@@ -4,7 +4,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::thread;
 
-use eventfs::{BranchName, BranchStatus, EventKind, FilesystemError};
+use eventfs::{BranchIdentifier, BranchName, BranchStatus, EventKind, FilesystemError};
 
 use support::{
     TestDirectories, branch_page_limit, event_page_limit, file_identifier_for_path,
@@ -710,6 +710,12 @@ fn branch_listing_orders_branch_identifiers_and_exhausts_cursors() {
         .chain(second_page.clone().into_records())
         .collect::<Vec<_>>();
     assert_eq!(iterator_records, paginated_records);
+
+    let after_maximum = filesystem
+        .list_branches(Some(BranchIdentifier::new(u64::MAX)), branch_page_limit(2))
+        .expect("listing after maximum branch identifier succeeds");
+    assert!(after_maximum.records().is_empty());
+    assert_eq!(after_maximum.next_after(), None);
 }
 
 #[test]

@@ -2383,3 +2383,320 @@ fn new_branch_name(value: String) -> Result<BranchName, ConfigurationError> {
     }
     Ok(BranchName(value))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use tempfile::TempDir;
+
+    #[test]
+    fn lock_table_conflicts_follow_advisory_range_rules() {
+        let mut write_table = LockTable::default();
+        let write_lock = file_lock(1, 10, 0, 10, libc::F_WRLCK as i32);
+        write_table.set_lock(write_lock);
+
+        assert_eq!(
+            write_table.conflicting_lock(file_lock(1, 11, 5, 5, libc::F_RDLCK as i32)),
+            Some(write_lock)
+        );
+        assert_eq!(
+            write_table.conflicting_lock(file_lock(1, 11, 5, 5, libc::F_WRLCK as i32)),
+            Some(write_lock)
+        );
+        assert_eq!(
+            write_table.conflicting_lock(file_lock(1, 10, 5, 5, libc::F_WRLCK as i32)),
+            None
+        );
+        assert_eq!(
+            write_table.conflicting_lock(file_lock(2, 11, 5, 5, libc::F_WRLCK as i32)),
+            None
+        );
+        assert_eq!(
+            write_table.conflicting_lock(file_lock(1, 11, 11, 20, libc::F_WRLCK as i32)),
+            None
+        );
+
+        let mut read_table = LockTable::default();
+        let read_lock = file_lock(1, 10, 0, 10, libc::F_RDLCK as i32);
+        read_table.set_lock(read_lock);
+        assert_eq!(
+            read_table.conflicting_lock(file_lock(1, 11, 5, 5, libc::F_RDLCK as i32)),
+            None
+        );
+        assert_eq!(
+            read_table.conflicting_lock(file_lock(1, 11, 5, 5, libc::F_WRLCK as i32)),
+            Some(read_lock)
+        );
+
+        assert!(lock_ranges_overlap(
+            file_lock(1, 1, 0, 10, libc::F_RDLCK as i32),
+            file_lock(1, 2, 10, 20, libc::F_RDLCK as i32)
+        ));
+        assert!(!lock_ranges_overlap(
+            file_lock(1, 1, 0, 10, libc::F_RDLCK as i32),
+            file_lock(1, 2, 11, 20, libc::F_RDLCK as i32)
+        ));
+    }
+
+    #[test]
+    fn lock_table_replaces_splits_and_clears_owner_ranges() {
+        let mut table = LockTable::default();
+        table.set_lock(file_lock(1, 7, 0, 99, libc::F_WRLCK as i32));
+
+        table.set_lock(file_lock(1, 7, 20, 29, libc::F_UNLCK as i32));
+
+        assert_eq!(table.locks.len(), 2);
+        assert!(
+            table
+                .locks
+                .contains(&file_lock(1, 7, 0, 19, libc::F_WRLCK as i32))
+        );
+        assert!(
+            table
+                .locks
+                .contains(&file_lock(1, 7, 30, 99, libc::F_WRLCK as i32))
+        );
+
+        table.set_lock(file_lock(1, 7, 0, 19, libc::F_RDLCK as i32));
+
+        assert_eq!(table.locks.len(), 2);
+        assert!(
+            table
+                .locks
+                .contains(&file_lock(1, 7, 0, 19, libc::F_RDLCK as i32))
+        );
+        assert!(
+            table
+                .locks
+                .contains(&file_lock(1, 7, 30, 99, libc::F_WRLCK as i32))
+        );
+
+        table.set_lock(file_lock(2, 8, 0, 10, libc::F_WRLCK as i32));
+        table.clear_owner(7);
+
+        assert_eq!(
+            table.locks,
+            vec![file_lock(2, 8, 0, 10, libc::F_WRLCK as i32)]
+        );
+    }
+
+    #[test]
+    fn file_lock_adapter_validates_inodes_types_and_conflicts() {
+        let fixture = TestFilesystem::new("file-lock-adapter");
+        let filesystem = &fixture.filesystem;
+
+        filesystem
+            .set_file_lock(
+                1,
+                fuser::LockOwner(1),
+                0,
+                10,
+                libc::F_WRLCK as i32,
+                100,
+                false,
+            )
+            .expect("first lock succeeds");
+
+        let conflict = filesystem
+            .set_file_lock(
+                1,
+                fuser::LockOwner(2),
+                5,
+                5,
+                libc::F_WRLCK as i32,
+                200,
+                false,
+            )
+            .expect_err("non-blocking conflicting lock is rejected");
+        assert_eq!(conflict.errno().code(), fuser::Errno::EAGAIN.code());
+
+        filesystem.clear_file_locks_for_owner(fuser::LockOwner(1));
+        filesystem
+            .set_file_lock(
+                1,
+                fuser::LockOwner(2),
+                5,
+                5,
+                libc::F_WRLCK as i32,
+                200,
+                false,
+            )
+            .expect("lock succeeds after conflicting owner is cleared");
+
+        let invalid_type = filesystem
+            .set_file_lock(1, fuser::LockOwner(3), 0, 1, 999, 300, false)
+            .expect_err("unknown lock type is rejected");
+        assert_eq!(invalid_type.errno().code(), fuser::Errno::EINVAL.code());
+
+        let missing_inode = filesystem
+            .set_file_lock(
+                u64::MAX,
+                fuser::LockOwner(3),
+                0,
+                1,
+                libc::F_RDLCK as i32,
+                300,
+                false,
+            )
+            .expect_err("missing inode is rejected");
+        assert_eq!(missing_inode.errno().code(), fuser::Errno::ENOENT.code());
+    }
+
+    #[test]
+    fn blocking_file_lock_waits_until_conflicting_owner_is_cleared() {
+        let fixture = TestFilesystem::new("blocking-file-lock");
+        let filesystem = fixture.filesystem.clone();
+
+        filesystem
+            .set_file_lock(
+                1,
+                fuser::LockOwner(1),
+                0,
+                10,
+                libc::F_WRLCK as i32,
+                100,
+                false,
+            )
+            .expect("initial write lock succeeds");
+
+        let waiting_filesystem = filesystem.clone();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            started_sender.send(()).expect("waiter start is sent");
+            waiting_filesystem.set_file_lock(
+                1,
+                fuser::LockOwner(2),
+                0,
+                10,
+                libc::F_WRLCK as i32,
+                200,
+                true,
+            )
+        });
+
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter starts");
+        thread::sleep(Duration::from_millis(50));
+        filesystem.clear_file_locks_for_owner(fuser::LockOwner(1));
+
+        waiter
+            .join()
+            .expect("waiter thread joins")
+            .expect("blocking lock succeeds after wake");
+    }
+
+    #[test]
+    fn fuse_database_and_integrity_errors_map_to_io_errors() {
+        assert_eq!(
+            storage::FuseError::Database.errno().code(),
+            fuser::Errno::EIO.code()
+        );
+        assert_eq!(
+            storage::FuseError::Integrity.errno().code(),
+            fuser::Errno::EIO.code()
+        );
+    }
+
+    #[test]
+    fn paged_record_iterators_stop_on_empty_pages_and_surface_loader_errors() {
+        let empty_records = paged_records::<TestPage, u64, u64>(|_| {
+            Ok(TestPage {
+                records: Vec::new(),
+                next_after: None,
+            })
+        })
+        .collect::<Vec<_>>();
+        assert!(empty_records.is_empty());
+
+        let mut failed = false;
+        let mut errors = paged_records::<TestPage, u64, u64>(move |_| {
+            if failed {
+                Ok(TestPage {
+                    records: vec![1],
+                    next_after: None,
+                })
+            } else {
+                failed = true;
+                Err(FilesystemError::Integrity)
+            }
+        });
+
+        assert_eq!(errors.next(), Some(Err(FilesystemError::Integrity)));
+        assert_eq!(errors.next(), None);
+    }
+
+    #[test]
+    fn unmount_without_mounted_session_is_rejected() {
+        let fixture = TestFilesystem::new("unmount-without-mounted-session");
+
+        assert_eq!(
+            fixture.filesystem.mark_unmounted(),
+            Err(FilesystemError::FilesystemOperation)
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn rename_mode_rejects_non_empty_flags_on_non_linux_targets() {
+        let error = rename_mode(fuser::RenameFlags::from_bits_retain(1))
+            .expect_err("non-linux rename flags are rejected");
+
+        assert_eq!(error.errno().code(), fuser::Errno::EINVAL.code());
+    }
+
+    struct TestFilesystem {
+        _root: TempDir,
+        filesystem: Filesystem,
+    }
+
+    struct TestPage {
+        records: Vec<u64>,
+        next_after: Option<u64>,
+    }
+
+    impl PagedRecords for TestPage {
+        type Cursor = u64;
+        type Record = u64;
+
+        fn next_after(&self) -> Option<Self::Cursor> {
+            self.next_after
+        }
+
+        fn into_records(self) -> Vec<Self::Record> {
+            self.records
+        }
+    }
+
+    impl TestFilesystem {
+        fn new(name: &str) -> Self {
+            let root = TempDir::new().expect("temporary directory is created");
+            let configuration = FilesystemConfiguration::new(
+                root.path().join(format!("{name}-database")),
+                root.path().join(format!("{name}-mount")),
+            )
+            .expect("configuration is valid");
+            let filesystem = Filesystem::open(configuration).expect("filesystem opens");
+            Self {
+                _root: root,
+                filesystem,
+            }
+        }
+    }
+
+    fn file_lock(inode: u64, owner: u64, start: u64, end: u64, typ: i32) -> FileLock {
+        FileLock {
+            inode,
+            owner,
+            start,
+            end,
+            typ,
+            pid: owner as u32,
+        }
+    }
+}

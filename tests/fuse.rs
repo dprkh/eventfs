@@ -17,8 +17,9 @@ use eventfs::{Filesystem, FilesystemError, FuseOperationError};
 
 use support::{
     TestDirectories, access_path, assert_event_sequences_increase, configuration_for,
-    event_page_limit, file_identifier_for_path, fsync_directory, get_xattr, list_all_events,
-    list_xattr, mkfifo, mount, open_test_filesystem, remove_xattr, set_xattr, statvfs,
+    event_page_limit, file_identifier_for_path, fsync_directory, get_xattr, get_xattr_into_buffer,
+    list_all_events, list_xattr, list_xattr_into_buffer, mkfifo, mount, open_test_filesystem,
+    remove_xattr, set_xattr, statvfs,
 };
 
 #[test]
@@ -517,6 +518,29 @@ fn mounted_extended_attributes_round_trip() {
         get_xattr(&file_path, name).is_err(),
         "removed xattr is no longer readable"
     );
+
+    mounted.unmount().expect("filesystem unmounts");
+}
+
+#[test]
+fn mounted_extended_attribute_small_buffers_return_range_errors() {
+    let directories = TestDirectories::new();
+    let filesystem = open_test_filesystem(&directories);
+    let mounted = filesystem
+        .spawn_mount()
+        .expect("filesystem mounts in the background");
+    let file_path = directories.mount_point_path().join("file");
+    let name = "user.eventfs.small-buffer";
+
+    fs::write(&file_path, b"contents").expect("file is written");
+    set_xattr(&file_path, name, b"value", libc::XATTR_CREATE).expect("xattr is created");
+
+    let value_error =
+        get_xattr_into_buffer(&file_path, name, 1).expect_err("small getxattr buffer is rejected");
+    assert_eq!(value_error.raw_os_error(), Some(libc::ERANGE));
+    let list_error =
+        list_xattr_into_buffer(&file_path, 1).expect_err("small listxattr buffer is rejected");
+    assert_eq!(list_error.raw_os_error(), Some(libc::ERANGE));
 
     mounted.unmount().expect("filesystem unmounts");
 }

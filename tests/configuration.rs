@@ -35,6 +35,61 @@ fn nonzero_public_constructors_reject_zero() {
 }
 
 #[test]
+fn public_configuration_and_error_values_expose_debug_display_and_equality() {
+    let directories = TestDirectories::new();
+    let configuration = directories.configuration();
+    let same_configuration = FilesystemConfiguration::new(
+        directories.database_directory_path().to_path_buf(),
+        directories.mount_point_path().to_path_buf(),
+    )
+    .expect("matching configuration is valid");
+
+    assert_eq!(configuration, same_configuration);
+    assert!(format!("{configuration:?}").contains("fuse_error_callback: false"));
+
+    let callback_configuration = configuration.clone().with_fuse_error_callback(|_error| {});
+    let cloned_callback_configuration = callback_configuration.clone();
+    let other_callback_configuration = same_configuration.with_fuse_error_callback(|_error| {});
+
+    assert_eq!(callback_configuration, cloned_callback_configuration);
+    assert_ne!(callback_configuration, configuration);
+    assert_ne!(callback_configuration, other_callback_configuration);
+    assert!(format!("{callback_configuration:?}").contains("fuse_error_callback: true"));
+
+    let filesystem = Filesystem::open(configuration).expect("filesystem opens");
+    assert!(format!("{filesystem:?}").contains("Filesystem"));
+
+    assert_eq!(
+        ConfigurationError::EmptyValue.to_string(),
+        "configuration value must not be empty"
+    );
+    assert_eq!(
+        ConfigurationError::ZeroValue.to_string(),
+        "configuration value must be non-zero"
+    );
+    assert_eq!(
+        FilesystemError::FilesystemOperation.to_string(),
+        "filesystem operation failed"
+    );
+    assert_eq!(
+        FilesystemError::Database.to_string(),
+        "database operation failed"
+    );
+    assert_eq!(
+        FilesystemError::Integrity.to_string(),
+        "integrity check failed"
+    );
+    assert_eq!(
+        FilesystemError::Backup.to_string(),
+        "backup operation failed"
+    );
+    assert_eq!(
+        FilesystemError::Import.to_string(),
+        "import operation failed"
+    );
+}
+
+#[test]
 fn valid_filesystem_configuration_opens_a_new_database_and_exposes_the_initial_event() {
     let directories = TestDirectories::new();
     let filesystem = open_test_filesystem(&directories);

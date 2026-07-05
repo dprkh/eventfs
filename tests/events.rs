@@ -44,7 +44,9 @@ fn event_listing_returns_initial_event_with_branch_metadata_and_utc_creation_tim
         Some(current_branch.head_sequence())
     );
     assert_eq!(event.file_identifier(), None);
+    assert_eq!(event.secondary_file_identifier(), None);
     assert_eq!(event.path(), None);
+    assert_eq!(event.secondary_path(), None);
     assert_eq!(event.offset(), None);
     assert_eq!(event.byte_length(), None);
     assert_eq!(events.next_after(), None);
@@ -342,6 +344,8 @@ fn global_event_listing_and_get_event_cover_non_file_event_kinds() {
 
         assert_eq!(fetched.as_ref(), Some(listed));
         assert_eq!(listed.file_identifier(), None);
+        assert_eq!(listed.secondary_file_identifier(), None);
+        assert_eq!(listed.secondary_path(), None);
         assert_eq!(listed.offset(), None);
         assert_eq!(listed.byte_length(), None);
         assert_eq!(listed.old_file_size(), None);

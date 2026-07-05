@@ -134,6 +134,80 @@ fn local_import_replaces_an_existing_target_database() {
 }
 
 #[test]
+fn local_import_replaces_an_existing_file_target_path() {
+    let directories = TestDirectories::new();
+    let filesystem = open_test_filesystem(&directories);
+    let backup_directory = directories.backup_directory();
+    let backup = filesystem
+        .create_backup(backup_directory.clone())
+        .expect("backup succeeds");
+    let target_database_path = directories.root_path().join("file-target-database");
+    let imported_mount_point = directories.root_path().join("file-target-mount");
+
+    fs::write(&target_database_path, b"obsolete file target").expect("target file is written");
+
+    let import = Filesystem::import_backup(
+        target_database_path.clone(),
+        backup_directory,
+        backup.backup_identifier(),
+    )
+    .expect("import over file target succeeds");
+
+    assert_eq!(import.backup_identifier(), backup.backup_identifier());
+    assert_eq!(
+        import.imported_event_sequence(),
+        backup.source_event_sequence()
+    );
+    assert!(
+        target_database_path.is_dir(),
+        "file target is replaced by the imported database directory"
+    );
+    Filesystem::open(
+        FilesystemConfiguration::new(target_database_path, imported_mount_point)
+            .expect("imported configuration is valid"),
+    )
+    .expect("imported filesystem opens");
+}
+
+#[test]
+fn local_backup_and_import_accept_relative_paths_after_normalization() {
+    let _cwd_lock = CWD_LOCK.lock().expect("cwd lock is available");
+    let _cwd_guard = CurrentDirectoryGuard::new();
+    let directories = TestDirectories::new();
+    let filesystem = open_test_filesystem(&directories);
+
+    env::set_current_dir(directories.root_path()).expect("cwd changes to test root");
+    let backup_directory =
+        BackupDirectory::new(PathBuf::from("./relative-backups")).expect("backup path is valid");
+    let backup = filesystem
+        .create_backup(backup_directory.clone())
+        .expect("relative backup succeeds");
+    let import = Filesystem::import_backup(
+        PathBuf::from("./relative-import"),
+        backup_directory,
+        backup.backup_identifier(),
+    )
+    .expect("relative import succeeds");
+
+    assert_eq!(import.backup_identifier(), backup.backup_identifier());
+    assert_eq!(
+        import.imported_event_sequence(),
+        backup.source_event_sequence()
+    );
+
+    let imported_mount_point = directories.root_path().join("relative-import-mount");
+    fs::create_dir(&imported_mount_point).expect("imported mount point is created");
+    Filesystem::open(
+        FilesystemConfiguration::new(
+            directories.root_path().join("relative-import"),
+            imported_mount_point,
+        )
+        .expect("relative imported configuration is valid"),
+    )
+    .expect("relative imported filesystem opens");
+}
+
+#[test]
 fn imported_backups_restore_active_branch_contents_history_snapshots_and_payloads() {
     let directories = TestDirectories::new();
     let filesystem = open_test_filesystem(&directories);

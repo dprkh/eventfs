@@ -243,6 +243,18 @@ pub fn get_xattr(path: &Path, name: &str) -> std::io::Result<Vec<u8>> {
     }
 }
 
+pub fn get_xattr_into_buffer(path: &Path, name: &str, size: usize) -> std::io::Result<usize> {
+    let path = c_path(path);
+    let name = CString::new(name).expect("xattr name is valid");
+    let mut value = vec![0; size];
+    let result = unsafe { getxattr_raw(&path, &name, value.as_mut_ptr().cast(), value.len()) };
+    if result >= 0 {
+        Ok(result as usize)
+    } else {
+        Err(last_os_error())
+    }
+}
+
 pub fn list_xattr(path: &Path) -> std::io::Result<Vec<u8>> {
     let path = c_path(path);
     let size = unsafe { listxattr_raw(&path, ptr::null_mut(), 0) };
@@ -254,6 +266,17 @@ pub fn list_xattr(path: &Path) -> std::io::Result<Vec<u8>> {
     if result >= 0 {
         value.truncate(result as usize);
         Ok(value)
+    } else {
+        Err(last_os_error())
+    }
+}
+
+pub fn list_xattr_into_buffer(path: &Path, size: usize) -> std::io::Result<usize> {
+    let path = c_path(path);
+    let mut value = vec![0; size];
+    let result = unsafe { listxattr_raw(&path, value.as_mut_ptr().cast(), value.len()) };
+    if result >= 0 {
+        Ok(result as usize)
     } else {
         Err(last_os_error())
     }

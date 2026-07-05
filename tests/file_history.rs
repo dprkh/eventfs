@@ -973,6 +973,33 @@ fn snapshot_and_payload_ranges_clamp_to_available_bytes_and_return_empty_beyond_
     );
 }
 
+#[test]
+fn active_branch_snapshot_lookup_returns_none_before_file_history_exists() {
+    let directories = TestDirectories::new();
+    let filesystem = open_test_filesystem(&directories);
+    let mounted = filesystem
+        .spawn_mount()
+        .expect("filesystem mounts in the background");
+    let file_path = directories.mount_point_path().join("appears-later");
+
+    fs::write(&file_path, b"late").expect("file is written through mounted filesystem");
+    mounted.unmount().expect("filesystem unmounts");
+
+    let file_identifier = file_identifier_for_path(&filesystem, "/appears-later");
+    assert_eq!(
+        filesystem
+            .file_snapshot_at_or_before(file_identifier, EventSequence::new(0))
+            .expect("snapshot lookup before file creation succeeds"),
+        None
+    );
+    assert_eq!(
+        filesystem
+            .file_snapshot_at_or_before(FileIdentifier::new(u64::MAX), EventSequence::new(u64::MAX))
+            .expect("snapshot lookup for a missing file succeeds"),
+        None
+    );
+}
+
 fn find_event_sequence(
     filesystem: &Filesystem,
     mut predicate: impl FnMut(&EventRecord) -> bool,

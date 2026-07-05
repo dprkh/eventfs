@@ -6559,6 +6559,21 @@ mod tests {
             storage.getxattr(inode_number, name),
             Err(FuseError::Errno(errno)) if errno.code() == fuser::Errno::NO_XATTR.code()
         ));
+        let main_after_remove = storage
+            .current_branch()
+            .expect("main branch after removal is readable");
+        let after_remove_branch_name =
+            BranchName::new("xattrs-after-remove").expect("branch name is valid");
+        storage
+            .create_branch(&after_remove_branch_name, main_after_remove.head_position())
+            .expect("branch is created after xattr removal");
+        storage
+            .switch_branch(&after_remove_branch_name)
+            .expect("post-removal branch is active");
+        assert!(matches!(
+            storage.getxattr(inode_number, name),
+            Err(FuseError::Errno(errno)) if errno.code() == fuser::Errno::NO_XATTR.code()
+        ));
 
         let kinds = collect_all_events(&storage)
             .into_iter()
@@ -6566,6 +6581,297 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(kinds.contains(&EventKind::ExtendedAttributeSet));
         assert!(kinds.contains(&EventKind::ExtendedAttributeRemoved));
+    }
+
+    #[test]
+    fn extended_attributes_validate_flags_names_and_noop_writes() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let inode_number = create_regular_file(&storage, "xattr-edges");
+        let name = OsStr::new("user.eventfs.edge");
+
+        storage
+            .setxattr(
+                inode_number,
+                name,
+                b"value",
+                libc::XATTR_CREATE,
+                current_uid(),
+                current_gid(),
+            )
+            .expect("xattr is created");
+        let before_noop = storage
+            .last_event_sequence()
+            .expect("last event sequence is readable");
+
+        storage
+            .setxattr(
+                inode_number,
+                name,
+                b"value",
+                0,
+                current_uid(),
+                current_gid(),
+            )
+            .expect("setting the same xattr value is a no-op");
+
+        assert_eq!(
+            storage
+                .last_event_sequence()
+                .expect("last event sequence is reread"),
+            before_noop
+        );
+        assert_fuse_errno(
+            storage
+                .setxattr(
+                    inode_number,
+                    name,
+                    b"value",
+                    libc::XATTR_CREATE,
+                    current_uid(),
+                    current_gid(),
+                )
+                .expect_err("create rejects an existing xattr"),
+            fuser::Errno::EEXIST,
+        );
+        assert_fuse_errno(
+            storage
+                .setxattr(
+                    inode_number,
+                    OsStr::new("user.eventfs.missing"),
+                    b"value",
+                    libc::XATTR_REPLACE,
+                    current_uid(),
+                    current_gid(),
+                )
+                .expect_err("replace rejects a missing xattr"),
+            fuser::Errno::NO_XATTR,
+        );
+        assert_fuse_errno(
+            storage
+                .setxattr(
+                    inode_number,
+                    name,
+                    b"value",
+                    libc::XATTR_CREATE | libc::XATTR_REPLACE,
+                    current_uid(),
+                    current_gid(),
+                )
+                .expect_err("create and replace flags conflict"),
+            fuser::Errno::EINVAL,
+        );
+        assert_fuse_errno(
+            storage
+                .setxattr(
+                    inode_number,
+                    name,
+                    b"value",
+                    0x4000,
+                    current_uid(),
+                    current_gid(),
+                )
+                .expect_err("unknown xattr flags are rejected"),
+            fuser::Errno::EINVAL,
+        );
+        assert_fuse_errno(
+            storage
+                .setxattr(
+                    inode_number,
+                    OsStr::new(""),
+                    b"value",
+                    0,
+                    current_uid(),
+                    current_gid(),
+                )
+                .expect_err("empty xattr names are rejected"),
+            fuser::Errno::EINVAL,
+        );
+        assert_fuse_errno(
+            storage
+                .getxattr(inode_number, OsStr::from_bytes(&[b'a'; 256]))
+                .expect_err("overlong xattr names are rejected"),
+            fuser::Errno::ERANGE,
+        );
+        assert_fuse_errno(
+            storage
+                .removexattr(inode_number, OsStr::from_bytes(b"user\0bad"), current_uid())
+                .expect_err("nul-containing xattr names are rejected"),
+            fuser::Errno::EINVAL,
+        );
+    }
+
+    #[test]
+    fn branch_creation_after_xattr_file_deletion_replays_inode_deletes() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let inode_number = create_regular_file(&storage, "deleted-xattr-file");
+        let name = OsStr::new("user.eventfs.deleted");
+        storage
+            .setxattr(
+                inode_number,
+                name,
+                b"value",
+                libc::XATTR_CREATE,
+                current_uid(),
+                current_gid(),
+            )
+            .expect("xattr is created");
+        storage
+            .unlink(
+                INODE_ROOT,
+                OsStr::new("deleted-xattr-file"),
+                current_uid(),
+                current_gid(),
+            )
+            .expect("file is unlinked");
+        let main = storage
+            .current_branch()
+            .expect("main branch after unlink is readable");
+        let branch_name = BranchName::new("after-xattr-delete").expect("branch name is valid");
+
+        storage
+            .create_branch(&branch_name, main.head_position())
+            .expect("branch after deleted xattr file is created");
+        storage
+            .switch_branch(&branch_name)
+            .expect("branch after deleted xattr file is active");
+
+        assert_fuse_errno(
+            storage
+                .getxattr(inode_number, name)
+                .expect_err("deleted file inode is absent on materialized branch"),
+            fuser::Errno::ENOENT,
+        );
+        assert_fuse_errno(
+            storage
+                .lookup(INODE_ROOT, OsStr::new("deleted-xattr-file"))
+                .expect_err("deleted file path is absent on materialized branch"),
+            fuser::Errno::ENOENT,
+        );
+    }
+
+    #[test]
+    fn write_state_rejects_invalid_inode_and_event_boundaries() {
+        assert!(matches!(
+            WriteState {
+                next_inode_number: INODE_FIRST_ALLOCATED - 1,
+                last_event_sequence: 0,
+                next_branch_identifier: 0,
+                active_branch_identifier: 0,
+                active_branch_head_sequence: 0,
+                active_branch_head_ordinal: 0,
+            }
+            .next_inode_number(),
+            Err(FuseError::Integrity)
+        ));
+        assert_fuse_errno(
+            WriteState {
+                next_inode_number: u64::MAX,
+                last_event_sequence: 0,
+                next_branch_identifier: 0,
+                active_branch_identifier: 0,
+                active_branch_head_sequence: 0,
+                active_branch_head_ordinal: 0,
+            }
+            .next_inode_number()
+            .expect_err("exhausted inode space is reported"),
+            fuser::Errno::ENOSPC,
+        );
+        assert!(matches!(
+            WriteState {
+                next_inode_number: INODE_FIRST_ALLOCATED,
+                last_event_sequence: u64::MAX,
+                next_branch_identifier: 0,
+                active_branch_identifier: 0,
+                active_branch_head_sequence: 0,
+                active_branch_head_ordinal: 0,
+            }
+            .next_event_sequence(),
+            Err(FuseError::Integrity)
+        ));
+    }
+
+    #[test]
+    fn readdirplus_returns_entries_with_attributes_and_honors_offsets() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let directory = storage
+            .create_node(
+                INODE_ROOT,
+                OsStr::new("directory"),
+                0o755,
+                0,
+                current_credentials(),
+                CreateNodeKind::Directory,
+            )
+            .expect("directory is created")
+            .attr
+            .ino
+            .into();
+        let file = create_regular_file(&storage, "file");
+
+        let mut entries = Vec::new();
+        storage
+            .readdirplus(INODE_ROOT, 0, |entry| {
+                entries.push((entry.name, entry.inode, entry.entry.attr.kind));
+                true
+            })
+            .expect("readdirplus succeeds");
+
+        assert_eq!(entries[0].0, ".");
+        assert_eq!(entries[0].1, INODE_ROOT);
+        assert_eq!(entries[1].0, "..");
+        assert_eq!(entries[1].1, INODE_ROOT);
+        assert!(entries.contains(&(
+            OsString::from("directory"),
+            directory,
+            fuser::FileType::Directory
+        )));
+        assert!(entries.contains(&(OsString::from("file"), file, fuser::FileType::RegularFile)));
+
+        let mut offset_entries = Vec::new();
+        storage
+            .readdirplus(INODE_ROOT, 2, |entry| {
+                offset_entries.push(entry.name);
+                true
+            })
+            .expect("readdirplus with offset succeeds");
+
+        assert_eq!(
+            offset_entries,
+            vec![OsString::from("directory"), OsString::from("file")]
+        );
+
+        let mut emitted = 0;
+        storage
+            .readdirplus(INODE_ROOT, 0, |_entry| {
+                emitted += 1;
+                false
+            })
+            .expect("readdirplus stops when the caller buffer is full");
+        assert_eq!(emitted, 1);
+
+        assert_fuse_errno(
+            storage
+                .readdirplus(file, 0, |_entry| true)
+                .expect_err("readdirplus rejects regular files"),
+            fuser::Errno::ENOTDIR,
+        );
+        assert_fuse_errno(
+            storage
+                .readdirplus(u64::MAX, 0, |_entry| true)
+                .expect_err("readdirplus rejects missing inodes"),
+            fuser::Errno::ENOENT,
+        );
+        assert_fuse_errno(
+            storage
+                .readdir(file, 0, |_entry| true)
+                .expect_err("readdir rejects regular files"),
+            fuser::Errno::ENOTDIR,
+        );
     }
 
     #[test]
@@ -6624,6 +6930,148 @@ mod tests {
                 .expect("event exists")
                 .kind(),
             EventKind::FileRangeZeroed
+        );
+    }
+
+    #[test]
+    fn fallocate_poll_lseek_and_copy_range_cover_edge_modes() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let source = create_regular_file(&storage, "range-source");
+        let destination = create_regular_file(&storage, "range-destination");
+        storage
+            .write_file(source, 0, b"abcdef", current_uid(), current_gid())
+            .expect("source is written");
+        let before_noops = storage
+            .last_event_sequence()
+            .expect("last event sequence is readable");
+
+        storage
+            .fallocate(source, 0, 0, 0, current_uid(), current_gid())
+            .expect("zero-length allocation validates and does nothing");
+        storage
+            .fallocate(
+                source,
+                12,
+                4,
+                fallocate_keep_size(),
+                current_uid(),
+                current_gid(),
+            )
+            .expect("keep-size allocation beyond EOF is a no-op");
+        assert_eq!(
+            storage
+                .last_event_sequence()
+                .expect("last event sequence is reread"),
+            before_noops
+        );
+
+        storage
+            .fallocate(source, 8, 4, 0, current_uid(), current_gid())
+            .expect("size-growing allocation extends the file");
+        assert_eq!(
+            storage
+                .getattr(source)
+                .expect("source attributes are readable")
+                .attr
+                .size,
+            12
+        );
+
+        for mode in [
+            fallocate_punch_hole() | fallocate_zero_range(),
+            fallocate_collapse_range(),
+            fallocate_insert_range(),
+            fallocate_unshare_range(),
+            0x4000,
+        ] {
+            assert_fuse_errno(
+                storage
+                    .fallocate(source, 0, 1, mode, current_uid(), current_gid())
+                    .expect_err("unsupported fallocate mode is rejected"),
+                fuser::Errno::EINVAL,
+            );
+        }
+        assert_fuse_errno(
+            storage
+                .fallocate(INODE_ROOT, 0, 1, 0, current_uid(), current_gid())
+                .expect_err("fallocate rejects directories"),
+            fuser::Errno::EISDIR,
+        );
+        assert_fuse_errno(
+            storage
+                .fallocate(source, u64::MAX, 1, 0, current_uid(), current_gid())
+                .expect_err("overflowing allocation is rejected"),
+            fuser::Errno::EFBIG,
+        );
+
+        let requested_poll = fuser::PollEvents::POLLIN
+            | fuser::PollEvents::POLLRDNORM
+            | fuser::PollEvents::POLLOUT
+            | fuser::PollEvents::POLLWRNORM
+            | fuser::PollEvents::POLLERR;
+        let ready = storage
+            .poll(source, current_uid(), current_gid(), requested_poll)
+            .expect("poll succeeds");
+        assert!(ready.contains(fuser::PollEvents::POLLIN));
+        assert!(ready.contains(fuser::PollEvents::POLLRDNORM));
+        assert!(ready.contains(fuser::PollEvents::POLLOUT));
+        assert!(ready.contains(fuser::PollEvents::POLLWRNORM));
+        assert!(!ready.contains(fuser::PollEvents::POLLERR));
+        assert_fuse_errno(
+            storage
+                .poll(u64::MAX, current_uid(), current_gid(), requested_poll)
+                .expect_err("poll rejects missing inodes"),
+            fuser::Errno::ENOENT,
+        );
+
+        assert_fuse_errno(
+            storage
+                .lseek(source, -1, libc::SEEK_DATA)
+                .expect_err("negative lseek offsets are rejected"),
+            fuser::Errno::EINVAL,
+        );
+        assert_fuse_errno(
+            storage
+                .lseek(INODE_ROOT, 0, libc::SEEK_DATA)
+                .expect_err("lseek rejects directories"),
+            fuser::Errno::EINVAL,
+        );
+        assert_fuse_errno(
+            storage
+                .lseek(source, 12, libc::SEEK_DATA)
+                .expect_err("lseek at EOF is rejected"),
+            fuser::Errno::ENXIO,
+        );
+        assert_fuse_errno(
+            storage
+                .lseek(source, 0, libc::SEEK_SET)
+                .expect_err("unsupported lseek whence is rejected"),
+            fuser::Errno::EINVAL,
+        );
+
+        let zero_length_copy = storage
+            .copy_file_range(source, 0, destination, 0, 0, current_uid(), current_gid())
+            .expect("zero-length copy succeeds");
+        let eof_copy = storage
+            .copy_file_range(source, 12, destination, 0, 4, current_uid(), current_gid())
+            .expect("copy from EOF succeeds without bytes");
+        assert_eq!(zero_length_copy.written, 0);
+        assert_eq!(eof_copy.written, 0);
+        assert_fuse_errno(
+            storage
+                .copy_file_range(
+                    INODE_ROOT,
+                    0,
+                    destination,
+                    0,
+                    4,
+                    current_uid(),
+                    current_gid(),
+                )
+                .expect_err("copy from a directory is rejected"),
+            fuser::Errno::EINVAL,
         );
     }
 
@@ -6716,10 +7164,12 @@ mod tests {
             .expect("event exists");
         assert_eq!(event.kind(), EventKind::FileContentsExchanged);
         assert_eq!(event.file_identifier(), Some(FileIdentifier::new(left)));
+        assert_eq!(event.path(), Some("/left"));
         assert_eq!(
             event.secondary_file_identifier(),
             Some(FileIdentifier::new(right))
         );
+        assert_eq!(event.secondary_path(), Some("/right"));
         assert_eq!(
             collect_all_file_events(&storage, FileIdentifier::new(left))
                 .last()
@@ -6765,6 +7215,1120 @@ mod tests {
             storage.volume_name().expect("volume name persists"),
             "eventfs-renamed"
         );
+    }
+
+    #[test]
+    fn volume_name_and_extended_times_cover_noop_and_error_edges() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let file = create_regular_file(&storage, "xtimes");
+        let before_noop = storage
+            .last_event_sequence()
+            .expect("last event sequence is readable");
+
+        storage
+            .set_volume_name(OsStr::new(METADATA_VOLUME_NAME_DEFAULT))
+            .expect("setting the same volume name is a no-op");
+        assert_eq!(
+            storage
+                .last_event_sequence()
+                .expect("last event sequence is reread"),
+            before_noop
+        );
+        assert_fuse_errno(
+            storage
+                .set_volume_name(OsStr::new(""))
+                .expect_err("empty volume names are rejected"),
+            fuser::Errno::EINVAL,
+        );
+        assert_fuse_errno(
+            storage
+                .set_volume_name(OsStr::from_bytes(&[b'v'; 256]))
+                .expect_err("overlong volume names are rejected"),
+            fuser::Errno::EINVAL,
+        );
+        assert_fuse_errno(
+            storage
+                .set_volume_name(OsStr::from_bytes(&[0xff]))
+                .expect_err("non-utf8 volume names are rejected"),
+            fuser::Errno::EINVAL,
+        );
+
+        let times = storage
+            .getxtimes(file)
+            .expect("extended times are readable");
+        assert!(times.bkuptime <= SystemTime::now());
+        assert!(times.crtime <= SystemTime::now());
+        assert_fuse_errno(
+            storage
+                .getxtimes(u64::MAX)
+                .expect_err("extended times reject missing inodes"),
+            fuser::Errno::ENOENT,
+        );
+    }
+
+    #[test]
+    fn payload_reads_and_index_listings_handle_empty_ranges_and_prefix_boundaries() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let first = create_regular_file(&storage, "payload-first");
+        let first_create_sequence = storage
+            .last_event_sequence()
+            .expect("create event sequence is readable");
+        let second = create_regular_file(&storage, "payload-second");
+        let xattr_name = OsStr::new("user.eventfs.only-second");
+
+        storage
+            .write_file(first, 0, b"payload", current_uid(), current_gid())
+            .expect("file is written");
+        let write_sequence = storage
+            .last_event_sequence()
+            .expect("write event sequence is readable");
+        storage
+            .setxattr(
+                second,
+                xattr_name,
+                b"value",
+                libc::XATTR_CREATE,
+                current_uid(),
+                current_gid(),
+            )
+            .expect("xattr is set on second file");
+
+        assert_eq!(
+            storage
+                .read_file_event_payload_range(
+                    EventSequence::new(u64::MAX),
+                    FileEventPayloadPart::Written,
+                    0,
+                    16,
+                )
+                .expect("missing event payload reads as empty"),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            storage
+                .read_file_event_payload_range(
+                    first_create_sequence,
+                    FileEventPayloadPart::Written,
+                    0,
+                    16,
+                )
+                .expect("non-payload event payload reads as empty"),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            storage
+                .read_file_event_payload_range(
+                    write_sequence,
+                    FileEventPayloadPart::Written,
+                    7,
+                    16,
+                )
+                .expect("payload range at end reads as empty"),
+            Vec::<u8>::new()
+        );
+
+        let limit = EventPageLimit::new(10).expect("limit is valid");
+        assert!(
+            storage
+                .list_file_events(FileIdentifier::new(0), None, limit)
+                .expect("missing active-branch file history lists as empty")
+                .records()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .list_branch_events(BranchIdentifier::new(0), None, limit)
+                .expect("missing branch history lists as empty")
+                .records()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .list_branch_file_events(
+                    BranchIdentifier::new(0),
+                    FileIdentifier::new(0),
+                    None,
+                    limit,
+                )
+                .expect("missing branch file history lists as empty")
+                .records()
+                .is_empty()
+        );
+        assert_eq!(
+            storage
+                .listxattr(first)
+                .expect("xattr listing with only later keys succeeds")
+                .bytes,
+            Vec::<u8>::new()
+        );
+    }
+
+    #[test]
+    fn directory_readers_cover_offsets_stops_and_nested_prefix_boundaries() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let directory = storage
+            .create_node(
+                INODE_ROOT,
+                OsStr::new("nested"),
+                0o755,
+                0,
+                current_credentials(),
+                CreateNodeKind::Directory,
+            )
+            .expect("directory is created")
+            .attr
+            .ino
+            .into();
+        storage
+            .create_node(
+                directory,
+                OsStr::new("child"),
+                0o644,
+                0,
+                current_credentials(),
+                CreateNodeKind::RegularFile,
+            )
+            .expect("nested file is created");
+
+        let mut names = Vec::new();
+        storage
+            .readdir(INODE_ROOT, 0, |entry| {
+                names.push(entry.name);
+                true
+            })
+            .expect("root directory is read");
+        assert_eq!(names[0], ".");
+        assert_eq!(names[1], "..");
+        assert!(names.contains(&OsString::from("nested")));
+
+        let mut emitted = 0;
+        storage
+            .readdir(INODE_ROOT, 0, |_entry| {
+                emitted += 1;
+                false
+            })
+            .expect("readdir stops after dot");
+        assert_eq!(emitted, 1);
+        emitted = 0;
+        storage
+            .readdir(INODE_ROOT, 1, |_entry| {
+                emitted += 1;
+                false
+            })
+            .expect("readdir stops after parent entry");
+        assert_eq!(emitted, 1);
+        emitted = 0;
+        storage
+            .readdir(INODE_ROOT, 2, |_entry| {
+                emitted += 1;
+                false
+            })
+            .expect("readdir stops after a real entry");
+        assert_eq!(emitted, 1);
+
+        let mut plus_names = Vec::new();
+        storage
+            .readdirplus(INODE_ROOT, 0, |entry| {
+                plus_names.push(entry.name);
+                true
+            })
+            .expect("root directory plus attributes is read");
+        assert_eq!(plus_names[0], ".");
+        assert_eq!(plus_names[1], "..");
+        assert!(plus_names.contains(&OsString::from("nested")));
+
+        emitted = 0;
+        storage
+            .readdirplus(directory, 1, |entry| {
+                assert_eq!(entry.name, "..");
+                emitted += 1;
+                false
+            })
+            .expect("readdirplus stops after parent entry");
+        assert_eq!(emitted, 1);
+        emitted = 0;
+        storage
+            .readdirplus(INODE_ROOT, 2, |_entry| {
+                emitted += 1;
+                false
+            })
+            .expect("readdirplus stops after a real entry");
+        assert_eq!(emitted, 1);
+    }
+
+    #[test]
+    fn node_symlink_attribute_and_access_validation_cover_user_errors() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let file = storage
+            .create_node(
+                INODE_ROOT,
+                OsStr::new("access-file"),
+                0o600,
+                0,
+                current_credentials(),
+                CreateNodeKind::RegularFile,
+            )
+            .expect("file is created")
+            .attr
+            .ino
+            .into();
+        let other_uid = non_current_uid();
+        let other_gid = non_current_gid();
+
+        assert_fuse_errno(
+            storage
+                .create_node(
+                    INODE_ROOT,
+                    OsStr::new("access-file"),
+                    0o644,
+                    0,
+                    current_credentials(),
+                    CreateNodeKind::RegularFile,
+                )
+                .expect_err("duplicate file creation is rejected"),
+            fuser::Errno::EEXIST,
+        );
+
+        let symlink = storage
+            .create_symlink(
+                INODE_ROOT,
+                OsStr::new("link"),
+                Path::new("access-file"),
+                current_uid(),
+                current_gid(),
+            )
+            .expect("symlink is created")
+            .attr
+            .ino
+            .into();
+        assert_eq!(
+            storage
+                .readlink(symlink)
+                .expect("symlink target is readable"),
+            b"access-file"
+        );
+        assert_fuse_errno(
+            storage
+                .create_symlink(
+                    INODE_ROOT,
+                    OsStr::new("link"),
+                    Path::new("other"),
+                    current_uid(),
+                    current_gid(),
+                )
+                .expect_err("duplicate symlink creation is rejected"),
+            fuser::Errno::EEXIST,
+        );
+        assert_fuse_errno(
+            storage
+                .readlink(file)
+                .expect_err("readlink rejects regular files"),
+            fuser::Errno::EINVAL,
+        );
+        assert_fuse_errno(
+            storage
+                .open_file(
+                    INODE_ROOT,
+                    current_uid(),
+                    current_gid(),
+                    fuser::OpenFlags(libc::O_RDONLY),
+                )
+                .expect_err("open_file rejects directories"),
+            fuser::Errno::EISDIR,
+        );
+        assert_fuse_errno(
+            storage
+                .read_file(INODE_ROOT, 0, 1, current_uid(), current_gid())
+                .expect_err("read_file rejects directories"),
+            fuser::Errno::EISDIR,
+        );
+        assert_fuse_errno(
+            storage
+                .opendir(file)
+                .expect_err("opendir rejects regular files"),
+            fuser::Errno::ENOTDIR,
+        );
+        assert_fuse_errno(
+            storage
+                .access(file, other_uid, other_gid, fuser::AccessFlags::R_OK)
+                .expect_err("access rejects non-owner without permissions"),
+            fuser::Errno::EACCES,
+        );
+        assert_fuse_errno(
+            storage
+                .setattr(
+                    file,
+                    SetAttributes {
+                        mode: Some(0o644),
+                        uid: None,
+                        gid: None,
+                        size: None,
+                        atime: None,
+                        mtime: None,
+                        ctime: None,
+                        crtime: None,
+                        bkuptime: None,
+                        flags: None,
+                    },
+                    other_uid,
+                    other_gid,
+                )
+                .expect_err("setattr rejects non-owner metadata changes"),
+            fuser::Errno::EACCES,
+        );
+        if current_uid() != 0 {
+            let readonly_size_file = storage
+                .create_node(
+                    INODE_ROOT,
+                    OsStr::new("readonly-size-file"),
+                    0o400,
+                    0,
+                    current_credentials(),
+                    CreateNodeKind::RegularFile,
+                )
+                .expect("read-only file is created")
+                .attr
+                .ino
+                .into();
+            assert_fuse_errno(
+                storage
+                    .setattr(
+                        readonly_size_file,
+                        SetAttributes {
+                            mode: None,
+                            uid: None,
+                            gid: None,
+                            size: Some(1),
+                            atime: None,
+                            mtime: None,
+                            ctime: None,
+                            crtime: None,
+                            bkuptime: None,
+                            flags: None,
+                        },
+                        current_uid(),
+                        current_gid(),
+                    )
+                    .expect_err("owner truncate requires write access"),
+                fuser::Errno::EACCES,
+            );
+        }
+
+        let atime = UNIX_EPOCH + Duration::from_secs(10);
+        let mtime = UNIX_EPOCH + Duration::from_secs(20);
+        let ctime = UNIX_EPOCH + Duration::from_secs(30);
+        let crtime = UNIX_EPOCH + Duration::from_secs(40);
+        let bkuptime = UNIX_EPOCH + Duration::from_secs(50);
+        let updated = storage
+            .setattr(
+                file,
+                SetAttributes {
+                    mode: Some(0o640),
+                    uid: Some(current_uid()),
+                    gid: Some(current_gid()),
+                    size: None,
+                    atime: Some(fuser::TimeOrNow::SpecificTime(atime)),
+                    mtime: Some(fuser::TimeOrNow::SpecificTime(mtime)),
+                    ctime: Some(ctime),
+                    crtime: Some(crtime),
+                    bkuptime: Some(bkuptime),
+                    flags: Some(0x20),
+                },
+                current_uid(),
+                current_gid(),
+            )
+            .expect("full metadata update succeeds");
+        assert_eq!(updated.attr.perm, 0o640);
+        assert_eq!(updated.attr.uid, current_uid());
+        assert_eq!(updated.attr.gid, current_gid());
+        assert_eq!(updated.attr.atime, atime);
+        assert_eq!(updated.attr.mtime, mtime);
+        assert_eq!(updated.attr.crtime, crtime);
+        assert_eq!(updated.attr.flags, 0x20);
+        let extended_times = storage
+            .getxtimes(file)
+            .expect("extended times are readable");
+        assert_eq!(extended_times.bkuptime, bkuptime);
+        assert_eq!(extended_times.crtime, crtime);
+
+        let xattr_name = OsStr::new("user.eventfs.access");
+        assert_fuse_errno(
+            storage
+                .setxattr(file, xattr_name, b"value", 0, other_uid, other_gid)
+                .expect_err("setxattr rejects non-owner without write access"),
+            fuser::Errno::EACCES,
+        );
+        storage
+            .setxattr(
+                file,
+                xattr_name,
+                b"value",
+                libc::XATTR_CREATE,
+                current_uid(),
+                current_gid(),
+            )
+            .expect("owner sets xattr");
+        assert_fuse_errno(
+            storage
+                .removexattr(file, xattr_name, other_uid)
+                .expect_err("removexattr rejects non-owner"),
+            fuser::Errno::EACCES,
+        );
+        assert_fuse_errno(
+            storage
+                .removexattr(file, OsStr::new("user.eventfs.missing"), current_uid())
+                .expect_err("removexattr rejects missing attributes"),
+            fuser::Errno::NO_XATTR,
+        );
+    }
+
+    #[test]
+    fn rename_remove_link_allocation_and_exchange_edges_cover_user_errors() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+
+        let readonly_directory = storage
+            .create_node(
+                INODE_ROOT,
+                OsStr::new("readonly-directory"),
+                0o500,
+                0,
+                current_credentials(),
+                CreateNodeKind::Directory,
+            )
+            .expect("readonly directory is created")
+            .attr
+            .ino
+            .into();
+        if current_uid() != 0 {
+            assert_fuse_errno(
+                storage
+                    .create_node(
+                        readonly_directory,
+                        OsStr::new("denied"),
+                        0o644,
+                        0,
+                        current_credentials(),
+                        CreateNodeKind::RegularFile,
+                    )
+                    .expect_err("create rejects unwritable parent directories"),
+                fuser::Errno::EACCES,
+            );
+        }
+
+        let parent_file = create_regular_file(&storage, "not-a-directory-parent");
+        assert_fuse_errno(
+            storage
+                .create_node(
+                    parent_file,
+                    OsStr::new("child"),
+                    0o644,
+                    0,
+                    current_credentials(),
+                    CreateNodeKind::RegularFile,
+                )
+                .expect_err("create rejects non-directory parents"),
+            fuser::Errno::ENOTDIR,
+        );
+
+        create_regular_file(&storage, "no-replace-source");
+        create_regular_file(&storage, "no-replace-destination");
+        assert_fuse_errno(
+            storage
+                .rename(
+                    INODE_ROOT,
+                    OsStr::new("no-replace-source"),
+                    INODE_ROOT,
+                    OsStr::new("no-replace-destination"),
+                    true,
+                    current_credentials(),
+                )
+                .expect_err("rename noreplace rejects existing destinations"),
+            fuser::Errno::EEXIST,
+        );
+
+        let ancestor = storage
+            .create_node(
+                INODE_ROOT,
+                OsStr::new("ancestor"),
+                0o755,
+                0,
+                current_credentials(),
+                CreateNodeKind::Directory,
+            )
+            .expect("ancestor directory is created")
+            .attr
+            .ino
+            .into();
+        let descendant = storage
+            .create_node(
+                ancestor,
+                OsStr::new("descendant"),
+                0o755,
+                0,
+                current_credentials(),
+                CreateNodeKind::Directory,
+            )
+            .expect("descendant directory is created")
+            .attr
+            .ino
+            .into();
+        assert_fuse_errno(
+            storage
+                .rename(
+                    INODE_ROOT,
+                    OsStr::new("ancestor"),
+                    descendant,
+                    OsStr::new("moved"),
+                    false,
+                    current_credentials(),
+                )
+                .expect_err("rename rejects moving a directory into itself"),
+            fuser::Errno::EINVAL,
+        );
+
+        create_regular_file(&storage, "file-over-directory");
+        storage
+            .create_node(
+                INODE_ROOT,
+                OsStr::new("directory-target"),
+                0o755,
+                0,
+                current_credentials(),
+                CreateNodeKind::Directory,
+            )
+            .expect("directory target is created");
+        assert_fuse_errno(
+            storage
+                .rename(
+                    INODE_ROOT,
+                    OsStr::new("file-over-directory"),
+                    INODE_ROOT,
+                    OsStr::new("directory-target"),
+                    false,
+                    current_credentials(),
+                )
+                .expect_err("rename rejects file over directory"),
+            fuser::Errno::EISDIR,
+        );
+
+        storage
+            .create_node(
+                INODE_ROOT,
+                OsStr::new("directory-over-file"),
+                0o755,
+                0,
+                current_credentials(),
+                CreateNodeKind::Directory,
+            )
+            .expect("directory source is created");
+        create_regular_file(&storage, "file-target");
+        assert_fuse_errno(
+            storage
+                .rename(
+                    INODE_ROOT,
+                    OsStr::new("directory-over-file"),
+                    INODE_ROOT,
+                    OsStr::new("file-target"),
+                    false,
+                    current_credentials(),
+                )
+                .expect_err("rename rejects directory over file"),
+            fuser::Errno::ENOTDIR,
+        );
+
+        let nonempty_target = storage
+            .create_node(
+                INODE_ROOT,
+                OsStr::new("nonempty-target"),
+                0o755,
+                0,
+                current_credentials(),
+                CreateNodeKind::Directory,
+            )
+            .expect("nonempty target is created")
+            .attr
+            .ino
+            .into();
+        storage
+            .create_node(
+                nonempty_target,
+                OsStr::new("child"),
+                0o644,
+                0,
+                current_credentials(),
+                CreateNodeKind::RegularFile,
+            )
+            .expect("target child is created");
+        storage
+            .create_node(
+                INODE_ROOT,
+                OsStr::new("empty-directory-source"),
+                0o755,
+                0,
+                current_credentials(),
+                CreateNodeKind::Directory,
+            )
+            .expect("empty source directory is created");
+        assert_fuse_errno(
+            storage
+                .rename(
+                    INODE_ROOT,
+                    OsStr::new("empty-directory-source"),
+                    INODE_ROOT,
+                    OsStr::new("nonempty-target"),
+                    false,
+                    current_credentials(),
+                )
+                .expect_err("rename rejects replacing nonempty directories"),
+            fuser::Errno::ENOTEMPTY,
+        );
+
+        let same_inode = create_regular_file(&storage, "same-inode");
+        storage
+            .hard_link(
+                same_inode,
+                INODE_ROOT,
+                OsStr::new("same-inode-link"),
+                current_uid(),
+                current_gid(),
+            )
+            .expect("hard link to same inode is created");
+        storage
+            .rename(
+                INODE_ROOT,
+                OsStr::new("same-inode"),
+                INODE_ROOT,
+                OsStr::new("same-inode-link"),
+                false,
+                current_credentials(),
+            )
+            .expect("renaming over another link to the same inode succeeds");
+
+        let linked_destination = create_regular_file(&storage, "linked-destination");
+        storage
+            .hard_link(
+                linked_destination,
+                INODE_ROOT,
+                OsStr::new("linked-destination-survivor"),
+                current_uid(),
+                current_gid(),
+            )
+            .expect("destination hard link is created");
+        create_regular_file(&storage, "linked-replacement-source");
+        storage
+            .rename(
+                INODE_ROOT,
+                OsStr::new("linked-replacement-source"),
+                INODE_ROOT,
+                OsStr::new("linked-destination"),
+                false,
+                current_credentials(),
+            )
+            .expect("rename over hard-linked destination succeeds");
+        storage
+            .lookup(INODE_ROOT, OsStr::new("linked-destination-survivor"))
+            .expect("surviving hard link remains addressable");
+
+        assert_fuse_errno(
+            storage
+                .hard_link(
+                    INODE_ROOT,
+                    INODE_ROOT,
+                    OsStr::new("root-hard-link"),
+                    current_uid(),
+                    current_gid(),
+                )
+                .expect_err("hard links to directories are rejected"),
+            fuser::Errno::EPERM,
+        );
+        let hard_link_source = create_regular_file(&storage, "hard-link-source");
+        create_regular_file(&storage, "hard-link-duplicate");
+        assert_fuse_errno(
+            storage
+                .hard_link(
+                    hard_link_source,
+                    INODE_ROOT,
+                    OsStr::new("hard-link-duplicate"),
+                    current_uid(),
+                    current_gid(),
+                )
+                .expect_err("hard links reject existing names"),
+            fuser::Errno::EEXIST,
+        );
+        assert_fuse_errno(
+            storage
+                .write_file(INODE_ROOT, 0, b"nope", current_uid(), current_gid())
+                .expect_err("write rejects directories"),
+            fuser::Errno::EISDIR,
+        );
+
+        let removable_directory = storage
+            .create_node(
+                INODE_ROOT,
+                OsStr::new("removable-directory"),
+                0o755,
+                0,
+                current_credentials(),
+                CreateNodeKind::Directory,
+            )
+            .expect("removable directory is created")
+            .attr
+            .ino
+            .into();
+        storage
+            .create_node(
+                removable_directory,
+                OsStr::new("child"),
+                0o644,
+                0,
+                current_credentials(),
+                CreateNodeKind::RegularFile,
+            )
+            .expect("removable child is created");
+        assert_fuse_errno(
+            storage
+                .rmdir(
+                    INODE_ROOT,
+                    OsStr::new("hard-link-source"),
+                    current_uid(),
+                    current_gid(),
+                )
+                .expect_err("rmdir rejects regular files"),
+            fuser::Errno::ENOTDIR,
+        );
+        assert_fuse_errno(
+            storage
+                .unlink(
+                    INODE_ROOT,
+                    OsStr::new("removable-directory"),
+                    current_uid(),
+                    current_gid(),
+                )
+                .expect_err("unlink rejects directories"),
+            fuser::Errno::EISDIR,
+        );
+        assert_fuse_errno(
+            storage
+                .rmdir(
+                    INODE_ROOT,
+                    OsStr::new("removable-directory"),
+                    current_uid(),
+                    current_gid(),
+                )
+                .expect_err("rmdir rejects nonempty directories"),
+            fuser::Errno::ENOTEMPTY,
+        );
+        storage
+            .unlink(
+                removable_directory,
+                OsStr::new("child"),
+                current_uid(),
+                current_gid(),
+            )
+            .expect("nested child is removed");
+        storage
+            .rmdir(
+                INODE_ROOT,
+                OsStr::new("removable-directory"),
+                current_uid(),
+                current_gid(),
+            )
+            .expect("empty directory is removed");
+
+        let allocation = create_regular_file(&storage, "allocation-edges");
+        storage
+            .write_file(allocation, 0, b"abcdef", current_uid(), current_gid())
+            .expect("allocation file is written");
+        storage
+            .fallocate(
+                allocation,
+                1,
+                2,
+                fallocate_punch_hole(),
+                current_uid(),
+                current_gid(),
+            )
+            .expect("punch-hole allocation succeeds");
+        storage
+            .fallocate(
+                allocation,
+                8,
+                2,
+                fallocate_zero_range(),
+                current_uid(),
+                current_gid(),
+            )
+            .expect("zero range without keep-size extends the file");
+        assert_eq!(
+            storage
+                .getattr(allocation)
+                .expect("allocation attributes are readable")
+                .attr
+                .size,
+            10
+        );
+        let before_noop = storage
+            .last_event_sequence()
+            .expect("event sequence is readable");
+        storage
+            .fallocate(
+                allocation,
+                20,
+                4,
+                fallocate_zero_range() | fallocate_keep_size(),
+                current_uid(),
+                current_gid(),
+            )
+            .expect("keep-size zero beyond EOF is a no-op");
+        assert_eq!(
+            storage
+                .last_event_sequence()
+                .expect("event sequence is reread"),
+            before_noop
+        );
+        assert_fuse_errno(
+            storage
+                .fallocate(
+                    INODE_ROOT,
+                    0,
+                    1,
+                    fallocate_zero_range(),
+                    current_uid(),
+                    current_gid(),
+                )
+                .expect_err("zero-range allocation rejects directories"),
+            fuser::Errno::EISDIR,
+        );
+
+        let exchange_file = create_regular_file(&storage, "exchange-file");
+        storage
+            .exchange(
+                INODE_ROOT,
+                OsStr::new("exchange-file"),
+                INODE_ROOT,
+                OsStr::new("exchange-file"),
+                current_uid(),
+                current_gid(),
+            )
+            .expect("exchanging a file with itself is a no-op");
+        assert_fuse_errno(
+            storage
+                .exchange(
+                    INODE_ROOT,
+                    OsStr::new("exchange-file"),
+                    INODE_ROOT,
+                    OsStr::new("readonly-directory"),
+                    current_uid(),
+                    current_gid(),
+                )
+                .expect_err("exchange rejects non-regular files"),
+            fuser::Errno::EINVAL,
+        );
+        let looked_up_exchange: u64 = storage
+            .lookup(INODE_ROOT, OsStr::new("exchange-file"))
+            .expect("exchange file remains present")
+            .attr
+            .ino
+            .into();
+        assert_eq!(looked_up_exchange, exchange_file);
+
+        let scratch_name = BranchName::new("deleted-switch-target").expect("branch name is valid");
+        let main = storage.current_branch().expect("main branch is readable");
+        storage
+            .create_branch(&scratch_name, main.head_position())
+            .expect("scratch branch is created");
+        storage
+            .delete_branch(&scratch_name)
+            .expect("scratch branch is deleted");
+        assert!(matches!(
+            storage.switch_branch(&scratch_name),
+            Err(FilesystemError::Integrity)
+        ));
+    }
+
+    #[test]
+    fn allocator_branch_and_history_index_corruption_guards_fail_closed() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let first = create_regular_file(&storage, "corrupt-first");
+        let original_write_state = write_state_snapshot(&storage);
+
+        {
+            let mut write_state = storage
+                .write_state
+                .lock()
+                .expect("write state lock is available");
+            write_state.next_inode_number = first;
+        }
+        assert!(matches!(
+            storage.create_node(
+                INODE_ROOT,
+                OsStr::new("colliding-file"),
+                0o644,
+                0,
+                current_credentials(),
+                CreateNodeKind::RegularFile,
+            ),
+            Err(FuseError::Integrity)
+        ));
+        {
+            let mut write_state = storage
+                .write_state
+                .lock()
+                .expect("write state lock is available");
+            write_state.next_inode_number = first;
+        }
+        assert!(matches!(
+            storage.create_symlink(
+                INODE_ROOT,
+                OsStr::new("colliding-link"),
+                Path::new("target"),
+                current_uid(),
+                current_gid(),
+            ),
+            Err(FuseError::Integrity)
+        ));
+        {
+            let mut write_state = storage
+                .write_state
+                .lock()
+                .expect("write state lock is available");
+            write_state.next_inode_number = original_write_state.next_inode_number;
+        }
+
+        let main = storage.current_branch().expect("main branch is readable");
+        let duplicate_name = BranchName::new("duplicate").expect("branch name is valid");
+        storage
+            .create_branch(&duplicate_name, main.head_position())
+            .expect("branch is created");
+        assert!(matches!(
+            storage.create_branch(&duplicate_name, main.head_position()),
+            Err(FilesystemError::Integrity)
+        ));
+        let before_branch_corruption = write_state_snapshot(&storage);
+        {
+            let mut write_state = storage
+                .write_state
+                .lock()
+                .expect("write state lock is available");
+            write_state.next_branch_identifier = main.branch_identifier().get();
+        }
+        assert!(matches!(
+            storage.create_branch(
+                &BranchName::new("colliding-branch").expect("branch name is valid"),
+                main.head_position(),
+            ),
+            Err(FilesystemError::Integrity)
+        ));
+        {
+            let mut write_state = storage
+                .write_state
+                .lock()
+                .expect("write state lock is available");
+            write_state.next_branch_identifier = u64::MAX;
+        }
+        assert!(matches!(
+            storage.create_branch(
+                &BranchName::new("overflow-branch").expect("branch name is valid"),
+                main.head_position(),
+            ),
+            Err(FilesystemError::Integrity)
+        ));
+        {
+            let mut write_state = storage
+                .write_state
+                .lock()
+                .expect("write state lock is available");
+            write_state.next_branch_identifier = before_branch_corruption.next_branch_identifier;
+        }
+
+        let second = create_regular_file(&storage, "corrupt-second");
+        let second_sequence = storage
+            .last_event_sequence()
+            .expect("second create sequence is readable");
+        let second_ordinal = storage
+            .get_event(second_sequence)
+            .expect("second create event lookup succeeds")
+            .expect("second create event exists")
+            .branch_position()
+            .expect("second create event has branch position")
+            .ordinal();
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            storage
+                .branch_file_events()
+                .expect("branch file events column family exists"),
+            encode_branch_file_position_key(main.branch_identifier().get(), first, second_ordinal),
+            encode_u64(second_sequence.get()),
+        );
+        write_batch(storage.database(), batch).expect("corrupt branch file index is written");
+        assert!(matches!(
+            storage.list_branch_file_events(
+                main.branch_identifier(),
+                FileIdentifier::new(first),
+                None,
+                EventPageLimit::new(10).expect("limit is valid"),
+            ),
+            Err(FilesystemError::Integrity)
+        ));
+
+        let _ = second;
+        let separate = tempfile::tempdir().expect("temporary directory is created");
+        let storage = open_database_path(&separate.path().join("database")).expect("storage opens");
+        create_regular_file(&storage, "branch-event-corrupt");
+        let create_sequence = storage
+            .last_event_sequence()
+            .expect("create sequence is readable");
+        let main = storage.current_branch().expect("main branch is readable");
+        let bad_ordinal = main.head_position().ordinal() + 1;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            storage
+                .branch_events()
+                .expect("branch events column family exists"),
+            encode_branch_position_key(main.branch_identifier().get(), bad_ordinal),
+            encode_u64(create_sequence.get()),
+        );
+        write_batch(storage.database(), batch).expect("corrupt branch event index is written");
+        assert!(matches!(
+            storage.list_branch_events(
+                main.branch_identifier(),
+                None,
+                EventPageLimit::new(10).expect("limit is valid"),
+            ),
+            Err(FilesystemError::Integrity)
+        ));
+
+        let separate = tempfile::tempdir().expect("temporary directory is created");
+        let storage = open_database_path(&separate.path().join("database")).expect("storage opens");
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            storage.branches().expect("branches column family exists"),
+            b"short",
+            b"invalid",
+        );
+        write_batch(storage.database(), batch).expect("corrupt branch key is written");
+        assert!(matches!(
+            storage.create_branch(
+                &BranchName::new("bad-branch-key").expect("branch name is valid"),
+                storage
+                    .current_branch()
+                    .expect("main branch is readable")
+                    .head_position(),
+            ),
+            Err(FilesystemError::Integrity)
+        ));
     }
 
     #[derive(Clone, Debug)]
@@ -7342,11 +8906,28 @@ mod tests {
             .into()
     }
 
+    fn assert_fuse_errno(error: FuseError, expected: fuser::Errno) {
+        match error {
+            FuseError::Errno(actual) => assert_eq!(actual.code(), expected.code()),
+            FuseError::Database | FuseError::Integrity => {
+                panic!("expected errno {}, got {error:?}", expected.code())
+            }
+        }
+    }
+
     fn current_credentials() -> FuseCredentials {
         FuseCredentials {
             uid: current_uid(),
             gid: current_gid(),
         }
+    }
+
+    fn non_current_uid() -> u32 {
+        if current_uid() == 1 { 2 } else { 1 }
+    }
+
+    fn non_current_gid() -> u32 {
+        if current_gid() == 1 { 2 } else { 1 }
     }
 
     fn patterned_bytes(length: usize, salt: usize) -> Vec<u8> {

@@ -382,6 +382,11 @@ fn take_backup_fault(fault: BackupFault) -> bool {
 mod tests {
     use super::*;
 
+    use std::env;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::Mutex;
+
     use crate::filesystem::{BranchName, FilesystemConfiguration};
 
     #[test]
@@ -414,6 +419,78 @@ mod tests {
     #[test]
     fn import_fault_during_replacement_after_old_target_move_rolls_back_target_database() {
         assert_import_fault_preserves_target(BackupFault::DuringReplaceAfterOldMoved);
+    }
+
+    #[test]
+    fn created_backup_identifier_rejects_missing_or_invalid_new_identifiers() {
+        let existing = BTreeSet::from([1]);
+
+        assert_eq!(
+            created_backup_identifier(&existing, &[backup_info(1)]),
+            Err(FilesystemError::Backup)
+        );
+        assert_eq!(
+            created_backup_identifier(&BTreeSet::new(), &[backup_info(0)]),
+            Err(FilesystemError::Backup)
+        );
+        assert_eq!(
+            created_backup_identifier(&existing, &[backup_info(1), backup_info(2)])
+                .expect("new backup identifier is selected")
+                .get(),
+            2
+        );
+    }
+
+    #[test]
+    fn normalized_path_handles_empty_and_relative_noncanonical_components() {
+        let _cwd_lock = CWD_LOCK.lock().expect("cwd lock is available");
+        let _cwd_guard = CurrentDirectoryGuard::new();
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        env::set_current_dir(temporary.path()).expect("cwd changes to temporary directory");
+        let current_directory = env::current_dir().expect("current directory is readable");
+
+        assert_eq!(
+            normalized_path(Path::new(""), FilesystemError::Backup),
+            Err(FilesystemError::Backup)
+        );
+        assert_eq!(
+            normalized_path(
+                Path::new("./missing/../relative-database"),
+                FilesystemError::Import,
+            )
+            .expect("relative path is normalized"),
+            current_directory.join("relative-database")
+        );
+    }
+
+    #[test]
+    fn replace_path_restores_existing_target_when_source_rename_fails() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let target = temporary.path().join("target");
+        let missing_source = temporary.path().join("missing-source");
+
+        fs::write(&target, b"old target").expect("target file is written");
+
+        assert_eq!(
+            replace_path(&target, &missing_source),
+            Err(FilesystemError::Import)
+        );
+        assert_eq!(
+            fs::read(&target).expect("target file is restored after failure"),
+            b"old target"
+        );
+    }
+
+    #[test]
+    fn remove_path_if_exists_removes_files_and_returns_metadata_errors() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let file = temporary.path().join("file");
+        fs::write(&file, b"contents").expect("file is written");
+
+        remove_path_if_exists(&file).expect("file is removed");
+
+        assert!(!file.exists());
+        assert!(remove_path_if_exists(Path::new(OsStr::from_bytes(b"bad\0path"))).is_err());
     }
 
     fn assert_import_fault_preserves_target(fault: BackupFault) {
@@ -456,6 +533,35 @@ mod tests {
         target
             .switch_branch(&target_branch)
             .expect("target-only branch remains after failed import");
+    }
+
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    struct CurrentDirectoryGuard {
+        path: PathBuf,
+    }
+
+    impl CurrentDirectoryGuard {
+        fn new() -> Self {
+            Self {
+                path: env::current_dir().expect("current directory is readable"),
+            }
+        }
+    }
+
+    impl Drop for CurrentDirectoryGuard {
+        fn drop(&mut self) {
+            env::set_current_dir(&self.path).expect("current directory is restored");
+        }
+    }
+
+    fn backup_info(backup_id: u32) -> BackupEngineInfo {
+        BackupEngineInfo {
+            timestamp: 0,
+            backup_id,
+            size: 0,
+            num_files: 0,
+        }
     }
 
     fn filesystem_at(database_directory: PathBuf, mount_point: PathBuf) -> Filesystem {
