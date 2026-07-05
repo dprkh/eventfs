@@ -17,13 +17,14 @@
 ## Recovery
 
 - Restore with `Filesystem::import_backup(database_directory, backup_directory, backup_identifier)`.
-- The import path verifies the requested backup, restores it to a temporary directory, opens the restored RocksDB database, then replaces the target database directory.
+- The import path verifies the requested backup, restores it to a temporary directory, opens and migrates the restored RocksDB database, then replaces the target database directory.
 - A failed import returns `FilesystemError::Import` or `FilesystemError::Integrity` and must not be treated as a successful recovery.
 - After import succeeds, open the restored database with `Filesystem::open` and mount it with `Filesystem::spawn_mount` or `Filesystem::mount`.
 
 ## Upgrade And Downgrade
 
-- eventfs is unreleased; current pre-release APIs and storage schemas are not compatibility baselines.
-- A database created by a newer storage schema is rejected before mutation by older code.
-- Downgrade only by importing a backup whose storage schema is compatible with the older eventfs version.
+- Storage schema version `7` is the first eventfs compatibility baseline.
+- Newer eventfs versions automatically migrate compatible released storage schemas when opening a database or importing a backup.
+- A database created or migrated by a newer storage schema is rejected before mutation by older code.
+- Downgrade only by importing a backup whose storage schema has not been migrated beyond the older eventfs version.
 - Before upgrading or downgrading deployed data, create and retain a complete `BackupDirectory` repository that can be imported by the target version.

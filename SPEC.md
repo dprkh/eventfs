@@ -504,12 +504,18 @@ Storage requirements:
 - `filesystem_metadata` MUST store storage schema version, next inode number, last committed event sequence, next branch identifier, active branch identifier, and volume name.
 - Stored inodes MUST include backup time and creation time.
 - `Filesystem::open` MUST create a missing database and required column families for a new database directory.
-- `Filesystem::open` MUST reject existing databases missing required current metadata values.
-- After the first release, `Filesystem::open` MUST create required current column families for compatible released databases.
-- The first released eventfs version MUST establish the first released storage schema compatibility baseline.
-- Pre-release storage schemas MAY be rejected or replaced until the first release.
-- Released storage schema changes MUST preserve compatibility with all earlier released storage schemas.
-- `Filesystem::open` MUST reject storage schema versions newer than the compiled current storage schema version.
+- Storage schema version `7` MUST be the first released storage schema compatibility baseline.
+- `Filesystem::open` MUST reject existing databases missing metadata required by their stored schema version.
+- `Filesystem::open` MUST reject storage schema versions older than `7`.
+- `Filesystem::open` MUST reject storage schema versions newer than the compiled current storage schema version before mutating storage.
+- `Filesystem::open` MUST automatically migrate compatible released storage schema versions to the compiled current storage schema version before returning.
+- Storage schema migrations MUST run in storage schema version order.
+- Storage schema migrations MUST be idempotent and crash-safe.
+- Storage schema migrations MUST NOT append filesystem events, rewrite committed event keys, change event sequences, or alter user-observable history.
+- Storage schema migrations MAY create column families introduced by later compatible storage schemas.
+- Storage schema migrations MAY rebuild derived indexes from committed events and materialized current filesystem state.
+- Missing column families required by the stored schema version MUST be rejected as corrupt storage.
+- Missing column families introduced after the stored compatible schema version MUST be created during migration.
 - Reads required by FUSE MUST use materialized current filesystem state, not event-log replay.
 - Mutating filesystem operations MUST use synchronous RocksDB write batches.
 
@@ -527,7 +533,7 @@ Storage requirements:
 - `import_backup` MUST verify the requested BackupEngine backup identifier before restoring.
 - `import_backup` MUST reject an empty target database directory as `FilesystemError::Import`.
 - `import_backup` MUST restore the requested backup into a temporary directory.
-- `import_backup` MUST open the restored RocksDB database successfully before replacing the target database directory.
+- `import_backup` MUST open and migrate the restored RocksDB database successfully before replacing the target database directory.
 - `import_backup` MUST discard existing data in the target database directory before moving the verified restored database into place.
 - eventfs MUST NOT perform remote object storage synchronization.
 
@@ -539,8 +545,8 @@ Storage requirements:
 - Backup rotation MUST be performed by retaining, archiving, or replacing whole `BackupDirectory` repositories outside active `create_backup` and `import_backup` calls.
 - eventfs MUST NOT expose APIs for deleting individual BackupEngine backups.
 - Recovery MUST use `Filesystem::import_backup` to restore a verified backup into a target database directory.
-- Recovery MUST open the restored RocksDB database successfully before replacing the target database directory.
-- Downgrade to an older eventfs version MUST use a backup whose storage schema is compatible with that older version.
+- Recovery MUST open and migrate the restored RocksDB database successfully before replacing the target database directory.
+- Downgrade to an older eventfs version MUST use a backup whose storage schema has not been migrated beyond that older version's compiled current storage schema version.
 - Opening a database with a newer storage schema MUST fail before mutation.
 - Repository operational documentation MUST describe data location, backup rotation, recovery, and upgrade/downgrade behavior.
 
@@ -573,8 +579,15 @@ Implementations MUST include automated tests for:
 - Event listing returns paginated events with UTC creation times.
 - Event, branch, branch event, branch file event, and active branch file event iterators return the same ordered records as explicit pagination.
 - Local backup creates increasing non-zero BackupEngine backup identifiers in a persistent backup directory.
-- Local import verifies a requested BackupEngine backup, replaces existing target data, and opens the imported database before success.
+- Local import verifies a requested BackupEngine backup, replaces existing target data, and opens and migrates the imported database before success.
 - Local backup and import reject overlapping source, backup, and target directories after path normalization.
+- Opening storage schema version `7` succeeds and preserves public filesystem behavior.
+- Opening every compatible released storage schema version migrates it to the current storage schema version.
+- Opening storage schema versions older than `7` fails without mutation.
+- Opening storage schema versions newer than the compiled current storage schema version fails without mutation.
+- Interrupted storage schema migrations either resume migration on reopen or leave a valid compatible released schema.
+- Opening a compatible released database with missing column families introduced after its stored schema version creates those column families during migration.
+- Opening a compatible released database with missing column families required by its stored schema version fails as corrupt storage.
 - Event records expose file write and truncate payload sizes without payload bytes.
 - File event payload range reads expose file write and truncate payload bytes.
 - `get_event` returns the requested event or no event.

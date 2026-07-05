@@ -134,23 +134,23 @@ pub(crate) fn open_database_path(path: &Path) -> Result<Storage, FilesystemError
     let block_cache = Cache::new_lru_cache(ROCKSDB_BLOCK_CACHE_CAPACITY);
     let options = database_options(is_new_database, &block_cache);
 
-    if is_new_database {
+    let database = if is_new_database {
         let descriptors = column_family_descriptors(required_column_family_names(), &block_cache);
         let database = DB::open_cf_descriptors(&options, path, descriptors)
             .map_err(|_| FilesystemError::Database)?;
         initialize_new_database(&database)?;
-        let write_state = load_write_state(&database)?;
-        Ok(storage(database, write_state))
+        database
     } else {
         let existing_column_families = existing_column_family_names(&options, path)?;
-        validate_required_column_families(&existing_column_families)?;
         let descriptors = column_family_descriptors(existing_column_families, &block_cache);
-        let database = DB::open_cf_descriptors(&options, path, descriptors)
+        let mut database = DB::open_cf_descriptors(&options, path, descriptors)
             .map_err(|_| FilesystemError::Database)?;
+        migrate_database_to_current_schema(&mut database, &block_cache)?;
         validate_existing_database(&database)?;
-        let write_state = load_write_state(&database)?;
-        Ok(storage(database, write_state))
-    }
+        database
+    };
+    let write_state = load_write_state(&database)?;
+    Ok(storage(database, write_state))
 }
 
 fn storage(database: DB, write_state: WriteState) -> Storage {
@@ -164,6 +164,7 @@ fn storage(database: DB, write_state: WriteState) -> Storage {
 
 type FuseResult<T> = Result<T, FuseError>;
 
+const STORAGE_SCHEMA_VERSION_BASELINE: u64 = 7;
 const STORAGE_SCHEMA_VERSION_CURRENT: u64 = 7;
 
 const EVENT_SEQUENCE_INITIAL: EventSequence = EventSequence::new(0);
@@ -4298,22 +4299,110 @@ fn load_write_state(database: &DB) -> Result<WriteState, FilesystemError> {
     })
 }
 
-fn validate_required_column_families(
-    existing_column_families: &BTreeSet<String>,
+struct StorageSchemaMigration {
+    source_version: u64,
+    target_version: u64,
+    migrate: fn(&mut DB, &mut WriteBatch) -> Result<(), FilesystemError>,
+}
+
+const STORAGE_SCHEMA_MIGRATIONS: &[StorageSchemaMigration] = &[];
+
+fn migrate_database_to_current_schema(
+    database: &mut DB,
+    block_cache: &Cache,
 ) -> Result<(), FilesystemError> {
-    for name in COLUMN_FAMILY_REQUIRED {
-        if !existing_column_families.contains(*name) {
+    let mut schema_version = read_storage_schema_version(database)?;
+    validate_supported_storage_schema_version(schema_version)?;
+    validate_database_column_families(
+        database,
+        &required_column_family_names_for_schema(schema_version)?,
+    )?;
+
+    while schema_version < STORAGE_SCHEMA_VERSION_CURRENT {
+        let migration = storage_schema_migration(schema_version)?;
+        create_column_families_for_schema(database, migration.target_version, block_cache)?;
+
+        let mut batch = WriteBatch::default();
+        (migration.migrate)(database, &mut batch)?;
+        let metadata = database
+            .cf_handle(COLUMN_FAMILY_FILESYSTEM_METADATA)
+            .ok_or(FilesystemError::Integrity)?;
+        batch.put_cf(
+            metadata,
+            METADATA_KEY_STORAGE_SCHEMA_VERSION,
+            encode_u64(migration.target_version),
+        );
+        write_batch(database, batch)?;
+        schema_version = migration.target_version;
+    }
+
+    validate_database_column_families(
+        database,
+        &required_column_family_names_for_schema(STORAGE_SCHEMA_VERSION_CURRENT)?,
+    )
+}
+
+fn storage_schema_migration(
+    schema_version: u64,
+) -> Result<&'static StorageSchemaMigration, FilesystemError> {
+    STORAGE_SCHEMA_MIGRATIONS
+        .iter()
+        .find(|migration| migration.source_version == schema_version)
+        .filter(|migration| {
+            migration.target_version > migration.source_version
+                && migration.target_version <= STORAGE_SCHEMA_VERSION_CURRENT
+        })
+        .ok_or(FilesystemError::Integrity)
+}
+
+fn create_column_families_for_schema(
+    database: &mut DB,
+    schema_version: u64,
+    block_cache: &Cache,
+) -> Result<(), FilesystemError> {
+    for name in required_column_family_names_for_schema(schema_version)? {
+        if database.cf_handle(&name).is_none() {
+            database
+                .create_cf(&name, &column_family_options(&name, block_cache))
+                .map_err(|_| FilesystemError::Database)?;
+        }
+    }
+    Ok(())
+}
+
+fn required_column_family_names_for_schema(
+    schema_version: u64,
+) -> Result<BTreeSet<String>, FilesystemError> {
+    validate_supported_storage_schema_version(schema_version)?;
+    Ok(required_column_family_names())
+}
+
+fn validate_database_column_families(
+    database: &DB,
+    required_column_families: &BTreeSet<String>,
+) -> Result<(), FilesystemError> {
+    for name in required_column_families {
+        if database.cf_handle(name).is_none() {
             return Err(FilesystemError::Integrity);
         }
     }
     Ok(())
 }
 
-fn validate_existing_database(database: &DB) -> Result<(), FilesystemError> {
-    let schema_version = read_metadata_u64(database, METADATA_KEY_STORAGE_SCHEMA_VERSION)?;
-    if schema_version > STORAGE_SCHEMA_VERSION_CURRENT {
+fn validate_supported_storage_schema_version(schema_version: u64) -> Result<(), FilesystemError> {
+    if !(STORAGE_SCHEMA_VERSION_BASELINE..=STORAGE_SCHEMA_VERSION_CURRENT).contains(&schema_version)
+    {
         return Err(FilesystemError::Integrity);
     }
+    Ok(())
+}
+
+fn read_storage_schema_version(database: &DB) -> Result<u64, FilesystemError> {
+    read_metadata_u64(database, METADATA_KEY_STORAGE_SCHEMA_VERSION)
+}
+
+fn validate_existing_database(database: &DB) -> Result<(), FilesystemError> {
+    let schema_version = read_storage_schema_version(database)?;
     if schema_version != STORAGE_SCHEMA_VERSION_CURRENT {
         return Err(FilesystemError::Integrity);
     }
