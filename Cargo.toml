@@ -1,0 +1,21 @@
+[package]
+name = "eventfs"
+version = "0.1.0"
+edition = "2024"
+description = "An event-sourced FUSE filesystem."
+repository = "https://github.com/dprkh/eventfs"
+readme = "README.md"
+
+[dependencies]
+fuser = "0.17"
+blake3 = "1"
+fastcdc = { version = "4", default-features = false }
+libc = "0.2"
+rocksdb = "0.24"
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+time = { version = "0.3", features = ["serde"] }
+
+[dev-dependencies]
+anyhow = "1.0"
