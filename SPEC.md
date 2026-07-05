@@ -115,10 +115,12 @@ impl EventRecord {
     pub fn kind(&self) -> EventKind;
     pub fn created_at(&self) -> time::UtcDateTime;
     pub fn file_identifier(&self) -> Option<FileIdentifier>;
+    pub fn secondary_file_identifier(&self) -> Option<FileIdentifier>;
     pub fn branch_identifier(&self) -> Option<BranchIdentifier>;
     pub fn branch_position(&self) -> Option<BranchPosition>;
     pub fn first_parent_sequence(&self) -> Option<EventSequence>;
     pub fn path(&self) -> Option<&str>;
+    pub fn secondary_path(&self) -> Option<&str>;
     pub fn offset(&self) -> Option<u64>;
     pub fn byte_length(&self) -> Option<u64>;
     pub fn old_file_size(&self) -> Option<u64>;
@@ -322,6 +324,7 @@ impl Filesystem {
 - `BranchPageLimit` MUST reject zero.
 - `BranchName` MUST reject empty names.
 - `EventRecord` MUST expose event sequence, event kind, UTC creation time, optional affected file identifier, and optional event path.
+- `EventRecord` MUST expose an optional secondary affected file identifier and secondary path for single-event operations that mutate two regular files.
 - `EventRecord` MUST expose branch identifier, branch position, and first-parent event sequence when the event belongs to a branch.
 - `EventRecord` MUST expose file write and truncate payload byte lengths, not payload bytes.
 - `FileSnapshot` MUST expose the file identifier, source event sequence, branch position, and file size.
@@ -336,7 +339,7 @@ impl Filesystem {
 - `Filesystem` MUST implement `fuser::Filesystem`.
 - `Filesystem` MUST implement `Clone`, `Send`, and `Sync`.
 - `Filesystem::mount` and `Filesystem::spawn_mount` MUST mount the filesystem at `FilesystemConfiguration.mount_point`.
-- The mounted filesystem MUST support lookup, attribute read, attribute update, node creation, directory creation, file creation, file open, file read, file write, file truncate, flush, file synchronization, directory open, directory read, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, and filesystem statistics.
+- The mounted filesystem MUST support lookup, attribute read, attribute update, node creation, directory creation, file creation, file open, file read, file write, file truncate, flush, file synchronization, directory open, directory read, directory read with attributes, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, filesystem statistics, extended attributes, POSIX byte-range locks, block mapping, ioctl rejection, poll readiness, space allocation, sparse seek, file-range copy, macOS volume rename, macOS file-content exchange, and macOS extended times.
 - Unsupported FUSE operations MUST return the platform-appropriate unsupported-operation error and MUST NOT append events.
 - Failed supported FUSE operations MUST invoke the configured FUSE error callback once with `FuseOperationError::is_unsupported` returning `false`.
 - Unsupported FUSE operations MUST invoke the configured FUSE error callback once with `FuseOperationError::is_unsupported` returning `true`.
@@ -350,21 +353,43 @@ impl Filesystem {
 - Filesystem statistics MUST report `bsize` as the eventfs preferred file I/O block size.
 - Filesystem statistics MUST report `namelen` as 255 bytes.
 - FUSE name components longer than 255 bytes MUST be rejected.
+- Extended attributes MUST be inode-scoped, branch-local, opaque byte values keyed by non-empty names no longer than 255 bytes.
+- `setxattr` MUST honor create and replace flags, reject unsupported position values, and append an extended-attribute-set event on success.
+- `getxattr` and `listxattr` MUST honor size probes and MUST return `ERANGE` when a non-zero output size is too small.
+- Missing extended attributes MUST return the platform missing-attribute errno.
+- `removexattr` MUST append an extended-attribute-removed event on success.
+- `readdirplus` MUST return the same entries as `readdir` with stable attributes from one storage snapshot.
+- `getlk` and `setlk` MUST implement process-local advisory byte-range locks, including blocking waits when requested, and MUST NOT append events.
+- `flush` and `release` MUST clear byte-range locks held by the released lock owner.
+- `bmap` MUST return the requested logical block index after inode validation and MUST NOT append events.
+- `ioctl` MUST expose no eventfs-specific commands, MUST return `ENOTTY` for every command after inode validation, and MUST NOT append events.
+- `poll` MUST report regular files and directories as immediately readable and writable according to requested events and access checks, and MUST NOT append events.
+- `fallocate` MUST support preallocation by size extension, keep-size no-op allocation, punch-hole, and zero-range.
+- `fallocate` collapse-range, insert-range, unshare-range, and unknown mode bits MUST return `EINVAL`.
+- `fallocate` requests with no logical file state change MUST NOT append events.
+- `lseek` MUST support `SEEK_DATA` and `SEEK_HOLE` using eventfs sparse extents and MUST NOT append events.
+- `copy_file_range` MUST reject non-empty flags and MUST append one destination file write event for copied bytes.
+- macOS `setvolname` MUST persist the volume name and append one volume-renamed event.
+- macOS `exchange` MUST atomically swap regular-file contents and append one file-contents-exchanged event with primary and secondary file identifiers and paths.
+- macOS `getxtimes` MUST return stored backup and creation times and MUST NOT append events.
 
 ## Event Semantics
 
-- Every mutating supported FUSE operation MUST create exactly one durable event.
+- Every mutating supported FUSE operation that changes logical filesystem state MUST create exactly one durable event.
+- Supported FUSE operations that do not change logical filesystem state MUST NOT append events.
 - Events MUST be assigned strictly increasing `u64` event sequences.
-- Event sequence assignment, event append, branch head update, branch event index updates, per-file event index updates, current extent updates, event payload extent updates, and file snapshot extent updates created for the event MUST commit in one RocksDB write batch.
+- Event sequence assignment, event append, branch head update, branch event index updates, per-file event index updates, current extent updates, event payload extent updates, file snapshot extent updates, extended attribute updates, and filesystem metadata updates created for the event MUST commit in one RocksDB write batch.
 - Committed event keys MUST NOT be overwritten or deleted.
-- Every event MUST store schema version, sequence, kind, UTC creation time, affected file identifier when applicable, path when applicable, and byte range when applicable.
+- Every event MUST store schema version, sequence, kind, UTC creation time, affected file identifier when applicable, secondary affected file identifier when applicable, path when applicable, secondary path when applicable, and byte range when applicable.
 - Branch events MUST store branch identifier, branch position, and first-parent event sequence.
 - File write events MUST store old file size, new file size, overwritten byte length, and written byte length in the durable event record.
 - File write events MUST store overwritten bytes and written bytes as durable event payload extents outside event metadata.
 - File truncate events MUST store old file size, new file size, and removed byte length in the durable event record.
 - File truncate events MUST store removed bytes for shrink operations as durable event payload extents outside event metadata.
 - Zero-filled file extension MUST be represented by old and new file sizes, not repeated zero bytes.
-- `EventKind` MUST include filesystem initialization, node creation, directory creation, file creation, file write, file truncate, metadata change, node unlink, directory removal, node rename, hard link creation, and symbolic link creation.
+- `EventKind` MUST include filesystem initialization, node creation, directory creation, file creation, file write, file truncate, metadata change, node unlink, directory removal, node rename, hard link creation, symbolic link creation, extended attribute set, extended attribute removal, file range zeroing, file contents exchange, and volume rename.
+- Extended attribute set and removal, file range zeroing, file contents exchange, volume rename, file-range copy destination writes, and size-growing allocation MUST append events when they change logical filesystem state.
+- Read-only operations, locks, poll, bmap, ioctl failures, and allocation requests with no logical state change MUST NOT append events.
 - `get_event` MUST return the event at the requested sequence when it exists.
 - `current_branch` MUST return the currently active branch.
 - `list_branches` MUST return branches ordered by branch identifier with pagination.
@@ -396,6 +421,7 @@ The RocksDB database MUST contain these column families:
 - `events`
 - `inodes`
 - `directory_entries`
+- `extended_attributes`
 - `filesystem_metadata`
 - `file_events`
 - `branches`
@@ -412,6 +438,7 @@ Storage requirements:
 - `events` keys MUST be big-endian event sequences.
 - `inodes` keys MUST be ordered by branch identifier and inode number.
 - `directory_entries` keys MUST be ordered by branch identifier, parent inode number, and name.
+- `extended_attributes` keys MUST be ordered by branch identifier, inode number, and attribute name.
 - `file_events` keys MUST be ordered by file identifier and event sequence.
 - `branch_events` keys MUST be ordered by branch identifier and branch position.
 - `branch_file_events` keys MUST be ordered by branch identifier, file identifier, and branch position.
@@ -426,7 +453,8 @@ Storage requirements:
 - Content chunk identifiers MUST be cryptographic digests of chunk bytes and MUST NOT use FastCDC rolling fingerprints.
 - eventfs MUST use RocksDB pinned reads for durable byte content whenever the API or internal operation can borrow the value.
 - eventfs MUST NOT materialize owned byte buffers for durable byte content unless mutation, FUSE output, serialization, or caller-owned copies require it.
-- `filesystem_metadata` MUST store storage schema version, next inode number, last committed event sequence, next branch identifier, and active branch identifier.
+- `filesystem_metadata` MUST store storage schema version, next inode number, last committed event sequence, next branch identifier, active branch identifier, and volume name.
+- Stored inodes MUST include backup time and creation time.
 - `Filesystem::open` MUST create a missing database and required column families for a new database directory.
 - `Filesystem::open` MUST reject existing databases missing required current metadata values.
 - After the first release, `Filesystem::open` MUST create required current column families for compatible released databases.
@@ -515,6 +543,8 @@ Implementations MUST include automated tests for:
 - Branch switching, divergence, file event listing, and snapshot reads preserve independent file contents across branches.
 - Event debug formatting does not expose stored file payload bytes.
 - Every supported FUSE operation works through the mounted filesystem.
+- Extended attributes, copy-range, allocation, sparse seek, locks, poll, bmap, ioctl failure, macOS volume rename, macOS file exchange, and macOS extended times work through the mounted filesystem where supported by the target operating system.
+- Mutating supported FUSE operations append exactly the specified event kinds, and supported read-only or no-op operations append none.
 - Configured FUSE error callbacks receive failed supported operation errors and unsupported operation errors with the returned errno.
 - Successful FUSE operations do not invoke configured FUSE error callbacks.
 - Mounted FUSE operation tests cover success cases, failure cases, edge cases, event append behavior for mutating operations, and no-event behavior for read-only and unsupported operations.

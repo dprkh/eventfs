@@ -56,21 +56,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - [x] `releasedir`
 - [x] `fsyncdir`
 - [x] `statfs`
-- [ ] `setxattr`
-- [ ] `getxattr`
-- [ ] `listxattr`
-- [ ] `removexattr`
+- [x] `setxattr`
+- [x] `getxattr`
+- [x] `listxattr`
+- [x] `removexattr`
 - [x] `access`
 - [x] `create`
-- [ ] `readdirplus`
-- [ ] `getlk`
-- [ ] `setlk`
-- [ ] `bmap`
-- [ ] `ioctl`
-- [ ] `poll`
-- [ ] `fallocate`
-- [ ] `lseek`
-- [ ] `copy_file_range`
-- [ ] `setvolname`
-- [ ] `exchange`
-- [ ] `getxtimes`
+- [x] `readdirplus`
+- [x] `getlk`
+- [x] `setlk`
+- [x] `bmap`
+- [x] `ioctl`
+- [x] `poll`
+- [x] `fallocate`
+- [x] `lseek`
+- [x] `copy_file_range`
+- [x] `setvolname`
+- [x] `exchange`
+- [x] `getxtimes`

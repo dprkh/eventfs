@@ -215,17 +215,76 @@ pub fn statvfs(path: &Path) -> libc::statvfs {
     unsafe { statistics.assume_init() }
 }
 
-pub fn assert_unsupported_xattrs(path: &Path) {
-    assert_eq!(setxattr(path), -1, "setxattr fails as unsupported");
-    assert_eq!(getxattr(path), -1, "getxattr fails as unsupported");
-    assert_eq!(removexattr(path), -1, "removexattr fails as unsupported");
+pub fn set_xattr(path: &Path, name: &str, value: &[u8], flags: i32) -> std::io::Result<()> {
+    let path = c_path(path);
+    let name = CString::new(name).expect("xattr name is valid");
+    let result = unsafe { setxattr_raw(&path, &name, value, flags) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(last_os_error())
+    }
+}
+
+pub fn get_xattr(path: &Path, name: &str) -> std::io::Result<Vec<u8>> {
+    let path = c_path(path);
+    let name = CString::new(name).expect("xattr name is valid");
+    let size = unsafe { getxattr_raw(&path, &name, ptr::null_mut(), 0) };
+    if size < 0 {
+        return Err(last_os_error());
+    }
+    let mut value = vec![0; size as usize];
+    let result = unsafe { getxattr_raw(&path, &name, value.as_mut_ptr().cast(), value.len()) };
+    if result >= 0 {
+        value.truncate(result as usize);
+        Ok(value)
+    } else {
+        Err(last_os_error())
+    }
+}
+
+pub fn list_xattr(path: &Path) -> std::io::Result<Vec<u8>> {
+    let path = c_path(path);
+    let size = unsafe { listxattr_raw(&path, ptr::null_mut(), 0) };
+    if size < 0 {
+        return Err(last_os_error());
+    }
+    let mut value = vec![0; size as usize];
+    let result = unsafe { listxattr_raw(&path, value.as_mut_ptr().cast(), value.len()) };
+    if result >= 0 {
+        value.truncate(result as usize);
+        Ok(value)
+    } else {
+        Err(last_os_error())
+    }
+}
+
+pub fn remove_xattr(path: &Path, name: &str) -> std::io::Result<()> {
+    let path = c_path(path);
+    let name = CString::new(name).expect("xattr name is valid");
+    let result = unsafe { removexattr_raw(&path, &name) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(last_os_error())
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn setxattr(path: &Path) -> i32 {
-    let path = c_path(path);
-    let name = CString::new("user.eventfs.unsupported").expect("xattr name is valid");
-    let value = b"value";
+unsafe fn setxattr_raw(path: &CString, name: &CString, value: &[u8], flags: i32) -> i32 {
+    unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            flags,
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn setxattr_raw(path: &CString, name: &CString, value: &[u8], flags: i32) -> i32 {
     unsafe {
         libc::setxattr(
             path.as_ptr(),
@@ -233,52 +292,48 @@ fn setxattr(path: &Path) -> i32 {
             value.as_ptr().cast(),
             value.len(),
             0,
-        )
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn setxattr(path: &Path) -> i32 {
-    let path = c_path(path);
-    let name = CString::new("user.eventfs.unsupported").expect("xattr name is valid");
-    let value = b"value";
-    unsafe {
-        libc::setxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-            0,
+            flags,
         )
     }
 }
 
 #[cfg(target_os = "linux")]
-fn getxattr(path: &Path) -> isize {
-    let path = c_path(path);
-    let name = CString::new("user.eventfs.unsupported").expect("xattr name is valid");
-    unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), ptr::null_mut(), 0) }
+unsafe fn getxattr_raw(
+    path: &CString,
+    name: &CString,
+    value: *mut libc::c_void,
+    size: usize,
+) -> isize {
+    unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), value, size) }
 }
 
 #[cfg(target_os = "macos")]
-fn getxattr(path: &Path) -> isize {
-    let path = c_path(path);
-    let name = CString::new("user.eventfs.unsupported").expect("xattr name is valid");
-    unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), ptr::null_mut(), 0, 0, 0) }
+unsafe fn getxattr_raw(
+    path: &CString,
+    name: &CString,
+    value: *mut libc::c_void,
+    size: usize,
+) -> isize {
+    unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), value, size, 0, 0) }
 }
 
 #[cfg(target_os = "linux")]
-fn removexattr(path: &Path) -> i32 {
-    let path = c_path(path);
-    let name = CString::new("user.eventfs.unsupported").expect("xattr name is valid");
+unsafe fn listxattr_raw(path: &CString, value: *mut libc::c_char, size: usize) -> isize {
+    unsafe { libc::listxattr(path.as_ptr(), value, size) }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn listxattr_raw(path: &CString, value: *mut libc::c_char, size: usize) -> isize {
+    unsafe { libc::listxattr(path.as_ptr(), value, size, 0) }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn removexattr_raw(path: &CString, name: &CString) -> i32 {
     unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) }
 }
 
 #[cfg(target_os = "macos")]
-fn removexattr(path: &Path) -> i32 {
-    let path = c_path(path);
-    let name = CString::new("user.eventfs.unsupported").expect("xattr name is valid");
+unsafe fn removexattr_raw(path: &CString, name: &CString) -> i32 {
     unsafe { libc::removexattr(path.as_ptr(), name.as_ptr(), 0) }
 }
 

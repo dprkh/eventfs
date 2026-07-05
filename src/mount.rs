@@ -36,11 +36,12 @@ impl Drop for MountedFilesystem {
 
 pub(crate) fn mount(filesystem: &Filesystem) -> Result<(), FilesystemError> {
     validate_mount_point(filesystem.configuration().mount_point())?;
+    let configuration = mount_configuration(filesystem)?;
     filesystem.mark_mounted()?;
     let result = fuser::mount2(
         filesystem.clone(),
         filesystem.configuration().mount_point(),
-        &mount_configuration(),
+        &configuration,
     )
     .map_err(|_| FilesystemError::FilesystemOperation);
     record_blocking_mount_result(filesystem, result)
@@ -48,11 +49,12 @@ pub(crate) fn mount(filesystem: &Filesystem) -> Result<(), FilesystemError> {
 
 pub(crate) fn spawn_mount(filesystem: &Filesystem) -> Result<MountedFilesystem, FilesystemError> {
     validate_mount_point(filesystem.configuration().mount_point())?;
+    let configuration = mount_configuration(filesystem)?;
     filesystem.mark_mounted()?;
     match fuser::spawn_mount2(
         filesystem.clone(),
         filesystem.configuration().mount_point(),
-        &mount_configuration(),
+        &configuration,
     ) {
         Ok(session) => Ok(MountedFilesystem {
             session: Some(session),
@@ -101,11 +103,15 @@ fn validate_mount_point(path: &Path) -> Result<(), FilesystemError> {
     }
 }
 
-fn mount_configuration() -> fuser::Config {
+fn mount_configuration(filesystem: &Filesystem) -> Result<fuser::Config, FilesystemError> {
     let mut configuration = fuser::Config::default();
+    let volume_name = filesystem
+        .storage()
+        .volume_name()
+        .map_err(|_| FilesystemError::FilesystemOperation)?;
     configuration
         .mount_options
-        .push(fuser::MountOption::FSName("eventfs".to_owned()));
+        .push(fuser::MountOption::FSName(volume_name));
     #[cfg(target_os = "macos")]
     {
         configuration
@@ -115,7 +121,7 @@ fn mount_configuration() -> fuser::Config {
             .mount_options
             .push(fuser::MountOption::CUSTOM("noapplexattr".to_owned()));
     }
-    configuration
+    Ok(configuration)
 }
 
 #[cfg(test)]

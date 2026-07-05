@@ -4,7 +4,7 @@ use std::fs;
 use std::num::NonZeroU64;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ pub struct Filesystem {
     database_directory: PathBuf,
     storage: Arc<Storage>,
     mount_state: Arc<Mutex<MountState>>,
+    lock_table: Arc<(Mutex<LockTable>, Condvar)>,
 }
 
 impl Filesystem {
@@ -649,6 +650,16 @@ pub enum EventKind {
     HardLinkCreated,
     /// Symbolic link creation event.
     SymbolicLinkCreated,
+    /// Extended attribute set event.
+    ExtendedAttributeSet,
+    /// Extended attribute removal event.
+    ExtendedAttributeRemoved,
+    /// Regular file range zeroing event.
+    FileRangeZeroed,
+    /// Regular file contents exchange event.
+    FileContentsExchanged,
+    /// Volume rename event.
+    VolumeRenamed,
 }
 
 /// Committed filesystem event exposed by event listing.
@@ -659,10 +670,12 @@ pub struct EventRecord {
     kind: EventKind,
     created_at: UtcDateTime,
     file_identifier: Option<FileIdentifier>,
+    secondary_file_identifier: Option<FileIdentifier>,
     branch_identifier: Option<BranchIdentifier>,
     branch_position: Option<BranchPosition>,
     first_parent_sequence: Option<EventSequence>,
     path: Option<String>,
+    secondary_path: Option<String>,
     offset: Option<u64>,
     byte_length: Option<u64>,
     payload: EventPayload,
@@ -689,6 +702,11 @@ impl EventRecord {
         self.file_identifier
     }
 
+    /// Returns the secondary affected regular file identifier, when applicable.
+    pub fn secondary_file_identifier(&self) -> Option<FileIdentifier> {
+        self.secondary_file_identifier
+    }
+
     /// Returns the branch identifier, when the event belongs to a branch.
     pub fn branch_identifier(&self) -> Option<BranchIdentifier> {
         self.branch_identifier
@@ -709,6 +727,11 @@ impl EventRecord {
         self.path.as_deref()
     }
 
+    /// Returns the secondary affected path, when applicable.
+    pub fn secondary_path(&self) -> Option<&str> {
+        self.secondary_path.as_deref()
+    }
+
     /// Returns the affected byte offset, when applicable.
     pub fn offset(&self) -> Option<u64> {
         self.offset
@@ -724,7 +747,9 @@ impl EventRecord {
         match &self.payload {
             EventPayload::FileWrite { old_file_size, .. }
             | EventPayload::FileTruncate { old_file_size, .. } => Some(*old_file_size),
-            EventPayload::None => None,
+            EventPayload::None
+            | EventPayload::FileSizeChange { .. }
+            | EventPayload::FileExchange { .. } => None,
         }
     }
 
@@ -733,7 +758,9 @@ impl EventRecord {
         match &self.payload {
             EventPayload::FileWrite { new_file_size, .. }
             | EventPayload::FileTruncate { new_file_size, .. } => Some(*new_file_size),
-            EventPayload::None => None,
+            EventPayload::None
+            | EventPayload::FileSizeChange { .. }
+            | EventPayload::FileExchange { .. } => None,
         }
     }
 
@@ -744,7 +771,10 @@ impl EventRecord {
                 overwritten_byte_length,
                 ..
             } => Some(*overwritten_byte_length),
-            EventPayload::None | EventPayload::FileTruncate { .. } => None,
+            EventPayload::None
+            | EventPayload::FileTruncate { .. }
+            | EventPayload::FileSizeChange { .. }
+            | EventPayload::FileExchange { .. } => None,
         }
     }
 
@@ -755,7 +785,10 @@ impl EventRecord {
                 written_byte_length,
                 ..
             } => Some(*written_byte_length),
-            EventPayload::None | EventPayload::FileTruncate { .. } => None,
+            EventPayload::None
+            | EventPayload::FileTruncate { .. }
+            | EventPayload::FileSizeChange { .. }
+            | EventPayload::FileExchange { .. } => None,
         }
     }
 
@@ -766,7 +799,10 @@ impl EventRecord {
                 removed_byte_length,
                 ..
             } => Some(*removed_byte_length),
-            EventPayload::None | EventPayload::FileWrite { .. } => None,
+            EventPayload::None
+            | EventPayload::FileWrite { .. }
+            | EventPayload::FileSizeChange { .. }
+            | EventPayload::FileExchange { .. } => None,
         }
     }
 }
@@ -780,10 +816,12 @@ impl fmt::Debug for EventRecord {
             .field("kind", &self.kind)
             .field("created_at", &self.created_at)
             .field("file_identifier", &self.file_identifier)
+            .field("secondary_file_identifier", &self.secondary_file_identifier)
             .field("branch_identifier", &self.branch_identifier)
             .field("branch_position", &self.branch_position)
             .field("first_parent_sequence", &self.first_parent_sequence)
             .field("path", &self.path)
+            .field("secondary_path", &self.secondary_path)
             .field("offset", &self.offset)
             .field("byte_length", &self.byte_length)
             .finish()
@@ -797,10 +835,12 @@ impl PartialEq for EventRecord {
             && self.kind == other.kind
             && self.created_at == other.created_at
             && self.file_identifier == other.file_identifier
+            && self.secondary_file_identifier == other.secondary_file_identifier
             && self.branch_identifier == other.branch_identifier
             && self.branch_position == other.branch_position
             && self.first_parent_sequence == other.first_parent_sequence
             && self.path == other.path
+            && self.secondary_path == other.secondary_path
             && self.offset == other.offset
             && self.byte_length == other.byte_length
             && self.payload == other.payload
@@ -1121,24 +1161,40 @@ impl EventRecord {
         byte_length: Option<u64>,
     ) -> Self {
         Self {
-            schema_version: 6,
+            schema_version: 7,
             sequence,
             kind,
             created_at,
             file_identifier,
+            secondary_file_identifier: None,
             branch_identifier: None,
             branch_position: None,
             first_parent_sequence: None,
             path,
+            secondary_path: None,
             offset,
             byte_length,
             payload: EventPayload::None,
         }
     }
 
+    pub(crate) fn with_secondary_file(
+        mut self,
+        file_identifier: FileIdentifier,
+        path: Option<String>,
+    ) -> Self {
+        self.secondary_file_identifier = Some(file_identifier);
+        self.secondary_path = path;
+        self
+    }
+
     pub(crate) fn with_payload(mut self, payload: EventPayload) -> Self {
         self.payload = payload;
         self
+    }
+
+    pub(crate) fn payload(&self) -> &EventPayload {
+        &self.payload
     }
 
     pub(crate) fn with_branch(
@@ -1220,6 +1276,14 @@ pub(crate) enum EventPayload {
         new_file_size: u64,
         removed_byte_length: u64,
     },
+    FileSizeChange {
+        old_file_size: u64,
+        new_file_size: u64,
+    },
+    FileExchange {
+        primary_file_size: u64,
+        secondary_file_size: u64,
+    },
 }
 
 impl EventPage {
@@ -1255,6 +1319,24 @@ impl FilesystemConfiguration {
 }
 
 impl fuser::Filesystem for Filesystem {
+    fn init(
+        &mut self,
+        _req: &fuser::Request,
+        config: &mut fuser::KernelConfig,
+    ) -> std::io::Result<()> {
+        let mut capabilities =
+            fuser::InitFlags::FUSE_POSIX_LOCKS | fuser::InitFlags::FUSE_DO_READDIRPLUS;
+        #[cfg(target_os = "macos")]
+        {
+            capabilities |= fuser::InitFlags::FUSE_ALLOCATE
+                | fuser::InitFlags::FUSE_EXCHANGE_DATA
+                | fuser::InitFlags::FUSE_VOL_RENAME
+                | fuser::InitFlags::FUSE_XTIMES;
+        }
+        let _ = config.add_capabilities(capabilities);
+        Ok(())
+    }
+
     fn lookup(
         &self,
         _req: &fuser::Request,
@@ -1295,7 +1377,7 @@ impl fuser::Filesystem for Filesystem {
         _fh: Option<fuser::FileHandle>,
         crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
+        bkuptime: Option<SystemTime>,
         flags: Option<fuser::BsdFileFlags>,
         reply: fuser::ReplyAttr,
     ) {
@@ -1308,6 +1390,7 @@ impl fuser::Filesystem for Filesystem {
             mtime,
             ctime,
             crtime,
+            bkuptime,
             flags: flags.map(|flags| flags.bits()),
         };
         match self
@@ -1536,9 +1619,10 @@ impl fuser::Filesystem for Filesystem {
         _req: &fuser::Request,
         _ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
-        _lock_owner: fuser::LockOwner,
+        lock_owner: fuser::LockOwner,
         reply: fuser::ReplyEmpty,
     ) {
+        self.clear_file_locks_for_owner(lock_owner);
         reply.ok();
     }
 
@@ -1548,10 +1632,13 @@ impl fuser::Filesystem for Filesystem {
         _ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
         _flags: fuser::OpenFlags,
-        _lock_owner: Option<fuser::LockOwner>,
+        lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        if let Some(lock_owner) = lock_owner {
+            self.clear_file_locks_for_owner(lock_owner);
+        }
         reply.ok();
     }
 
@@ -1643,46 +1730,64 @@ impl fuser::Filesystem for Filesystem {
 
     fn setxattr(
         &self,
-        _req: &fuser::Request,
-        _ino: fuser::INodeNo,
-        _name: &OsStr,
-        _value: &[u8],
-        _flags: i32,
-        _position: u32,
+        req: &fuser::Request,
+        ino: fuser::INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
         reply: fuser::ReplyEmpty,
     ) {
-        reply.error(self.unsupported_fuse_error("setxattr"));
+        let result = if position == 0 {
+            self.storage
+                .setxattr(ino.into(), name, value, flags, req.uid(), req.gid())
+        } else {
+            Err(storage::FuseError::Errno(fuser::Errno::EINVAL))
+        };
+        match result {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(self.fuse_error("setxattr", error)),
+        }
     }
 
     fn getxattr(
         &self,
         _req: &fuser::Request,
-        _ino: fuser::INodeNo,
-        _name: &OsStr,
-        _size: u32,
+        ino: fuser::INodeNo,
+        name: &OsStr,
+        size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        reply.error(self.unsupported_fuse_error("getxattr"));
+        match self.storage.getxattr(ino.into(), name) {
+            Ok(value) => reply_xattr_bytes(reply, "getxattr", self, &value, size),
+            Err(error) => reply.error(self.fuse_error("getxattr", error)),
+        }
     }
 
     fn listxattr(
         &self,
         _req: &fuser::Request,
-        _ino: fuser::INodeNo,
-        _size: u32,
+        ino: fuser::INodeNo,
+        size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        reply.error(self.unsupported_fuse_error("listxattr"));
+        match self.storage.listxattr(ino.into()) {
+            Ok(list) => reply_xattr_bytes(reply, "listxattr", self, &list.bytes, size),
+            Err(error) => reply.error(self.fuse_error("listxattr", error)),
+        }
     }
 
     fn removexattr(
         &self,
-        _req: &fuser::Request,
-        _ino: fuser::INodeNo,
-        _name: &OsStr,
+        req: &fuser::Request,
+        ino: fuser::INodeNo,
+        name: &OsStr,
         reply: fuser::ReplyEmpty,
     ) {
-        reply.error(self.unsupported_fuse_error("removexattr"));
+        match self.storage.removexattr(ino.into(), name, req.uid()) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(self.fuse_error("removexattr", error)),
+        }
     }
 
     fn access(
@@ -1738,60 +1843,98 @@ impl fuser::Filesystem for Filesystem {
     fn readdirplus(
         &self,
         _req: &fuser::Request,
-        _ino: fuser::INodeNo,
+        ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
-        _offset: u64,
-        reply: fuser::ReplyDirectoryPlus,
+        offset: u64,
+        mut reply: fuser::ReplyDirectoryPlus,
     ) {
-        reply.error(self.unsupported_fuse_error("readdirplus"));
+        let result = self.storage.readdirplus(ino.into(), offset, |entry| {
+            !reply.add(
+                fuser::INodeNo(entry.inode),
+                entry.offset,
+                entry.name,
+                &entry.entry.ttl,
+                &entry.entry.attr,
+                fuser::Generation(0),
+            )
+        });
+        match result {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(self.fuse_error("readdirplus", error)),
+        }
     }
 
     fn getlk(
         &self,
         _req: &fuser::Request,
-        _ino: fuser::INodeNo,
+        ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
-        _lock_owner: fuser::LockOwner,
-        _start: u64,
-        _end: u64,
-        _typ: i32,
-        _pid: u32,
+        lock_owner: fuser::LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
         reply: fuser::ReplyLock,
     ) {
-        reply.error(self.unsupported_fuse_error("getlk"));
+        match lock_type(typ).and_then(|typ| {
+            self.storage.bmap(ino.into())?;
+            let requested = FileLock {
+                inode: ino.into(),
+                owner: lock_owner.0,
+                start,
+                end,
+                typ,
+                pid,
+            };
+            let (lock_table, _condition) = &*self.lock_table;
+            let table = lock_table
+                .lock()
+                .map_err(|_| storage::FuseError::Errno(fuser::Errno::EIO))?;
+            Ok(table.conflicting_lock(requested))
+        }) {
+            Ok(Some(lock)) => reply.locked(lock.start, lock.end, lock.typ, lock.pid),
+            Ok(None) => reply.locked(start, end, libc::F_UNLCK as i32, pid),
+            Err(error) => reply.error(self.fuse_error("getlk", error)),
+        }
     }
 
     fn setlk(
         &self,
         _req: &fuser::Request,
-        _ino: fuser::INodeNo,
+        ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
-        _lock_owner: fuser::LockOwner,
-        _start: u64,
-        _end: u64,
-        _typ: i32,
-        _pid: u32,
-        _sleep: bool,
+        lock_owner: fuser::LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        reply.error(self.unsupported_fuse_error("setlk"));
+        match self.set_file_lock(ino.into(), lock_owner, start, end, typ, pid, sleep) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(self.fuse_error("setlk", error)),
+        }
     }
 
     fn bmap(
         &self,
         _req: &fuser::Request,
-        _ino: fuser::INodeNo,
+        ino: fuser::INodeNo,
         _blocksize: u32,
-        _idx: u64,
+        idx: u64,
         reply: fuser::ReplyBmap,
     ) {
-        reply.error(self.unsupported_fuse_error("bmap"));
+        match self.storage.bmap(ino.into()) {
+            Ok(()) => reply.bmap(idx),
+            Err(error) => reply.error(self.fuse_error("bmap", error)),
+        }
     }
 
     fn ioctl(
         &self,
         _req: &fuser::Request,
-        _ino: fuser::INodeNo,
+        ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
         _flags: fuser::IoctlFlags,
         _cmd: u32,
@@ -1799,96 +1942,139 @@ impl fuser::Filesystem for Filesystem {
         _out_size: u32,
         reply: fuser::ReplyIoctl,
     ) {
-        reply.error(self.unsupported_fuse_error("ioctl"));
+        match self.storage.bmap(ino.into()) {
+            Ok(()) => reply
+                .error(self.fuse_error("ioctl", storage::FuseError::Errno(fuser::Errno::ENOTTY))),
+            Err(error) => reply.error(self.fuse_error("ioctl", error)),
+        }
     }
 
     fn poll(
         &self,
-        _req: &fuser::Request,
-        _ino: fuser::INodeNo,
+        req: &fuser::Request,
+        ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
         _ph: fuser::PollNotifier,
-        _events: fuser::PollEvents,
+        events: fuser::PollEvents,
         _flags: fuser::PollFlags,
         reply: fuser::ReplyPoll,
     ) {
-        reply.error(self.unsupported_fuse_error("poll"));
+        match self.storage.poll(ino.into(), req.uid(), req.gid(), events) {
+            Ok(ready) => reply.poll(ready),
+            Err(error) => reply.error(self.fuse_error("poll", error)),
+        }
     }
 
     fn fallocate(
         &self,
-        _req: &fuser::Request,
-        _ino: fuser::INodeNo,
+        req: &fuser::Request,
+        ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
-        _offset: u64,
-        _length: u64,
-        _mode: i32,
+        offset: u64,
+        length: u64,
+        mode: i32,
         reply: fuser::ReplyEmpty,
     ) {
-        reply.error(self.unsupported_fuse_error("fallocate"));
+        match self
+            .storage
+            .fallocate(ino.into(), offset, length, mode, req.uid(), req.gid())
+        {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(self.fuse_error("fallocate", error)),
+        }
     }
 
     fn lseek(
         &self,
         _req: &fuser::Request,
-        _ino: fuser::INodeNo,
+        ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
-        _offset: i64,
-        _whence: i32,
+        offset: i64,
+        whence: i32,
         reply: fuser::ReplyLseek,
     ) {
-        reply.error(self.unsupported_fuse_error("lseek"));
+        match self.storage.lseek(ino.into(), offset, whence) {
+            Ok(offset) => reply.offset(offset),
+            Err(error) => reply.error(self.fuse_error("lseek", error)),
+        }
     }
 
     fn copy_file_range(
         &self,
-        _req: &fuser::Request,
-        _ino_in: fuser::INodeNo,
+        req: &fuser::Request,
+        ino_in: fuser::INodeNo,
         _fh_in: fuser::FileHandle,
-        _offset_in: u64,
-        _ino_out: fuser::INodeNo,
+        offset_in: u64,
+        ino_out: fuser::INodeNo,
         _fh_out: fuser::FileHandle,
-        _offset_out: u64,
-        _len: u64,
-        _flags: fuser::CopyFileRangeFlags,
+        offset_out: u64,
+        len: u64,
+        flags: fuser::CopyFileRangeFlags,
         reply: fuser::ReplyWrite,
     ) {
-        reply.error(self.unsupported_fuse_error("copy_file_range"));
+        let result = if flags.is_empty() {
+            self.storage.copy_file_range(
+                ino_in.into(),
+                offset_in,
+                ino_out.into(),
+                offset_out,
+                len,
+                req.uid(),
+                req.gid(),
+            )
+        } else {
+            Err(storage::FuseError::Errno(fuser::Errno::EINVAL))
+        };
+        match result {
+            Ok(write) => reply.written(write.written),
+            Err(error) => reply.error(self.fuse_error("copy_file_range", error)),
+        }
     }
 
     #[cfg(target_os = "macos")]
-    fn setvolname(&self, _req: &fuser::Request, _name: &OsStr, reply: fuser::ReplyEmpty) {
-        reply.error(self.unsupported_fuse_error("setvolname"));
+    fn setvolname(&self, _req: &fuser::Request, name: &OsStr, reply: fuser::ReplyEmpty) {
+        match self.storage.set_volume_name(name) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(self.fuse_error("setvolname", error)),
+        }
     }
 
     #[cfg(target_os = "macos")]
     fn exchange(
         &self,
-        _req: &fuser::Request,
-        _parent: fuser::INodeNo,
-        _name: &OsStr,
-        _newparent: fuser::INodeNo,
-        _newname: &OsStr,
-        _options: u64,
+        req: &fuser::Request,
+        parent: fuser::INodeNo,
+        name: &OsStr,
+        newparent: fuser::INodeNo,
+        newname: &OsStr,
+        options: u64,
         reply: fuser::ReplyEmpty,
     ) {
-        reply.error(self.unsupported_fuse_error("exchange"));
+        let result = if options == 0 {
+            self.storage.exchange(
+                parent.into(),
+                name,
+                newparent.into(),
+                newname,
+                req.uid(),
+                req.gid(),
+            )
+        } else {
+            Err(storage::FuseError::Errno(fuser::Errno::EINVAL))
+        };
+        match result {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(self.fuse_error("exchange", error)),
+        }
     }
 
     #[cfg(target_os = "macos")]
-    fn getxtimes(&self, _req: &fuser::Request, _ino: fuser::INodeNo, reply: fuser::ReplyXTimes) {
-        reply.error(self.unsupported_fuse_error("getxtimes"));
+    fn getxtimes(&self, _req: &fuser::Request, ino: fuser::INodeNo, reply: fuser::ReplyXTimes) {
+        match self.storage.getxtimes(ino.into()) {
+            Ok(times) => reply.xtimes(times.bkuptime, times.crtime),
+            Err(error) => reply.error(self.fuse_error("getxtimes", error)),
+        }
     }
-}
-
-#[cfg(target_os = "macos")]
-fn unsupported_operation_error() -> fuser::Errno {
-    fuser::Errno::ENOTSUP
-}
-
-#[cfg(not(target_os = "macos"))]
-fn unsupported_operation_error() -> fuser::Errno {
-    fuser::Errno::EOPNOTSUPP
 }
 
 fn rename_mode(flags: fuser::RenameFlags) -> Result<bool, storage::FuseError> {
@@ -1906,6 +2092,39 @@ fn rename_mode(flags: fuser::RenameFlags) -> Result<bool, storage::FuseError> {
             return Err(storage::FuseError::Errno(fuser::Errno::EINVAL));
         }
         Ok(false)
+    }
+}
+
+fn reply_xattr_bytes(
+    reply: fuser::ReplyXattr,
+    operation: &'static str,
+    filesystem: &Filesystem,
+    bytes: &[u8],
+    size: u32,
+) {
+    let Ok(byte_len) = u32::try_from(bytes.len()) else {
+        reply.error(filesystem.fuse_error(
+            operation,
+            storage::FuseError::Errno(fuser::Errno::EOVERFLOW),
+        ));
+        return;
+    };
+    if size == 0 {
+        reply.size(byte_len);
+    } else if size < byte_len {
+        reply.error(
+            filesystem.fuse_error(operation, storage::FuseError::Errno(fuser::Errno::ERANGE)),
+        );
+    } else {
+        reply.data(bytes);
+    }
+}
+
+fn lock_type(typ: i32) -> Result<i32, storage::FuseError> {
+    if typ == libc::F_RDLCK as i32 || typ == libc::F_WRLCK as i32 || typ == libc::F_UNLCK as i32 {
+        Ok(typ)
+    } else {
+        Err(storage::FuseError::Errno(fuser::Errno::EINVAL))
     }
 }
 
@@ -1928,10 +2147,51 @@ impl Filesystem {
         errno
     }
 
-    fn unsupported_fuse_error(&self, operation: &'static str) -> fuser::Errno {
-        let errno = unsupported_operation_error();
-        self.notify_fuse_error(operation, errno, true);
-        errno
+    fn set_file_lock(
+        &self,
+        inode: u64,
+        lock_owner: fuser::LockOwner,
+        start: u64,
+        end: u64,
+        typ: i32,
+        pid: u32,
+        sleep: bool,
+    ) -> Result<(), storage::FuseError> {
+        let typ = lock_type(typ)?;
+        self.storage.bmap(inode)?;
+        let requested = FileLock {
+            inode,
+            owner: lock_owner.0,
+            start,
+            end,
+            typ,
+            pid,
+        };
+        let (lock_table, condition) = &*self.lock_table;
+        let mut table = lock_table
+            .lock()
+            .map_err(|_| storage::FuseError::Errno(fuser::Errno::EIO))?;
+        loop {
+            if typ == libc::F_UNLCK as i32 || table.conflicting_lock(requested).is_none() {
+                table.set_lock(requested);
+                condition.notify_all();
+                return Ok(());
+            }
+            if !sleep {
+                return Err(storage::FuseError::Errno(fuser::Errno::EAGAIN));
+            }
+            table = condition
+                .wait(table)
+                .map_err(|_| storage::FuseError::Errno(fuser::Errno::EIO))?;
+        }
+    }
+
+    fn clear_file_locks_for_owner(&self, owner: fuser::LockOwner) {
+        let (lock_table, condition) = &*self.lock_table;
+        if let Ok(mut table) = lock_table.lock() {
+            table.clear_owner(owner.0);
+            condition.notify_all();
+        }
     }
 
     fn notify_fuse_error(&self, operation: &'static str, errno: fuser::Errno, unsupported: bool) {
@@ -1982,6 +2242,88 @@ struct MountState {
     mounted_sessions: usize,
 }
 
+#[derive(Debug, Default)]
+struct LockTable {
+    locks: Vec<FileLock>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileLock {
+    inode: u64,
+    owner: u64,
+    start: u64,
+    end: u64,
+    typ: i32,
+    pid: u32,
+}
+
+impl LockTable {
+    fn conflicting_lock(&self, requested: FileLock) -> Option<FileLock> {
+        self.locks.iter().copied().find(|existing| {
+            existing.inode == requested.inode
+                && existing.owner != requested.owner
+                && lock_ranges_overlap(*existing, requested)
+                && (existing.typ == libc::F_WRLCK as i32 || requested.typ == libc::F_WRLCK as i32)
+        })
+    }
+
+    fn set_lock(&mut self, requested: FileLock) {
+        self.remove_owner_range(
+            requested.inode,
+            requested.owner,
+            requested.start,
+            requested.end,
+        );
+        if requested.typ != libc::F_UNLCK as i32 {
+            self.locks.push(requested);
+        }
+    }
+
+    fn clear_owner(&mut self, owner: u64) {
+        self.locks.retain(|lock| lock.owner != owner);
+    }
+
+    fn remove_owner_range(&mut self, inode: u64, owner: u64, start: u64, end: u64) {
+        let mut retained = Vec::with_capacity(self.locks.len());
+        for lock in self.locks.drain(..) {
+            if lock.inode != inode
+                || lock.owner != owner
+                || !lock_ranges_overlap(
+                    lock,
+                    FileLock {
+                        inode,
+                        owner,
+                        start,
+                        end,
+                        typ: lock.typ,
+                        pid: lock.pid,
+                    },
+                )
+            {
+                retained.push(lock);
+                continue;
+            }
+            if lock.start < start {
+                retained.push(FileLock {
+                    end: start.saturating_sub(1),
+                    ..lock
+                });
+            }
+            if lock.end > end {
+                retained.push(FileLock {
+                    start: end.saturating_add(1),
+                    ..lock
+                });
+            }
+        }
+        self.locks = retained;
+    }
+}
+
+fn lock_ranges_overlap(left: FileLock, right: FileLock) -> bool {
+    left.start <= right.end && right.start <= left.end
+}
+
 fn open_filesystem(configuration: FilesystemConfiguration) -> Result<Filesystem, FilesystemError> {
     let storage = Arc::new(storage::open_database(&configuration)?);
     let database_directory = fs::canonicalize(configuration.database_directory())
@@ -1991,6 +2333,7 @@ fn open_filesystem(configuration: FilesystemConfiguration) -> Result<Filesystem,
         database_directory,
         storage,
         mount_state: Arc::new(Mutex::new(MountState::default())),
+        lock_table: Arc::new((Mutex::new(LockTable::default()), Condvar::new())),
     })
 }
 
