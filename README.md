@@ -5,7 +5,9 @@ This library implements a [FUSE](https://www.kernel.org/doc/html/next/filesystem
 ```rust
 use std::{fs, path::PathBuf};
 
-use eventfs::{EventPageLimit, Filesystem, FilesystemConfiguration};
+use eventfs::{
+    EventPageLimit, Filesystem, FilesystemConfiguration, MountOption, SessionAccessControlList,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the local mount point used by FUSE.
@@ -14,7 +16,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&mount_point)?;
 
     // Open the filesystem and mount it in the background.
-    let configuration = FilesystemConfiguration::new("eventfs.db", mount_point.clone())?;
+    let configuration = FilesystemConfiguration::new("eventfs.db", mount_point.clone())?
+        .with_session_access_control_list(SessionAccessControlList::Owner)
+        .with_mount_options([MountOption::DefaultPermissions]);
 
     let filesystem = Filesystem::open(configuration)?;
 

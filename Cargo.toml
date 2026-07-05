@@ -6,6 +6,10 @@ description = "An event-sourced FUSE filesystem."
 repository = "https://github.com/dprkh/eventfs"
 readme = "README.md"
 
+[features]
+default = []
+tracing = ["dep:tracing"]
+
 [dependencies]
 fuser = "0.17"
 blake3 = "1"
@@ -16,6 +20,7 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 time = { version = "0.3", features = ["serde"] }
+tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
 anyhow = "1.0"

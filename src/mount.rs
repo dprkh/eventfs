@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::filesystem::{Filesystem, FilesystemError};
+use crate::filesystem::{Filesystem, FilesystemError, MountOption, SessionAccessControlList};
 
 /// Background mounted filesystem session.
 #[derive(Debug)]
@@ -105,13 +105,24 @@ fn validate_mount_point(path: &Path) -> Result<(), FilesystemError> {
 
 fn mount_configuration(filesystem: &Filesystem) -> Result<fuser::Config, FilesystemError> {
     let mut configuration = fuser::Config::default();
-    let volume_name = filesystem
-        .storage()
-        .volume_name()
-        .map_err(|_| FilesystemError::FilesystemOperation)?;
+    configuration.acl =
+        fuser_session_access_control_list(filesystem.configuration().session_access_control_list());
+    let caller_mount_options = filesystem.configuration().mount_options();
+    if !caller_mount_options
+        .iter()
+        .any(|option| matches!(option, MountOption::FilesystemName(_)))
+    {
+        let volume_name = filesystem
+            .storage()
+            .volume_name()
+            .map_err(|_| FilesystemError::FilesystemOperation)?;
+        configuration
+            .mount_options
+            .push(fuser::MountOption::FSName(volume_name));
+    }
     configuration
         .mount_options
-        .push(fuser::MountOption::FSName(volume_name));
+        .extend(caller_mount_options.iter().map(fuser_mount_option));
     #[cfg(target_os = "macos")]
     {
         configuration
@@ -122,6 +133,39 @@ fn mount_configuration(filesystem: &Filesystem) -> Result<fuser::Config, Filesys
             .push(fuser::MountOption::CUSTOM("noapplexattr".to_owned()));
     }
     Ok(configuration)
+}
+
+fn fuser_session_access_control_list(
+    session_access_control_list: SessionAccessControlList,
+) -> fuser::SessionACL {
+    match session_access_control_list {
+        SessionAccessControlList::All => fuser::SessionACL::All,
+        SessionAccessControlList::RootAndOwner => fuser::SessionACL::RootAndOwner,
+        SessionAccessControlList::Owner => fuser::SessionACL::Owner,
+    }
+}
+
+fn fuser_mount_option(option: &MountOption) -> fuser::MountOption {
+    match option {
+        MountOption::FilesystemName(value) => fuser::MountOption::FSName(value.clone()),
+        MountOption::Subtype(value) => fuser::MountOption::Subtype(value.clone()),
+        MountOption::Custom(value) => fuser::MountOption::CUSTOM(value.clone()),
+        MountOption::AutoUnmount => fuser::MountOption::AutoUnmount,
+        MountOption::DefaultPermissions => fuser::MountOption::DefaultPermissions,
+        MountOption::Dev => fuser::MountOption::Dev,
+        MountOption::NoDev => fuser::MountOption::NoDev,
+        MountOption::Suid => fuser::MountOption::Suid,
+        MountOption::NoSuid => fuser::MountOption::NoSuid,
+        MountOption::ReadOnly => fuser::MountOption::RO,
+        MountOption::ReadWrite => fuser::MountOption::RW,
+        MountOption::Exec => fuser::MountOption::Exec,
+        MountOption::NoExec => fuser::MountOption::NoExec,
+        MountOption::Atime => fuser::MountOption::Atime,
+        MountOption::NoAtime => fuser::MountOption::NoAtime,
+        MountOption::DirSync => fuser::MountOption::DirSync,
+        MountOption::Sync => fuser::MountOption::Sync,
+        MountOption::Async => fuser::MountOption::Async,
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +236,102 @@ mod tests {
         assert_unmounted(&fixture.filesystem);
     }
 
+    #[test]
+    fn mount_configuration_uses_default_filesystem_name_and_owner_access() {
+        let fixture = TestFilesystem::new("default-mount-configuration");
+        let configuration =
+            mount_configuration(&fixture.filesystem).expect("mount configuration is built");
+
+        assert_eq!(configuration.acl, fuser::SessionACL::Owner);
+        assert!(
+            matches!(
+                configuration.mount_options.first(),
+                Some(fuser::MountOption::FSName(_))
+            ),
+            "default filesystem name is supplied"
+        );
+    }
+
+    #[test]
+    fn mount_configuration_maps_session_access_control_list_and_mount_options() {
+        let mount_options = vec![
+            MountOption::FilesystemName("configured-name".to_owned()),
+            MountOption::Subtype("eventfs".to_owned()),
+            MountOption::Custom("debug".to_owned()),
+            MountOption::AutoUnmount,
+            MountOption::DefaultPermissions,
+            MountOption::Dev,
+            MountOption::NoDev,
+            MountOption::Suid,
+            MountOption::NoSuid,
+            MountOption::ReadOnly,
+            MountOption::ReadWrite,
+            MountOption::Exec,
+            MountOption::NoExec,
+            MountOption::Atime,
+            MountOption::NoAtime,
+            MountOption::DirSync,
+            MountOption::Sync,
+            MountOption::Async,
+        ];
+        let expected_mount_options = vec![
+            fuser::MountOption::FSName("configured-name".to_owned()),
+            fuser::MountOption::Subtype("eventfs".to_owned()),
+            fuser::MountOption::CUSTOM("debug".to_owned()),
+            fuser::MountOption::AutoUnmount,
+            fuser::MountOption::DefaultPermissions,
+            fuser::MountOption::Dev,
+            fuser::MountOption::NoDev,
+            fuser::MountOption::Suid,
+            fuser::MountOption::NoSuid,
+            fuser::MountOption::RO,
+            fuser::MountOption::RW,
+            fuser::MountOption::Exec,
+            fuser::MountOption::NoExec,
+            fuser::MountOption::Atime,
+            fuser::MountOption::NoAtime,
+            fuser::MountOption::DirSync,
+            fuser::MountOption::Sync,
+            fuser::MountOption::Async,
+        ];
+        let fixture =
+            TestFilesystem::new_with_configuration("configured-mount-options", |configuration| {
+                configuration
+                    .with_session_access_control_list(SessionAccessControlList::All)
+                    .with_mount_options(mount_options)
+            });
+        let configuration =
+            mount_configuration(&fixture.filesystem).expect("mount configuration is built");
+
+        assert_eq!(configuration.acl, fuser::SessionACL::All);
+        assert_eq!(
+            &configuration.mount_options[..expected_mount_options.len()],
+            expected_mount_options.as_slice()
+        );
+        assert_eq!(
+            configuration
+                .mount_options
+                .iter()
+                .filter(|option| matches!(option, fuser::MountOption::FSName(_)))
+                .count(),
+            1,
+            "caller filesystem name replaces the default filesystem name"
+        );
+    }
+
+    #[test]
+    fn mount_configuration_maps_root_and_owner_access() {
+        let fixture =
+            TestFilesystem::new_with_configuration("root-and-owner-access", |configuration| {
+                configuration
+                    .with_session_access_control_list(SessionAccessControlList::RootAndOwner)
+            });
+        let configuration =
+            mount_configuration(&fixture.filesystem).expect("mount configuration is built");
+
+        assert_eq!(configuration.acl, fuser::SessionACL::RootAndOwner);
+    }
+
     fn assert_unmounted(filesystem: &Filesystem) {
         let branch = filesystem
             .current_branch()
@@ -208,15 +348,21 @@ mod tests {
 
     impl TestFilesystem {
         fn new(name: &str) -> Self {
+            Self::new_with_configuration(name, |configuration| configuration)
+        }
+
+        fn new_with_configuration(
+            name: &str,
+            configure: impl FnOnce(FilesystemConfiguration) -> FilesystemConfiguration,
+        ) -> Self {
             let root = tempfile::tempdir().expect("temporary directory is created");
             let database = root.path().join("database");
             let mount_point = root.path().join("mount");
             fs::create_dir(&mount_point).expect("mount point is created");
-            let filesystem = Filesystem::open(
-                FilesystemConfiguration::new(database, mount_point)
-                    .unwrap_or_else(|_| panic!("{name} configuration is valid")),
-            )
-            .unwrap_or_else(|_| panic!("{name} filesystem opens"));
+            let configuration = FilesystemConfiguration::new(database, mount_point)
+                .unwrap_or_else(|_| panic!("{name} configuration is valid"));
+            let filesystem = Filesystem::open(configure(configuration))
+                .unwrap_or_else(|_| panic!("{name} filesystem opens"));
             Self {
                 filesystem,
                 _root: root,

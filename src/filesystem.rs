@@ -327,6 +327,8 @@ impl Filesystem {
 pub struct FilesystemConfiguration {
     database_directory: PathBuf,
     mount_point: PathBuf,
+    session_access_control_list: SessionAccessControlList,
+    mount_options: Vec<MountOption>,
     fuse_error_callback: Option<Arc<FuseErrorCallback>>,
 }
 
@@ -344,6 +346,19 @@ impl FilesystemConfiguration {
         new_filesystem_configuration(database_directory.into(), mount_point.into())
     }
 
+    /// Configures which users may access the mounted filesystem session.
+    pub fn with_session_access_control_list(
+        self,
+        session_access_control_list: SessionAccessControlList,
+    ) -> Self {
+        with_session_access_control_list(self, session_access_control_list)
+    }
+
+    /// Configures additional FUSE mount options.
+    pub fn with_mount_options(self, mount_options: impl IntoIterator<Item = MountOption>) -> Self {
+        with_mount_options(self, mount_options)
+    }
+
     /// Configures a callback invoked after failed or unsupported FUSE operations.
     pub fn with_fuse_error_callback(
         self,
@@ -351,6 +366,59 @@ impl FilesystemConfiguration {
     ) -> Self {
         with_fuse_error_callback(self, callback)
     }
+}
+
+/// User access allowed for a mounted FUSE session.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum SessionAccessControlList {
+    /// Allows requests from any user.
+    All,
+    /// Allows requests from root and the session owner.
+    RootAndOwner,
+    /// Allows requests only from the session owner.
+    #[default]
+    Owner,
+}
+
+/// FUSE mount option configured through eventfs-owned public API.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum MountOption {
+    /// Sets the filesystem name shown by the mount.
+    FilesystemName(String),
+    /// Sets the filesystem subtype shown by the mount.
+    Subtype(String),
+    /// Passes a custom mount option string.
+    Custom(String),
+    /// Automatically unmounts when the mounting process exits.
+    AutoUnmount,
+    /// Enables permission checking in the kernel.
+    DefaultPermissions,
+    /// Enables special character and block devices.
+    Dev,
+    /// Disables special character and block devices.
+    NoDev,
+    /// Honors set-user-ID and set-group-ID bits on files.
+    Suid,
+    /// Does not honor set-user-ID and set-group-ID bits on files.
+    NoSuid,
+    /// Mounts the filesystem read-only.
+    ReadOnly,
+    /// Mounts the filesystem read-write.
+    ReadWrite,
+    /// Allows execution of binaries.
+    Exec,
+    /// Disallows execution of binaries.
+    NoExec,
+    /// Supports inode access time.
+    Atime,
+    /// Does not update inode access time.
+    NoAtime,
+    /// Performs directory modifications synchronously.
+    DirSync,
+    /// Performs all I/O synchronously.
+    Sync,
+    /// Performs all I/O asynchronously.
+    Async,
 }
 
 /// Error context passed to configured FUSE operation failure callbacks.
@@ -936,6 +1004,11 @@ impl fmt::Debug for FilesystemConfiguration {
             .debug_struct("FilesystemConfiguration")
             .field("database_directory", &self.database_directory)
             .field("mount_point", &self.mount_point)
+            .field(
+                "session_access_control_list",
+                &self.session_access_control_list,
+            )
+            .field("mount_options", &self.mount_options)
             .field("fuse_error_callback", &self.fuse_error_callback.is_some())
             .finish()
     }
@@ -945,6 +1018,8 @@ impl PartialEq for FilesystemConfiguration {
     fn eq(&self, other: &Self) -> bool {
         self.database_directory == other.database_directory
             && self.mount_point == other.mount_point
+            && self.session_access_control_list == other.session_access_control_list
+            && self.mount_options == other.mount_options
             && fuse_error_callbacks_equal(
                 self.fuse_error_callback.as_ref(),
                 other.fuse_error_callback.as_ref(),
@@ -1020,6 +1095,14 @@ fn new_fuse_operation_error(
         unsupported,
     }
 }
+
+#[cfg(feature = "tracing")]
+fn trace_fuse_operation(operation: &'static str) {
+    tracing::trace!(operation = operation, "fuse operation");
+}
+
+#[cfg(not(feature = "tracing"))]
+fn trace_fuse_operation(_operation: &'static str) {}
 
 fn events(
     filesystem: &Filesystem,
@@ -1313,6 +1396,14 @@ impl FilesystemConfiguration {
         &self.mount_point
     }
 
+    pub(crate) fn session_access_control_list(&self) -> SessionAccessControlList {
+        self.session_access_control_list
+    }
+
+    pub(crate) fn mount_options(&self) -> &[MountOption] {
+        &self.mount_options
+    }
+
     fn fuse_error_callback(&self) -> Option<&Arc<FuseErrorCallback>> {
         self.fuse_error_callback.as_ref()
     }
@@ -1324,6 +1415,7 @@ impl fuser::Filesystem for Filesystem {
         _req: &fuser::Request,
         config: &mut fuser::KernelConfig,
     ) -> std::io::Result<()> {
+        trace_fuse_operation("init");
         let mut capabilities =
             fuser::InitFlags::FUSE_POSIX_LOCKS | fuser::InitFlags::FUSE_DO_READDIRPLUS;
         #[cfg(target_os = "macos")]
@@ -1337,6 +1429,10 @@ impl fuser::Filesystem for Filesystem {
         Ok(())
     }
 
+    fn destroy(&mut self) {
+        trace_fuse_operation("destroy");
+    }
+
     fn lookup(
         &self,
         _req: &fuser::Request,
@@ -1344,10 +1440,15 @@ impl fuser::Filesystem for Filesystem {
         name: &OsStr,
         reply: fuser::ReplyEntry,
     ) {
+        trace_fuse_operation("lookup");
         match self.storage.lookup(parent.into(), name) {
             Ok(entry) => reply.entry(&entry.ttl, &entry.attr, fuser::Generation(0)),
             Err(error) => reply.error(self.fuse_error("lookup", error)),
         }
+    }
+
+    fn forget(&self, _req: &fuser::Request, _ino: fuser::INodeNo, _nlookup: u64) {
+        trace_fuse_operation("forget");
     }
 
     fn getattr(
@@ -1357,6 +1458,7 @@ impl fuser::Filesystem for Filesystem {
         _fh: Option<fuser::FileHandle>,
         reply: fuser::ReplyAttr,
     ) {
+        trace_fuse_operation("getattr");
         match self.storage.getattr(ino.into()) {
             Ok(entry) => reply.attr(&entry.ttl, &entry.attr),
             Err(error) => reply.error(self.fuse_error("getattr", error)),
@@ -1381,6 +1483,7 @@ impl fuser::Filesystem for Filesystem {
         flags: Option<fuser::BsdFileFlags>,
         reply: fuser::ReplyAttr,
     ) {
+        trace_fuse_operation("setattr");
         let attributes = storage::SetAttributes {
             mode,
             uid,
@@ -1403,6 +1506,7 @@ impl fuser::Filesystem for Filesystem {
     }
 
     fn readlink(&self, _req: &fuser::Request, ino: fuser::INodeNo, reply: fuser::ReplyData) {
+        trace_fuse_operation("readlink");
         match self.storage.readlink(ino.into()) {
             Ok(target) => reply.data(&target),
             Err(error) => reply.error(self.fuse_error("readlink", error)),
@@ -1419,6 +1523,7 @@ impl fuser::Filesystem for Filesystem {
         rdev: u32,
         reply: fuser::ReplyEntry,
     ) {
+        trace_fuse_operation("mknod");
         match self.storage.create_node(
             parent.into(),
             name,
@@ -1444,6 +1549,7 @@ impl fuser::Filesystem for Filesystem {
         umask: u32,
         reply: fuser::ReplyEntry,
     ) {
+        trace_fuse_operation("mkdir");
         match self.storage.create_node(
             parent.into(),
             name,
@@ -1467,6 +1573,7 @@ impl fuser::Filesystem for Filesystem {
         name: &OsStr,
         reply: fuser::ReplyEmpty,
     ) {
+        trace_fuse_operation("unlink");
         match self
             .storage
             .unlink(parent.into(), name, _req.uid(), _req.gid())
@@ -1483,6 +1590,7 @@ impl fuser::Filesystem for Filesystem {
         name: &OsStr,
         reply: fuser::ReplyEmpty,
     ) {
+        trace_fuse_operation("rmdir");
         match self
             .storage
             .rmdir(parent.into(), name, _req.uid(), _req.gid())
@@ -1500,6 +1608,7 @@ impl fuser::Filesystem for Filesystem {
         target: &Path,
         reply: fuser::ReplyEntry,
     ) {
+        trace_fuse_operation("symlink");
         match self
             .storage
             .create_symlink(parent.into(), link_name, target, _req.uid(), _req.gid())
@@ -1519,6 +1628,7 @@ impl fuser::Filesystem for Filesystem {
         flags: fuser::RenameFlags,
         reply: fuser::ReplyEmpty,
     ) {
+        trace_fuse_operation("rename");
         match rename_mode(flags).and_then(|no_replace| {
             self.storage.rename(
                 parent.into(),
@@ -1545,6 +1655,7 @@ impl fuser::Filesystem for Filesystem {
         newname: &OsStr,
         reply: fuser::ReplyEntry,
     ) {
+        trace_fuse_operation("link");
         match self.storage.hard_link(
             ino.into(),
             newparent.into(),
@@ -1564,6 +1675,7 @@ impl fuser::Filesystem for Filesystem {
         _flags: fuser::OpenFlags,
         reply: fuser::ReplyOpen,
     ) {
+        trace_fuse_operation("open");
         match self
             .storage
             .open_file(ino.into(), _req.uid(), _req.gid(), _flags)
@@ -1584,6 +1696,7 @@ impl fuser::Filesystem for Filesystem {
         _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyData,
     ) {
+        trace_fuse_operation("read");
         match self
             .storage
             .read_file(ino.into(), offset, size, _req.uid(), _req.gid())
@@ -1605,6 +1718,7 @@ impl fuser::Filesystem for Filesystem {
         _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
+        trace_fuse_operation("write");
         match self
             .storage
             .write_file(ino.into(), offset, data, _req.uid(), _req.gid())
@@ -1622,6 +1736,7 @@ impl fuser::Filesystem for Filesystem {
         lock_owner: fuser::LockOwner,
         reply: fuser::ReplyEmpty,
     ) {
+        trace_fuse_operation("flush");
         self.clear_file_locks_for_owner(lock_owner);
         reply.ok();
     }
@@ -1636,6 +1751,7 @@ impl fuser::Filesystem for Filesystem {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        trace_fuse_operation("release");
         if let Some(lock_owner) = lock_owner {
             self.clear_file_locks_for_owner(lock_owner);
         }
@@ -1650,6 +1766,7 @@ impl fuser::Filesystem for Filesystem {
         _datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        trace_fuse_operation("fsync");
         reply.ok();
     }
 
@@ -1660,6 +1777,7 @@ impl fuser::Filesystem for Filesystem {
         _flags: fuser::OpenFlags,
         reply: fuser::ReplyOpen,
     ) {
+        trace_fuse_operation("opendir");
         match self.storage.opendir(ino.into()) {
             Ok(()) => reply.opened(fuser::FileHandle(0), fuser::FopenFlags::empty()),
             Err(error) => reply.error(self.fuse_error("opendir", error)),
@@ -1674,6 +1792,7 @@ impl fuser::Filesystem for Filesystem {
         offset: u64,
         mut reply: fuser::ReplyDirectory,
     ) {
+        trace_fuse_operation("readdir");
         let result = self.storage.readdir(ino.into(), offset, |entry| {
             !reply.add(
                 fuser::INodeNo(entry.inode),
@@ -1698,6 +1817,7 @@ impl fuser::Filesystem for Filesystem {
         _flags: fuser::OpenFlags,
         reply: fuser::ReplyEmpty,
     ) {
+        trace_fuse_operation("releasedir");
         reply.ok();
     }
 
@@ -1709,10 +1829,12 @@ impl fuser::Filesystem for Filesystem {
         _datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        trace_fuse_operation("fsyncdir");
         reply.ok();
     }
 
     fn statfs(&self, _req: &fuser::Request, _ino: fuser::INodeNo, reply: fuser::ReplyStatfs) {
+        trace_fuse_operation("statfs");
         match self.storage.statfs(self.configuration.database_directory()) {
             Ok(statistics) => reply.statfs(
                 statistics.blocks,
@@ -1738,6 +1860,7 @@ impl fuser::Filesystem for Filesystem {
         position: u32,
         reply: fuser::ReplyEmpty,
     ) {
+        trace_fuse_operation("setxattr");
         let result = if position == 0 {
             self.storage
                 .setxattr(ino.into(), name, value, flags, req.uid(), req.gid())
@@ -1758,6 +1881,7 @@ impl fuser::Filesystem for Filesystem {
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
+        trace_fuse_operation("getxattr");
         match self.storage.getxattr(ino.into(), name) {
             Ok(value) => reply_xattr_bytes(reply, "getxattr", self, &value, size),
             Err(error) => reply.error(self.fuse_error("getxattr", error)),
@@ -1771,6 +1895,7 @@ impl fuser::Filesystem for Filesystem {
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
+        trace_fuse_operation("listxattr");
         match self.storage.listxattr(ino.into()) {
             Ok(list) => reply_xattr_bytes(reply, "listxattr", self, &list.bytes, size),
             Err(error) => reply.error(self.fuse_error("listxattr", error)),
@@ -1784,6 +1909,7 @@ impl fuser::Filesystem for Filesystem {
         name: &OsStr,
         reply: fuser::ReplyEmpty,
     ) {
+        trace_fuse_operation("removexattr");
         match self.storage.removexattr(ino.into(), name, req.uid()) {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(self.fuse_error("removexattr", error)),
@@ -1797,6 +1923,7 @@ impl fuser::Filesystem for Filesystem {
         mask: fuser::AccessFlags,
         reply: fuser::ReplyEmpty,
     ) {
+        trace_fuse_operation("access");
         match self
             .storage
             .access(ino.into(), _req.uid(), _req.gid(), mask)
@@ -1816,6 +1943,7 @@ impl fuser::Filesystem for Filesystem {
         _flags: i32,
         reply: fuser::ReplyCreate,
     ) {
+        trace_fuse_operation("create");
         match self.storage.create_node(
             parent.into(),
             name,
@@ -1848,6 +1976,7 @@ impl fuser::Filesystem for Filesystem {
         offset: u64,
         mut reply: fuser::ReplyDirectoryPlus,
     ) {
+        trace_fuse_operation("readdirplus");
         let result = self.storage.readdirplus(ino.into(), offset, |entry| {
             !reply.add(
                 fuser::INodeNo(entry.inode),
@@ -1876,6 +2005,7 @@ impl fuser::Filesystem for Filesystem {
         pid: u32,
         reply: fuser::ReplyLock,
     ) {
+        trace_fuse_operation("getlk");
         match lock_type(typ).and_then(|typ| {
             self.storage.bmap(ino.into())?;
             let requested = FileLock {
@@ -1911,6 +2041,7 @@ impl fuser::Filesystem for Filesystem {
         sleep: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        trace_fuse_operation("setlk");
         match self.set_file_lock(ino.into(), lock_owner, start, end, typ, pid, sleep) {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(self.fuse_error("setlk", error)),
@@ -1925,6 +2056,7 @@ impl fuser::Filesystem for Filesystem {
         idx: u64,
         reply: fuser::ReplyBmap,
     ) {
+        trace_fuse_operation("bmap");
         match self.storage.bmap(ino.into()) {
             Ok(()) => reply.bmap(idx),
             Err(error) => reply.error(self.fuse_error("bmap", error)),
@@ -1942,6 +2074,7 @@ impl fuser::Filesystem for Filesystem {
         _out_size: u32,
         reply: fuser::ReplyIoctl,
     ) {
+        trace_fuse_operation("ioctl");
         match self.storage.bmap(ino.into()) {
             Ok(()) => reply
                 .error(self.fuse_error("ioctl", storage::FuseError::Errno(fuser::Errno::ENOTTY))),
@@ -1959,6 +2092,7 @@ impl fuser::Filesystem for Filesystem {
         _flags: fuser::PollFlags,
         reply: fuser::ReplyPoll,
     ) {
+        trace_fuse_operation("poll");
         match self.storage.poll(ino.into(), req.uid(), req.gid(), events) {
             Ok(ready) => reply.poll(ready),
             Err(error) => reply.error(self.fuse_error("poll", error)),
@@ -1975,6 +2109,7 @@ impl fuser::Filesystem for Filesystem {
         mode: i32,
         reply: fuser::ReplyEmpty,
     ) {
+        trace_fuse_operation("fallocate");
         match self
             .storage
             .fallocate(ino.into(), offset, length, mode, req.uid(), req.gid())
@@ -1993,6 +2128,7 @@ impl fuser::Filesystem for Filesystem {
         whence: i32,
         reply: fuser::ReplyLseek,
     ) {
+        trace_fuse_operation("lseek");
         match self.storage.lseek(ino.into(), offset, whence) {
             Ok(offset) => reply.offset(offset),
             Err(error) => reply.error(self.fuse_error("lseek", error)),
@@ -2012,6 +2148,7 @@ impl fuser::Filesystem for Filesystem {
         flags: fuser::CopyFileRangeFlags,
         reply: fuser::ReplyWrite,
     ) {
+        trace_fuse_operation("copy_file_range");
         let result = if flags.is_empty() {
             self.storage.copy_file_range(
                 ino_in.into(),
@@ -2033,6 +2170,7 @@ impl fuser::Filesystem for Filesystem {
 
     #[cfg(target_os = "macos")]
     fn setvolname(&self, _req: &fuser::Request, name: &OsStr, reply: fuser::ReplyEmpty) {
+        trace_fuse_operation("setvolname");
         match self.storage.set_volume_name(name) {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(self.fuse_error("setvolname", error)),
@@ -2050,6 +2188,7 @@ impl fuser::Filesystem for Filesystem {
         options: u64,
         reply: fuser::ReplyEmpty,
     ) {
+        trace_fuse_operation("exchange");
         let result = if options == 0 {
             self.storage.exchange(
                 parent.into(),
@@ -2070,6 +2209,7 @@ impl fuser::Filesystem for Filesystem {
 
     #[cfg(target_os = "macos")]
     fn getxtimes(&self, _req: &fuser::Request, ino: fuser::INodeNo, reply: fuser::ReplyXTimes) {
+        trace_fuse_operation("getxtimes");
         match self.storage.getxtimes(ino.into()) {
             Ok(times) => reply.xtimes(times.bkuptime, times.crtime),
             Err(error) => reply.error(self.fuse_error("getxtimes", error)),
@@ -2346,8 +2486,26 @@ fn new_filesystem_configuration(
     Ok(FilesystemConfiguration {
         database_directory,
         mount_point,
+        session_access_control_list: SessionAccessControlList::default(),
+        mount_options: Vec::new(),
         fuse_error_callback: None,
     })
+}
+
+fn with_session_access_control_list(
+    mut configuration: FilesystemConfiguration,
+    session_access_control_list: SessionAccessControlList,
+) -> FilesystemConfiguration {
+    configuration.session_access_control_list = session_access_control_list;
+    configuration
+}
+
+fn with_mount_options(
+    mut configuration: FilesystemConfiguration,
+    mount_options: impl IntoIterator<Item = MountOption>,
+) -> FilesystemConfiguration {
+    configuration.mount_options = mount_options.into_iter().collect();
+    configuration
 }
 
 fn with_fuse_error_callback(
@@ -2631,6 +2789,28 @@ mod tests {
         assert_eq!(errors.next(), None);
     }
 
+    #[cfg(feature = "tracing")]
+    #[test]
+    fn trace_fuse_operation_emits_trace_level_operation_event() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = TestTraceSubscriber {
+            events: Arc::clone(&events),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            trace_fuse_operation("lookup");
+        });
+
+        assert!(
+            events
+                .lock()
+                .expect("trace events lock is available")
+                .iter()
+                .any(|event| event == "TRACE:operation=lookup"),
+            "trace event records operation name"
+        );
+    }
+
     #[test]
     fn unmount_without_mounted_session_is_rejected() {
         let fixture = TestFilesystem::new("unmount-without-mounted-session");
@@ -2660,6 +2840,16 @@ mod tests {
         next_after: Option<u64>,
     }
 
+    #[cfg(feature = "tracing")]
+    struct TestTraceSubscriber {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[cfg(feature = "tracing")]
+    struct TestTraceVisitor {
+        operation: Option<String>,
+    }
+
     impl PagedRecords for TestPage {
         type Cursor = u64;
         type Record = u64;
@@ -2671,6 +2861,50 @@ mod tests {
         fn into_records(self) -> Vec<Self::Record> {
             self.records
         }
+    }
+
+    #[cfg(feature = "tracing")]
+    impl tracing::Subscriber for TestTraceSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = TestTraceVisitor { operation: None };
+            event.record(&mut visitor);
+            if let Some(operation) = visitor.operation {
+                self.events
+                    .lock()
+                    .expect("trace events lock is available")
+                    .push(format!(
+                        "{}:operation={operation}",
+                        event.metadata().level()
+                    ));
+            }
+        }
+
+        fn enter(&self, _span: &tracing::Id) {}
+
+        fn exit(&self, _span: &tracing::Id) {}
+    }
+
+    #[cfg(feature = "tracing")]
+    impl tracing::field::Visit for TestTraceVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "operation" {
+                self.operation = Some(value.to_owned());
+            }
+        }
+
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn fmt::Debug) {}
     }
 
     impl TestFilesystem {

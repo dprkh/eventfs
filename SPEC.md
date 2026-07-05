@@ -21,6 +21,8 @@ pub struct Filesystem;
 pub struct FilesystemConfiguration;
 pub struct MountedFilesystem;
 pub struct FuseOperationError;
+pub enum SessionAccessControlList;
+pub enum MountOption;
 
 pub struct BackupDirectory;
 pub struct BackupIdentifier;
@@ -61,6 +63,16 @@ impl FilesystemConfiguration {
         mount_point: impl Into<std::path::PathBuf>,
     ) -> Result<Self, ConfigurationError>;
 
+    pub fn with_session_access_control_list(
+        self,
+        session_access_control_list: SessionAccessControlList,
+    ) -> Self;
+
+    pub fn with_mount_options(
+        self,
+        mount_options: impl IntoIterator<Item = MountOption>,
+    ) -> Self;
+
     pub fn with_fuse_error_callback(
         self,
         callback: impl Fn(FuseOperationError) + Send + Sync + 'static,
@@ -72,6 +84,33 @@ impl FuseOperationError {
     pub fn errno(&self) -> i32;
     pub fn filesystem_error(&self) -> FilesystemError;
     pub fn is_unsupported(&self) -> bool;
+}
+
+pub enum SessionAccessControlList {
+    All,
+    RootAndOwner,
+    Owner,
+}
+
+pub enum MountOption {
+    FilesystemName(String),
+    Subtype(String),
+    Custom(String),
+    AutoUnmount,
+    DefaultPermissions,
+    Dev,
+    NoDev,
+    Suid,
+    NoSuid,
+    ReadOnly,
+    ReadWrite,
+    Exec,
+    NoExec,
+    Atime,
+    NoAtime,
+    DirSync,
+    Sync,
+    Async,
 }
 
 impl BackupDirectory {
@@ -317,8 +356,13 @@ impl Filesystem {
 - Public iterator APIs MUST provide the common sequential read path for paginated records.
 - README and examples MUST demonstrate the intended common-path API for changed public functionality.
 - `FilesystemConfiguration::new` and path-valued public constructors MUST reject empty paths.
+- `FilesystemConfiguration::new` MUST default to `SessionAccessControlList::Owner` and no caller-supplied mount options.
+- `FilesystemConfiguration::with_session_access_control_list` MUST configure the session access control list shared by filesystem clones and mounted sessions opened from the configuration.
+- `FilesystemConfiguration::with_mount_options` MUST replace the caller-supplied mount options shared by filesystem clones and mounted sessions opened from the configuration.
 - `FilesystemConfiguration::with_fuse_error_callback` MUST configure one optional callback shared by filesystem clones and mounted sessions opened from the configuration.
 - `FuseOperationError` MUST expose the failed FUSE operation name, the positive platform errno returned to FUSE, the mapped `FilesystemError`, and whether the operation was unsupported.
+- `SessionAccessControlList` MUST expose unrestricted access, root-and-owner access, and owner-only access.
+- `MountOption` MUST expose FUSE filesystem name, subtype, custom string option, automatic unmount, default permissions, device-node enablement, set-user-ID and set-group-ID handling, read-only/read-write mode, executable-file handling, access-time handling, directory synchronization, and synchronous/asynchronous I/O mount options without exposing fuser-owned public types.
 - `BackupIdentifier` MUST reject zero.
 - `EventPageLimit` MUST reject zero.
 - `BranchPageLimit` MUST reject zero.
@@ -328,7 +372,7 @@ impl Filesystem {
 - `EventRecord` MUST expose branch identifier, branch position, and first-parent event sequence when the event belongs to a branch.
 - `EventRecord` MUST expose file write and truncate payload byte lengths, not payload bytes.
 - `FileSnapshot` MUST expose the file identifier, source event sequence, branch position, and file size.
-- Public API MUST NOT expose RocksDB-owned public types.
+- Public API MUST NOT expose fuser-owned or RocksDB-owned public types.
 - Branch APIs MUST use `BranchPosition`, not `EventSequence`, for branch-local cursors.
 - File snapshot and event payload bytes MUST be read through explicit range APIs.
 - Event creation times MUST be represented as `time::UtcDateTime`, not text.
@@ -339,7 +383,11 @@ impl Filesystem {
 - `Filesystem` MUST implement `fuser::Filesystem`.
 - `Filesystem` MUST implement `Clone`, `Send`, and `Sync`.
 - `Filesystem::mount` and `Filesystem::spawn_mount` MUST mount the filesystem at `FilesystemConfiguration.mount_point`.
+- `Filesystem::mount` and `Filesystem::spawn_mount` MUST apply `FilesystemConfiguration` session access control list and caller-supplied mount options.
+- eventfs MUST supply `MountOption::FilesystemName` from the persisted volume name when the caller did not supply `MountOption::FilesystemName`.
 - The mounted filesystem MUST support lookup, attribute read, attribute update, node creation, directory creation, file creation, file open, file read, file write, file truncate, flush, file synchronization, directory open, directory read, directory read with attributes, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, filesystem statistics, extended attributes, POSIX byte-range locks, block mapping, ioctl rejection, poll readiness, space allocation, sparse seek, file-range copy, macOS volume rename, macOS file-content exchange, and macOS extended times.
+- When the `tracing` Cargo feature is enabled, every eventfs-handled FUSE operation MUST emit one `tracing::trace!` event containing the operation name.
+- FUSE operation trace logging MUST NOT append events, change FUSE replies, change errno mapping, or affect the configured FUSE error callback.
 - Unsupported FUSE operations MUST return the platform-appropriate unsupported-operation error and MUST NOT append events.
 - Failed supported FUSE operations MUST invoke the configured FUSE error callback once with `FuseOperationError::is_unsupported` returning `false`.
 - Unsupported FUSE operations MUST invoke the configured FUSE error callback once with `FuseOperationError::is_unsupported` returning `true`.

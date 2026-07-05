@@ -2,7 +2,9 @@ use std::{fs, path::PathBuf};
 
 use anyhow::Result;
 
-use eventfs::{EventPageLimit, Filesystem, FilesystemConfiguration};
+use eventfs::{
+    EventPageLimit, Filesystem, FilesystemConfiguration, MountOption, SessionAccessControlList,
+};
 
 fn main() -> Result<()> {
     // Prepare a local mount point.
@@ -11,6 +13,8 @@ fn main() -> Result<()> {
 
     // Open eventfs and mount it in the background.
     let configuration = FilesystemConfiguration::new("eventfs.db", mount_point_path.clone())?
+        .with_session_access_control_list(SessionAccessControlList::Owner)
+        .with_mount_options([MountOption::DefaultPermissions])
         .with_fuse_error_callback(|error| {
             eprintln!(
                 "FUSE operation {} failed with errno {}",

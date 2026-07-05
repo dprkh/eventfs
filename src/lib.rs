@@ -11,7 +11,8 @@ pub use filesystem::{
     BranchEventPage, BranchIdentifier, BranchName, BranchPage, BranchPageLimit, BranchPosition,
     BranchRecord, BranchStatus, ConfigurationError, EventKind, EventPage, EventPageLimit,
     EventRecord, EventSequence, FileEventPayloadPart, FileIdentifier, FileSnapshot, Filesystem,
-    FilesystemConfiguration, FilesystemError, FuseOperationError,
+    FilesystemConfiguration, FilesystemError, FuseOperationError, MountOption,
+    SessionAccessControlList,
 };
 pub use mount::MountedFilesystem;
 

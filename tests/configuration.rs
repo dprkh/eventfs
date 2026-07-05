@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use eventfs::{
     BackupDirectory, BackupIdentifier, BranchName, BranchPageLimit, ConfigurationError, EventKind,
     EventPageLimit, EventSequence, Filesystem, FilesystemConfiguration, FilesystemError,
+    MountOption, SessionAccessControlList,
 };
 use rocksdb::{ColumnFamilyDescriptor, DB, IteratorMode, Options};
 
@@ -45,7 +46,24 @@ fn public_configuration_and_error_values_expose_debug_display_and_equality() {
     .expect("matching configuration is valid");
 
     assert_eq!(configuration, same_configuration);
-    assert!(format!("{configuration:?}").contains("fuse_error_callback: false"));
+    let debug_configuration = format!("{configuration:?}");
+    assert!(debug_configuration.contains("session_access_control_list: Owner"));
+    assert!(debug_configuration.contains("mount_options: []"));
+    assert!(debug_configuration.contains("fuse_error_callback: false"));
+
+    let mount_configuration = configuration
+        .clone()
+        .with_session_access_control_list(SessionAccessControlList::RootAndOwner)
+        .with_mount_options([
+            MountOption::DefaultPermissions,
+            MountOption::NoDev,
+            MountOption::FilesystemName("eventfs-test".to_owned()),
+        ]);
+
+    assert_ne!(mount_configuration, configuration);
+    assert!(format!("{mount_configuration:?}").contains("RootAndOwner"));
+    assert!(format!("{mount_configuration:?}").contains("DefaultPermissions"));
+    assert!(format!("{mount_configuration:?}").contains("FilesystemName"));
 
     let callback_configuration = configuration.clone().with_fuse_error_callback(|_error| {});
     let cloned_callback_configuration = callback_configuration.clone();
