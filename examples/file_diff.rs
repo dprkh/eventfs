@@ -13,10 +13,7 @@ fn main() -> Result<()> {
     fs::create_dir_all(&mount_point_path)?;
 
     // Open eventfs and mount it in the background.
-    let configuration = FilesystemConfiguration::builder()
-        .database_directory(PathBuf::from("eventfs.diff.db"))
-        .mount_point(mount_point_path.clone())
-        .build()?;
+    let configuration = FilesystemConfiguration::new("eventfs.diff.db", mount_point_path.clone())?;
     let filesystem = Filesystem::open(configuration)?;
     let mounted = filesystem.spawn_mount()?;
 
@@ -48,18 +45,9 @@ fn main() -> Result<()> {
 }
 
 fn list_all_events(filesystem: &Filesystem) -> Result<Vec<EventRecord>> {
-    // Collect every event page into one list.
-    let limit = EventPageLimit::try_from(100)?;
-    let mut after = None;
-    let mut events = Vec::new();
-    loop {
-        let page = filesystem.list_events(after, limit)?;
-        events.extend_from_slice(page.records());
-        match page.next_after() {
-            Some(next_after) => after = Some(next_after),
-            None => return Ok(events),
-        }
-    }
+    // Collect every event into one list.
+    let limit = EventPageLimit::new(100)?;
+    Ok(filesystem.events(limit).collect::<Result<Vec<_>, _>>()?)
 }
 
 fn file_identifier_for_path(events: &[EventRecord], path: &str) -> Result<FileIdentifier> {

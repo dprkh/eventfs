@@ -391,6 +391,11 @@ fn per_file_event_listing_paginates_in_active_branch_order_with_cursors() {
             "file event branch positions increase",
         );
     }
+    let iterator_events = filesystem
+        .file_events(first_identifier, event_page_limit(2))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("file event iterator succeeds");
+    assert_eq!(iterator_events, combined);
 
     mounted.unmount().expect("filesystem unmounts");
 }
@@ -649,7 +654,7 @@ fn active_branch_snapshots_and_file_events_ignore_other_branch_sequences() {
         .expect("main branch is returned");
     let feature_name = BranchName::new("snapshot-cursors").expect("branch name is valid");
     let feature = filesystem
-        .create_branch(feature_name.clone(), main.head_position())
+        .create_branch(&feature_name, main.head_position())
         .expect("feature branch is created");
 
     filesystem

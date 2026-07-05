@@ -52,6 +52,19 @@ impl Filesystem {
         mount::spawn_mount(self)
     }
 
+    /// Iterates over committed filesystem events.
+    ///
+    /// # Errors
+    ///
+    /// Yields [`FilesystemError::Database`] or [`FilesystemError::Integrity`] when event indexes
+    /// cannot be read or decoded.
+    pub fn events(
+        &self,
+        limit: EventPageLimit,
+    ) -> impl Iterator<Item = Result<EventRecord, FilesystemError>> + '_ {
+        events(self, limit)
+    }
+
     /// Lists committed filesystem events after an optional cursor.
     ///
     /// # Errors
@@ -89,6 +102,19 @@ impl Filesystem {
         self.storage.current_branch()
     }
 
+    /// Iterates over branches.
+    ///
+    /// # Errors
+    ///
+    /// Yields [`FilesystemError::Database`] or [`FilesystemError::Integrity`] when branch records
+    /// cannot be read or decoded.
+    pub fn branches(
+        &self,
+        limit: BranchPageLimit,
+    ) -> impl Iterator<Item = Result<BranchRecord, FilesystemError>> + '_ {
+        branches(self, limit)
+    }
+
     /// Lists branches after an optional branch identifier cursor.
     ///
     /// # Errors
@@ -111,7 +137,7 @@ impl Filesystem {
     /// is invalid, and [`FilesystemError::Database`] when the branch cannot be persisted.
     pub fn create_branch(
         &self,
-        name: BranchName,
+        name: &BranchName,
         from: BranchPosition,
     ) -> Result<BranchRecord, FilesystemError> {
         self.storage.create_branch(name, from)
@@ -139,6 +165,20 @@ impl Filesystem {
         self.storage.delete_branch(name)
     }
 
+    /// Iterates over committed filesystem events for one branch.
+    ///
+    /// # Errors
+    ///
+    /// Yields [`FilesystemError::Integrity`] when the cursor belongs to another branch, and
+    /// [`FilesystemError::Database`] when event indexes cannot be read.
+    pub fn branch_events(
+        &self,
+        branch: BranchIdentifier,
+        limit: EventPageLimit,
+    ) -> impl Iterator<Item = Result<EventRecord, FilesystemError>> + '_ {
+        branch_events(self, branch, limit)
+    }
+
     /// Lists committed filesystem events for one branch after an optional cursor.
     ///
     /// # Errors
@@ -152,6 +192,21 @@ impl Filesystem {
         limit: EventPageLimit,
     ) -> Result<BranchEventPage, FilesystemError> {
         self.storage.list_branch_events(branch, after, limit)
+    }
+
+    /// Iterates over committed filesystem events for one regular file on one branch.
+    ///
+    /// # Errors
+    ///
+    /// Yields [`FilesystemError::Integrity`] when the cursor belongs to another branch, and
+    /// [`FilesystemError::Database`] when file event indexes cannot be read.
+    pub fn branch_file_events(
+        &self,
+        branch: BranchIdentifier,
+        file_identifier: FileIdentifier,
+        limit: EventPageLimit,
+    ) -> impl Iterator<Item = Result<EventRecord, FilesystemError>> + '_ {
+        branch_file_events(self, branch, file_identifier, limit)
     }
 
     /// Lists committed filesystem events for one regular file on one branch.
@@ -169,6 +224,20 @@ impl Filesystem {
     ) -> Result<BranchEventPage, FilesystemError> {
         self.storage
             .list_branch_file_events(branch, file_identifier, after, limit)
+    }
+
+    /// Iterates over committed filesystem events for one regular file on the active branch.
+    ///
+    /// # Errors
+    ///
+    /// Yields [`FilesystemError::Database`] or [`FilesystemError::Integrity`] when file event
+    /// indexes or records cannot be read.
+    pub fn file_events(
+        &self,
+        file_identifier: FileIdentifier,
+        limit: EventPageLimit,
+    ) -> impl Iterator<Item = Result<EventRecord, FilesystemError>> + '_ {
+        file_events(self, file_identifier, limit)
     }
 
     /// Lists committed filesystem events for one regular file on the active branch.
@@ -258,67 +327,18 @@ pub struct FilesystemConfiguration {
     mount_point: PathBuf,
 }
 
-/// Type-state builder for filesystem configuration.
-pub struct FilesystemConfigurationBuilder<State> {
-    state: State,
-}
-
-/// Builder state requiring a database directory.
-pub struct WantsDatabaseDirectory;
-
-/// Builder state requiring a mount point.
-pub struct WantsMountPoint {
-    database_directory: PathBuf,
-}
-
-/// Builder state containing all required filesystem configuration values.
-pub struct Ready {
-    database_directory: PathBuf,
-    mount_point: PathBuf,
-}
-
 impl FilesystemConfiguration {
-    /// Starts a filesystem configuration builder.
-    pub fn builder() -> FilesystemConfigurationBuilder<WantsDatabaseDirectory> {
-        FilesystemConfigurationBuilder {
-            state: WantsDatabaseDirectory,
-        }
-    }
-}
-
-impl FilesystemConfigurationBuilder<WantsDatabaseDirectory> {
-    /// Sets the local RocksDB database directory.
-    pub fn database_directory(
-        self,
-        database_directory: PathBuf,
-    ) -> FilesystemConfigurationBuilder<WantsMountPoint> {
-        FilesystemConfigurationBuilder {
-            state: WantsMountPoint { database_directory },
-        }
-    }
-}
-
-impl FilesystemConfigurationBuilder<WantsMountPoint> {
-    /// Sets the FUSE mount point directory.
-    pub fn mount_point(self, mount_point: PathBuf) -> FilesystemConfigurationBuilder<Ready> {
-        FilesystemConfigurationBuilder {
-            state: Ready {
-                database_directory: self.state.database_directory,
-                mount_point,
-            },
-        }
-    }
-}
-
-impl FilesystemConfigurationBuilder<Ready> {
-    /// Builds a filesystem configuration and rejects empty paths.
+    /// Creates a filesystem configuration and rejects empty paths.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigurationError::EmptyValue`] when the database directory or mount point path is
     /// empty.
-    pub fn build(self) -> Result<FilesystemConfiguration, ConfigurationError> {
-        new_filesystem_configuration(self.state.database_directory, self.state.mount_point)
+    pub fn new(
+        database_directory: impl Into<PathBuf>,
+        mount_point: impl Into<PathBuf>,
+    ) -> Result<Self, ConfigurationError> {
+        new_filesystem_configuration(database_directory.into(), mount_point.into())
     }
 }
 
@@ -343,17 +363,18 @@ impl EventSequence {
 pub struct EventPageLimit(NonZeroU64);
 
 impl EventPageLimit {
+    /// Creates an event page limit and rejects zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigurationError::ZeroValue`] when the supplied value is zero.
+    pub fn new(value: u64) -> Result<Self, ConfigurationError> {
+        new_event_page_limit(value)
+    }
+
     /// Returns the page limit value.
     pub fn get(self) -> u64 {
         self.0.get()
-    }
-}
-
-impl TryFrom<u64> for EventPageLimit {
-    type Error = ConfigurationError;
-
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
-        new_event_page_limit(value)
     }
 }
 
@@ -362,17 +383,18 @@ impl TryFrom<u64> for EventPageLimit {
 pub struct BranchPageLimit(NonZeroU64);
 
 impl BranchPageLimit {
+    /// Creates a branch page limit and rejects zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigurationError::ZeroValue`] when the supplied value is zero.
+    pub fn new(value: u64) -> Result<Self, ConfigurationError> {
+        new_branch_page_limit(value)
+    }
+
     /// Returns the page limit value.
     pub fn get(self) -> u64 {
         self.0.get()
-    }
-}
-
-impl TryFrom<u64> for BranchPageLimit {
-    type Error = ConfigurationError;
-
-    fn try_from(value: u64) -> Result<Self, Self::Error> {
-        new_branch_page_limit(value)
     }
 }
 
@@ -504,6 +526,11 @@ impl BranchPage {
     /// Returns the branch records in this page.
     pub fn records(&self) -> &[BranchRecord] {
         &self.records
+    }
+
+    /// Returns the branch records owned by this page.
+    pub fn into_records(self) -> Vec<BranchRecord> {
+        self.records
     }
 
     /// Returns the next branch cursor when another page exists.
@@ -754,6 +781,11 @@ impl EventPage {
         &self.records
     }
 
+    /// Returns the event records owned by this page.
+    pub fn into_records(self) -> Vec<EventRecord> {
+        self.records
+    }
+
     /// Returns the next event cursor when another page exists.
     pub fn next_after(&self) -> Option<EventSequence> {
         self.next_after
@@ -771,6 +803,11 @@ impl BranchEventPage {
     /// Returns the event records in this page.
     pub fn records(&self) -> &[EventRecord] {
         &self.records
+    }
+
+    /// Returns the event records owned by this page.
+    pub fn into_records(self) -> Vec<EventRecord> {
+        self.records
     }
 
     /// Returns the next branch cursor when another page exists.
@@ -836,6 +873,135 @@ impl fmt::Display for FilesystemError {
 }
 
 impl std::error::Error for FilesystemError {}
+
+fn events(
+    filesystem: &Filesystem,
+    limit: EventPageLimit,
+) -> impl Iterator<Item = Result<EventRecord, FilesystemError>> + '_ {
+    paged_records(move |after| filesystem.list_events(after, limit))
+}
+
+fn branches(
+    filesystem: &Filesystem,
+    limit: BranchPageLimit,
+) -> impl Iterator<Item = Result<BranchRecord, FilesystemError>> + '_ {
+    paged_records(move |after| filesystem.list_branches(after, limit))
+}
+
+fn branch_events(
+    filesystem: &Filesystem,
+    branch: BranchIdentifier,
+    limit: EventPageLimit,
+) -> impl Iterator<Item = Result<EventRecord, FilesystemError>> + '_ {
+    paged_records(move |after| filesystem.list_branch_events(branch, after, limit))
+}
+
+fn branch_file_events(
+    filesystem: &Filesystem,
+    branch: BranchIdentifier,
+    file_identifier: FileIdentifier,
+    limit: EventPageLimit,
+) -> impl Iterator<Item = Result<EventRecord, FilesystemError>> + '_ {
+    paged_records(move |after| {
+        filesystem.list_branch_file_events(branch, file_identifier, after, limit)
+    })
+}
+
+fn file_events(
+    filesystem: &Filesystem,
+    file_identifier: FileIdentifier,
+    limit: EventPageLimit,
+) -> impl Iterator<Item = Result<EventRecord, FilesystemError>> + '_ {
+    paged_records(move |after| filesystem.list_file_events(file_identifier, after, limit))
+}
+
+fn paged_records<Page, Cursor, Record>(
+    mut load_page: impl FnMut(Option<Cursor>) -> Result<Page, FilesystemError>,
+) -> impl Iterator<Item = Result<Record, FilesystemError>>
+where
+    Page: PagedRecords<Cursor = Cursor, Record = Record>,
+    Cursor: Copy,
+{
+    let mut after = None;
+    let mut records = Vec::<Record>::new().into_iter();
+    let mut exhausted = false;
+
+    std::iter::from_fn(move || {
+        loop {
+            if let Some(record) = records.next() {
+                return Some(Ok(record));
+            }
+            if exhausted {
+                return None;
+            }
+
+            match load_page(after) {
+                Ok(page) => {
+                    after = page.next_after();
+                    exhausted = after.is_none();
+                    let next_records = page.into_records();
+                    if next_records.is_empty() {
+                        exhausted = true;
+                        return None;
+                    }
+                    records = next_records.into_iter();
+                }
+                Err(error) => {
+                    exhausted = true;
+                    return Some(Err(error));
+                }
+            }
+        }
+    })
+}
+
+trait PagedRecords {
+    type Cursor: Copy;
+    type Record;
+
+    fn next_after(&self) -> Option<Self::Cursor>;
+
+    fn into_records(self) -> Vec<Self::Record>;
+}
+
+impl PagedRecords for EventPage {
+    type Cursor = EventSequence;
+    type Record = EventRecord;
+
+    fn next_after(&self) -> Option<Self::Cursor> {
+        self.next_after
+    }
+
+    fn into_records(self) -> Vec<Self::Record> {
+        self.records
+    }
+}
+
+impl PagedRecords for BranchPage {
+    type Cursor = BranchIdentifier;
+    type Record = BranchRecord;
+
+    fn next_after(&self) -> Option<Self::Cursor> {
+        self.next_after
+    }
+
+    fn into_records(self) -> Vec<Self::Record> {
+        self.records
+    }
+}
+
+impl PagedRecords for BranchEventPage {
+    type Cursor = BranchPosition;
+    type Record = EventRecord;
+
+    fn next_after(&self) -> Option<Self::Cursor> {
+        self.next_after
+    }
+
+    fn into_records(self) -> Vec<Self::Record> {
+        self.records
+    }
+}
 
 impl EventRecord {
     pub(crate) fn new(

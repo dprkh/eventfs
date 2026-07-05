@@ -29,7 +29,7 @@ fn branch_switching_divergence_and_snapshot_reads_preserve_independent_file_cont
     let file_identifier = file_identifier_for_path(&filesystem, "/message");
     let feature_name = BranchName::new("feature").expect("branch name is valid");
     let feature = filesystem
-        .create_branch(feature_name.clone(), main.head_position())
+        .create_branch(&feature_name, main.head_position())
         .expect("feature branch is created");
     assert_eq!(feature.status(), BranchStatus::Open);
     assert_eq!(feature.head_sequence(), main.head_sequence());
@@ -157,7 +157,7 @@ fn branch_creation_after_directory_rename_preserves_parent_link_counts() {
         .expect("main branch is returned");
     let branch_name = BranchName::new("directory-rename-history").expect("branch name is valid");
     filesystem
-        .create_branch(branch_name.clone(), main.head_position())
+        .create_branch(&branch_name, main.head_position())
         .expect("branch is created from renamed directory history");
     filesystem
         .switch_branch(&branch_name)
@@ -219,7 +219,7 @@ fn branch_creation_from_prior_file_event_uses_snapshot_contents_at_that_position
     let historical_name = BranchName::new("from-first-write").expect("branch name is valid");
     let historical = filesystem
         .create_branch(
-            historical_name.clone(),
+            &historical_name,
             first_write
                 .branch_position()
                 .expect("first write has a branch position"),
@@ -306,7 +306,7 @@ fn branch_creation_from_prior_position_restores_historical_namespace() {
 
     let historical_name = BranchName::new("historical-namespace").expect("branch name is valid");
     filesystem
-        .create_branch(historical_name.clone(), historical_position)
+        .create_branch(&historical_name, historical_position)
         .expect("historical namespace branch is created");
     filesystem
         .switch_branch(&historical_name)
@@ -381,7 +381,7 @@ fn branch_file_history_and_snapshots_handle_files_absent_on_branch_or_at_positio
 
     let historical_name = BranchName::new("before-late-file").expect("branch name is valid");
     let historical = filesystem
-        .create_branch(historical_name.clone(), before_file_position)
+        .create_branch(&historical_name, before_file_position)
         .expect("historical branch is created");
     filesystem
         .switch_branch(&historical_name)
@@ -428,7 +428,7 @@ fn newly_created_branch_has_no_branch_events_before_divergence() {
         .expect("main branch is returned");
     let feature = filesystem
         .create_branch(
-            BranchName::new("empty-branch-events").expect("branch name is valid"),
+            &BranchName::new("empty-branch-events").expect("branch name is valid"),
             main.head_position(),
         )
         .expect("feature branch is created");
@@ -457,7 +457,7 @@ fn branch_event_listing_uses_branch_positions_and_rejects_cross_branch_cursors()
         .expect("current branch is returned");
     let feature_name = BranchName::new("event-listing").expect("branch name is valid");
     let feature = filesystem
-        .create_branch(feature_name.clone(), main.head_position())
+        .create_branch(&feature_name, main.head_position())
         .expect("feature branch is created");
     filesystem
         .switch_branch(&feature_name)
@@ -506,6 +506,17 @@ fn branch_event_listing_uses_branch_positions_and_rejects_cross_branch_cursors()
                 .branch_position()
                 .expect("branch event has a branch position")
     }));
+    let iterator_records = filesystem
+        .branch_events(feature.branch_identifier(), event_page_limit(1))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("feature branch event iterator succeeds");
+    let paginated_records = page
+        .clone()
+        .into_records()
+        .into_iter()
+        .chain(remaining.clone().into_records())
+        .collect::<Vec<_>>();
+    assert_eq!(iterator_records, paginated_records);
 
     assert_eq!(
         filesystem.list_branch_events(
@@ -535,7 +546,7 @@ fn global_events_remain_branch_aware_and_branch_file_listing_paginates_per_branc
     let file_identifier = file_identifier_for_path(&filesystem, "/message");
     let feature_name = BranchName::new("branch-file-pages").expect("branch name is valid");
     let feature = filesystem
-        .create_branch(feature_name.clone(), main.head_position())
+        .create_branch(&feature_name, main.head_position())
         .expect("feature branch is created");
 
     filesystem
@@ -613,6 +624,21 @@ fn global_events_remain_branch_aware_and_branch_file_listing_paginates_per_branc
                 .branch_position()
                 .expect("branch file event has a branch position")
     }));
+    let iterator_branch_file_events = filesystem
+        .branch_file_events(
+            feature.branch_identifier(),
+            file_identifier,
+            event_page_limit(1),
+        )
+        .collect::<Result<Vec<_>, _>>()
+        .expect("feature branch file event iterator succeeds");
+    let paginated_branch_file_events = branch_file_first_page
+        .clone()
+        .into_records()
+        .into_iter()
+        .chain(branch_file_remaining.clone().into_records())
+        .collect::<Vec<_>>();
+    assert_eq!(iterator_branch_file_events, paginated_branch_file_events);
 
     assert_eq!(
         filesystem.list_branch_file_events(
@@ -635,7 +661,7 @@ fn branch_listing_orders_branch_identifiers_and_exhausts_cursors() {
     for name in ["alpha", "beta", "gamma"] {
         filesystem
             .create_branch(
-                BranchName::new(name).expect("branch name is valid"),
+                &BranchName::new(name).expect("branch name is valid"),
                 main.head_position(),
             )
             .expect("branch is created");
@@ -673,6 +699,17 @@ fn branch_listing_orders_branch_identifiers_and_exhausts_cursors() {
         None,
         "branch listing stops exposing cursors after the last page"
     );
+    let iterator_records = filesystem
+        .branches(branch_page_limit(2))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("branch iterator succeeds");
+    let paginated_records = first_page
+        .clone()
+        .into_records()
+        .into_iter()
+        .chain(second_page.clone().into_records())
+        .collect::<Vec<_>>();
+    assert_eq!(iterator_records, paginated_records);
 }
 
 #[test]
@@ -692,7 +729,7 @@ fn branch_event_first_parent_sequences_follow_each_branch_head_chain() {
         .expect("main branch is returned");
     let feature_name = BranchName::new("first-parent").expect("branch name is valid");
     let feature = filesystem
-        .create_branch(feature_name.clone(), main.head_position())
+        .create_branch(&feature_name, main.head_position())
         .expect("feature branch is created");
 
     filesystem
@@ -769,7 +806,7 @@ fn branch_snapshot_reads_and_deletion_reject_cross_branch_or_active_state() {
     let file_identifier = file_identifier_for_path(&filesystem, "/message");
     let feature_name = BranchName::new("active-delete").expect("branch name is valid");
     let feature = filesystem
-        .create_branch(feature_name.clone(), main.head_position())
+        .create_branch(&feature_name, main.head_position())
         .expect("feature branch is created");
 
     assert_eq!(
@@ -799,7 +836,7 @@ fn branch_listing_and_deletion_keep_history_but_remove_inactive_refs() {
         .expect("current branch is returned");
     let scratch_name = BranchName::new("scratch").expect("branch name is valid");
     let scratch = filesystem
-        .create_branch(scratch_name.clone(), main.head_position())
+        .create_branch(&scratch_name, main.head_position())
         .expect("scratch branch is created");
 
     let first_page = filesystem
@@ -827,7 +864,7 @@ fn branch_listing_and_deletion_keep_history_but_remove_inactive_refs() {
         .delete_branch(&scratch_name)
         .expect("inactive branch is deleted");
     assert_eq!(
-        filesystem.create_branch(scratch_name.clone(), main.head_position()),
+        filesystem.create_branch(&scratch_name, main.head_position()),
         Err(FilesystemError::Integrity)
     );
     assert_eq!(
@@ -855,7 +892,7 @@ fn branch_creation_rejects_deleted_branch_positions() {
         .expect("main branch is returned");
     let deleted_name = BranchName::new("deleted-source").expect("branch name is valid");
     let deleted = filesystem
-        .create_branch(deleted_name.clone(), main.head_position())
+        .create_branch(&deleted_name, main.head_position())
         .expect("deleted source branch is created");
 
     filesystem
@@ -864,7 +901,7 @@ fn branch_creation_rejects_deleted_branch_positions() {
 
     assert_eq!(
         filesystem.create_branch(
-            BranchName::new("from-deleted-source").expect("branch name is valid"),
+            &BranchName::new("from-deleted-source").expect("branch name is valid"),
             deleted.head_position(),
         ),
         Err(FilesystemError::Integrity)
@@ -889,7 +926,7 @@ fn deleted_branch_refs_preserve_history_and_snapshot_reads() {
     let file_identifier = file_identifier_for_path(&filesystem, "/message");
     let feature_name = BranchName::new("deleted-history").expect("branch name is valid");
     let feature = filesystem
-        .create_branch(feature_name.clone(), main.head_position())
+        .create_branch(&feature_name, main.head_position())
         .expect("feature branch is created");
 
     filesystem
@@ -977,10 +1014,10 @@ fn branch_switching_and_deletion_do_not_append_events() {
     let feature_name = BranchName::new("switch-no-event").expect("branch name is valid");
     let scratch_name = BranchName::new("delete-no-event").expect("branch name is valid");
     filesystem
-        .create_branch(feature_name.clone(), main.head_position())
+        .create_branch(&feature_name, main.head_position())
         .expect("feature branch is created");
     filesystem
-        .create_branch(scratch_name.clone(), main.head_position())
+        .create_branch(&scratch_name, main.head_position())
         .expect("scratch branch is created");
 
     let before = list_all_events(&filesystem);
@@ -1021,7 +1058,7 @@ fn concurrent_branch_deletion_switching_and_listing_preserve_branch_integrity() 
         .collect::<Vec<_>>();
     for name in &names {
         filesystem
-            .create_branch(name.clone(), main.head_position())
+            .create_branch(name, main.head_position())
             .expect("load branch is created");
     }
 
@@ -1101,7 +1138,7 @@ fn mounted_branch_switch_conflicts_with_concurrent_writes() {
         .expect("main branch is returned");
     let feature_name = BranchName::new("mounted-conflict").expect("branch name is valid");
     filesystem
-        .create_branch(feature_name.clone(), main.head_position())
+        .create_branch(&feature_name, main.head_position())
         .expect("feature branch is created");
     let mounted = filesystem
         .spawn_mount()

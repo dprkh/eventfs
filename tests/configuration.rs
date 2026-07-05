@@ -13,17 +13,11 @@ use support::{TestDirectories, list_all_events, open_test_filesystem};
 #[test]
 fn path_valued_public_constructors_reject_empty_paths() {
     assert_eq!(
-        FilesystemConfiguration::builder()
-            .database_directory(PathBuf::new())
-            .mount_point(PathBuf::from("mount"))
-            .build(),
+        FilesystemConfiguration::new(PathBuf::new(), PathBuf::from("mount")),
         Err(ConfigurationError::EmptyValue)
     );
     assert_eq!(
-        FilesystemConfiguration::builder()
-            .database_directory(PathBuf::from("database"))
-            .mount_point(PathBuf::new())
-            .build(),
+        FilesystemConfiguration::new(PathBuf::from("database"), PathBuf::new()),
         Err(ConfigurationError::EmptyValue)
     );
     assert_eq!(
@@ -35,14 +29,8 @@ fn path_valued_public_constructors_reject_empty_paths() {
 #[test]
 fn nonzero_public_constructors_reject_zero() {
     assert_eq!(BackupIdentifier::new(0), Err(ConfigurationError::ZeroValue));
-    assert_eq!(
-        EventPageLimit::try_from(0),
-        Err(ConfigurationError::ZeroValue)
-    );
-    assert_eq!(
-        BranchPageLimit::try_from(0),
-        Err(ConfigurationError::ZeroValue)
-    );
+    assert_eq!(EventPageLimit::new(0), Err(ConfigurationError::ZeroValue));
+    assert_eq!(BranchPageLimit::new(0), Err(ConfigurationError::ZeroValue));
     assert_eq!(BranchName::new(""), Err(ConfigurationError::EmptyValue));
 }
 
@@ -80,11 +68,11 @@ fn opening_a_filesystem_does_not_require_the_mount_point_to_exist_yet() {
     );
 
     let filesystem = Filesystem::open(
-        FilesystemConfiguration::builder()
-            .database_directory(directories.database_directory_path().to_path_buf())
-            .mount_point(missing_mount_point)
-            .build()
-            .expect("configuration is valid"),
+        FilesystemConfiguration::new(
+            directories.database_directory_path().to_path_buf(),
+            missing_mount_point,
+        )
+        .expect("configuration is valid"),
     )
     .expect("filesystem opens before the mount point exists");
     let events = list_all_events(&filesystem);

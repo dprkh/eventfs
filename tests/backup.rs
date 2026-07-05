@@ -64,10 +64,7 @@ fn local_import_verifies_requested_backup_replaces_target_and_imported_database_
     let imported_mount_point = directories.root_path().join("imported-mount");
     fs::create_dir(&imported_mount_point).expect("imported mount point is created");
     Filesystem::open(
-        FilesystemConfiguration::builder()
-            .database_directory(imported_database_path)
-            .mount_point(imported_mount_point)
-            .build()
+        FilesystemConfiguration::new(imported_database_path, imported_mount_point)
             .expect("imported configuration is valid"),
     )
     .expect("imported filesystem opens");
@@ -154,7 +151,7 @@ fn imported_backups_restore_active_branch_contents_history_snapshots_and_payload
     let file_identifier = file_identifier_for_path(&filesystem, "/message");
     let feature_name = BranchName::new("restored-feature").expect("branch name is valid");
     filesystem
-        .create_branch(feature_name.clone(), main.head_position())
+        .create_branch(&feature_name, main.head_position())
         .expect("feature branch is created");
     filesystem
         .switch_branch(&feature_name)
@@ -606,7 +603,7 @@ fn unknown_backup_import_failures_preserve_existing_target_data() {
         .current_branch()
         .expect("target main branch is returned");
     target
-        .create_branch(target_branch.clone(), main.head_position())
+        .create_branch(&target_branch, main.head_position())
         .expect("target branch is created");
     target
         .switch_branch(&target_branch)

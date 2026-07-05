@@ -566,7 +566,7 @@ impl Storage {
 
     pub(crate) fn create_branch(
         &self,
-        name: BranchName,
+        name: &BranchName,
         from: BranchPosition,
     ) -> Result<BranchRecord, FilesystemError> {
         let mut write_state = self
@@ -4326,14 +4326,14 @@ mod tests {
         assert_eq!(bytes, b"newer");
 
         let first_page = storage
-            .list_events(None, EventPageLimit::try_from(2).expect("limit is valid"))
+            .list_events(None, EventPageLimit::new(2).expect("limit is valid"))
             .expect("events are listed");
         assert_eq!(first_page.records().len(), 2);
         let cursor = first_page.next_after().expect("another page exists");
         let second_page = storage
             .list_events(
                 Some(cursor),
-                EventPageLimit::try_from(10).expect("limit is valid"),
+                EventPageLimit::new(10).expect("limit is valid"),
             )
             .expect("second page is listed");
         assert_eq!(second_page.next_after(), None);
@@ -4849,7 +4849,7 @@ mod tests {
             storage.list_file_events(
                 file_identifier,
                 None,
-                EventPageLimit::try_from(10).expect("limit is valid")
+                EventPageLimit::new(10).expect("limit is valid")
             ),
             Err(FilesystemError::Integrity)
         ));
@@ -4864,10 +4864,10 @@ mod tests {
         let first_name = BranchName::new("first").expect("branch name is valid");
         let second_name = BranchName::new("second").expect("branch name is valid");
         let first = storage
-            .create_branch(first_name.clone(), main.head_position())
+            .create_branch(&first_name, main.head_position())
             .expect("first branch is created");
         let second = storage
-            .create_branch(second_name, main.head_position())
+            .create_branch(&second_name, main.head_position())
             .expect("second branch is created");
 
         let mut batch = WriteBatch::default();
@@ -4932,7 +4932,7 @@ mod tests {
 
         assert!(matches!(
             storage.create_branch(
-                BranchName::new("corrupt-materialization").expect("branch name is valid"),
+                &BranchName::new("corrupt-materialization").expect("branch name is valid"),
                 main.head_position(),
             ),
             Err(FilesystemError::Integrity)
@@ -5831,7 +5831,7 @@ mod tests {
     fn collect_all_events(storage: &Storage) -> Vec<EventRecord> {
         let mut records = Vec::new();
         let mut after = None;
-        let limit = EventPageLimit::try_from(2).expect("limit is valid");
+        let limit = EventPageLimit::new(2).expect("limit is valid");
 
         loop {
             let page = storage
@@ -5851,7 +5851,7 @@ mod tests {
     ) -> Vec<EventRecord> {
         let mut records = Vec::new();
         let mut after = None;
-        let limit = EventPageLimit::try_from(2).expect("limit is valid");
+        let limit = EventPageLimit::new(2).expect("limit is valid");
 
         loop {
             let page = storage
@@ -5868,7 +5868,7 @@ mod tests {
     fn collect_all_branch_events(storage: &Storage, branch: BranchIdentifier) -> Vec<EventRecord> {
         let mut records = Vec::new();
         let mut after = None;
-        let limit = EventPageLimit::try_from(2).expect("limit is valid");
+        let limit = EventPageLimit::new(2).expect("limit is valid");
 
         loop {
             let page = storage
@@ -5889,7 +5889,7 @@ mod tests {
     ) -> Vec<EventRecord> {
         let mut records = Vec::new();
         let mut after = None;
-        let limit = EventPageLimit::try_from(2).expect("limit is valid");
+        let limit = EventPageLimit::new(2).expect("limit is valid");
 
         loop {
             let page = storage
@@ -5922,7 +5922,7 @@ mod tests {
                 .list_file_events(
                     file_identifier,
                     after,
-                    EventPageLimit::try_from(2).expect("limit is valid"),
+                    EventPageLimit::new(2).expect("limit is valid"),
                 )
                 .expect("file event page is readable");
             for event in page.records() {

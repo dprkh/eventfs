@@ -18,10 +18,6 @@ The public API MUST expose only these library-owned public types:
 ```rust
 pub struct Filesystem;
 pub struct FilesystemConfiguration;
-pub struct FilesystemConfigurationBuilder<State>;
-pub struct WantsDatabaseDirectory;
-pub struct WantsMountPoint;
-pub struct Ready;
 pub struct MountedFilesystem;
 
 pub struct BackupDirectory;
@@ -58,25 +54,10 @@ impl MountedFilesystem {
 }
 
 impl FilesystemConfiguration {
-    pub fn builder() -> FilesystemConfigurationBuilder<WantsDatabaseDirectory>;
-}
-
-impl FilesystemConfigurationBuilder<WantsDatabaseDirectory> {
-    pub fn database_directory(
-        self,
-        database_directory: std::path::PathBuf,
-    ) -> FilesystemConfigurationBuilder<WantsMountPoint>;
-}
-
-impl FilesystemConfigurationBuilder<WantsMountPoint> {
-    pub fn mount_point(
-        self,
-        mount_point: std::path::PathBuf,
-    ) -> FilesystemConfigurationBuilder<Ready>;
-}
-
-impl FilesystemConfigurationBuilder<Ready> {
-    pub fn build(self) -> Result<FilesystemConfiguration, ConfigurationError>;
+    pub fn new(
+        database_directory: impl Into<std::path::PathBuf>,
+        mount_point: impl Into<std::path::PathBuf>,
+    ) -> Result<Self, ConfigurationError>;
 }
 
 impl BackupDirectory {
@@ -104,16 +85,14 @@ impl EventSequence {
     pub fn get(self) -> u64;
 }
 
-impl TryFrom<u64> for EventPageLimit {
-    type Error = ConfigurationError;
-}
-
 impl EventPageLimit {
+    pub fn new(value: u64) -> Result<Self, ConfigurationError>;
     pub fn get(self) -> u64;
 }
 
 impl EventPage {
     pub fn records(&self) -> &[EventRecord];
+    pub fn into_records(self) -> Vec<EventRecord>;
     pub fn next_after(&self) -> Option<EventSequence>;
 }
 
@@ -170,21 +149,20 @@ impl BranchPosition {
     pub fn ordinal(&self) -> u64;
 }
 
-impl TryFrom<u64> for BranchPageLimit {
-    type Error = ConfigurationError;
-}
-
 impl BranchPageLimit {
+    pub fn new(value: u64) -> Result<Self, ConfigurationError>;
     pub fn get(self) -> u64;
 }
 
 impl BranchPage {
     pub fn records(&self) -> &[BranchRecord];
+    pub fn into_records(self) -> Vec<BranchRecord>;
     pub fn next_after(&self) -> Option<BranchIdentifier>;
 }
 
 impl BranchEventPage {
     pub fn records(&self) -> &[EventRecord];
+    pub fn into_records(self) -> Vec<EventRecord>;
     pub fn next_after(&self) -> Option<BranchPosition>;
 }
 
@@ -199,10 +177,15 @@ impl Filesystem {
     ) -> Result<BackupReceipt, FilesystemError>;
 
     pub fn import_backup(
-        database_directory: std::path::PathBuf,
+        database_directory: impl Into<std::path::PathBuf>,
         backup_directory: BackupDirectory,
         backup_identifier: BackupIdentifier,
     ) -> Result<ImportReceipt, FilesystemError>;
+
+    pub fn events(
+        &self,
+        limit: EventPageLimit,
+    ) -> impl Iterator<Item = Result<EventRecord, FilesystemError>> + '_;
 
     pub fn list_events(
         &self,
@@ -217,6 +200,11 @@ impl Filesystem {
 
     pub fn current_branch(&self) -> Result<BranchRecord, FilesystemError>;
 
+    pub fn branches(
+        &self,
+        limit: BranchPageLimit,
+    ) -> impl Iterator<Item = Result<BranchRecord, FilesystemError>> + '_;
+
     pub fn list_branches(
         &self,
         after: Option<BranchIdentifier>,
@@ -225,7 +213,7 @@ impl Filesystem {
 
     pub fn create_branch(
         &self,
-        name: BranchName,
+        name: &BranchName,
         from: BranchPosition,
     ) -> Result<BranchRecord, FilesystemError>;
 
@@ -233,12 +221,25 @@ impl Filesystem {
 
     pub fn delete_branch(&self, name: &BranchName) -> Result<(), FilesystemError>;
 
+    pub fn branch_events(
+        &self,
+        branch: BranchIdentifier,
+        limit: EventPageLimit,
+    ) -> impl Iterator<Item = Result<EventRecord, FilesystemError>> + '_;
+
     pub fn list_branch_events(
         &self,
         branch: BranchIdentifier,
         after: Option<BranchPosition>,
         limit: EventPageLimit,
     ) -> Result<BranchEventPage, FilesystemError>;
+
+    pub fn branch_file_events(
+        &self,
+        branch: BranchIdentifier,
+        file_identifier: FileIdentifier,
+        limit: EventPageLimit,
+    ) -> impl Iterator<Item = Result<EventRecord, FilesystemError>> + '_;
 
     pub fn list_branch_file_events(
         &self,
@@ -270,6 +271,12 @@ impl Filesystem {
         length: u64,
     ) -> Result<Vec<u8>, FilesystemError>;
 
+    pub fn file_events(
+        &self,
+        file_identifier: FileIdentifier,
+        limit: EventPageLimit,
+    ) -> impl Iterator<Item = Result<EventRecord, FilesystemError>> + '_;
+
     pub fn list_file_events(
         &self,
         file_identifier: FileIdentifier,
@@ -285,8 +292,15 @@ impl Filesystem {
 }
 ```
 
-- `FilesystemConfiguration::builder` MUST return a builder that requires the database directory before the mount point.
-- `FilesystemConfigurationBuilder<Ready>::build` and path-valued public constructors MUST reject empty paths.
+- New public API functionality MUST be specified in this section before it is added to code.
+- Public APIs MUST provide one obvious common-path call shape.
+- Caller-authored path and text values MUST accept standard convertible inputs when validation remains explicit.
+- Public methods MUST borrow caller-owned values when ownership is not required.
+- Validated scalar wrapper types MUST expose `new` and `get` and MUST NOT expose duplicate public construction paths.
+- Paginated APIs MUST remain available for explicit cursor control when pagination is part of the contract.
+- Public iterator APIs MUST provide the common sequential read path for paginated records.
+- README and examples MUST demonstrate the intended common-path API for changed public functionality.
+- `FilesystemConfiguration::new` and path-valued public constructors MUST reject empty paths.
 - `BackupIdentifier` MUST reject zero.
 - `EventPageLimit` MUST reject zero.
 - `BranchPageLimit` MUST reject zero.
@@ -459,6 +473,7 @@ Implementations MUST include automated tests for:
 
 - Invalid configuration values are rejected by public constructors.
 - Event listing returns paginated events with UTC creation times.
+- Event, branch, branch event, branch file event, and active branch file event iterators return the same ordered records as explicit pagination.
 - Local backup creates increasing non-zero BackupEngine backup identifiers in a persistent backup directory.
 - Local import verifies a requested BackupEngine backup, replaces existing target data, and opens the imported database before success.
 - Local backup and import reject overlapping source, backup, and target directories after path normalization.

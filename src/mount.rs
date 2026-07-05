@@ -207,10 +207,7 @@ mod tests {
             let mount_point = root.path().join("mount");
             fs::create_dir(&mount_point).expect("mount point is created");
             let filesystem = Filesystem::open(
-                FilesystemConfiguration::builder()
-                    .database_directory(database)
-                    .mount_point(mount_point)
-                    .build()
+                FilesystemConfiguration::new(database, mount_point)
                     .unwrap_or_else(|_| panic!("{name} configuration is valid")),
             )
             .unwrap_or_else(|_| panic!("{name} filesystem opens"));

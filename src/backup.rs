@@ -111,11 +111,15 @@ impl Filesystem {
     /// Returns [`FilesystemError::Integrity`] when the backup repository or identifier is invalid,
     /// and [`FilesystemError::Import`] when restore, validation, or target replacement fails.
     pub fn import_backup(
-        database_directory: PathBuf,
+        database_directory: impl Into<PathBuf>,
         backup_directory: BackupDirectory,
         backup_identifier: BackupIdentifier,
     ) -> Result<ImportReceipt, FilesystemError> {
-        import_backup_internal(database_directory, backup_directory, backup_identifier)
+        import_backup_internal(
+            database_directory.into(),
+            backup_directory,
+            backup_identifier,
+        )
     }
 }
 
@@ -434,7 +438,7 @@ mod tests {
             .current_branch()
             .expect("target main branch is returned");
         target
-            .create_branch(target_branch.clone(), main.head_position())
+            .create_branch(&target_branch, main.head_position())
             .expect("target-only branch is created");
         drop(target);
 
@@ -457,10 +461,7 @@ mod tests {
     fn filesystem_at(database_directory: PathBuf, mount_point: PathBuf) -> Filesystem {
         fs::create_dir_all(&mount_point).expect("mount point is created");
         Filesystem::open(
-            FilesystemConfiguration::builder()
-                .database_directory(database_directory)
-                .mount_point(mount_point)
-                .build()
+            FilesystemConfiguration::new(database_directory, mount_point)
                 .expect("configuration is valid"),
         )
         .expect("filesystem opens")

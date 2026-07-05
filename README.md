@@ -1,3 +1,5 @@
+# Example
+
 ```rust
 use std::{fs, path::PathBuf};
 
@@ -11,10 +13,7 @@ fn main() -> Result<()> {
     fs::create_dir_all(&mount_point_path)?;
 
     // Open eventfs and mount it in the background.
-    let configuration = FilesystemConfiguration::builder()
-        .database_directory(PathBuf::from("eventfs.db"))
-        .mount_point(mount_point_path.clone())
-        .build()?;
+    let configuration = FilesystemConfiguration::new("eventfs.db", mount_point_path.clone())?;
     let filesystem = Filesystem::open(configuration)?;
     let _mounted = filesystem.spawn_mount()?;
 
@@ -23,23 +22,17 @@ fn main() -> Result<()> {
     fs::write(&file_path, "Hello, world!")?;
     println!("{}", fs::read_to_string(&file_path)?);
 
-    // Print every event page.
-    let limit = EventPageLimit::try_from(100)?;
-    let mut after = None;
-    loop {
-        let page = filesystem.list_events(after, limit)?;
-        for event in page.records() {
-            println!("{event:?}");
-        }
-        match page.next_after() {
-            Some(next_after) => after = Some(next_after),
-            None => break,
-        }
+    // Print every event.
+    let limit = EventPageLimit::new(100)?;
+    for event in filesystem.events(limit) {
+        println!("{:?}", event?);
     }
 
     Ok(())
 }
 ```
+
+# FUSE operation support
 
 - [x] `lookup`
 - [x] `getattr`

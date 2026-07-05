@@ -160,7 +160,7 @@ fn global_event_listing_and_get_event_preserve_branch_metadata_across_divergence
         .expect("main branch is returned");
     let feature_name = BranchName::new("global-events-feature").expect("branch name is valid");
     let feature = filesystem
-        .create_branch(feature_name.clone(), main.head_position())
+        .create_branch(&feature_name, main.head_position())
         .expect("feature branch is created");
 
     filesystem
@@ -376,7 +376,7 @@ fn event_listing_is_page_size_invariant_and_get_event_round_trips_each_record() 
         .expect("main branch is returned");
     let feature_name = BranchName::new("page-size-invariant").expect("branch name is valid");
     filesystem
-        .create_branch(feature_name.clone(), main.head_position())
+        .create_branch(&feature_name, main.head_position())
         .expect("feature branch is created");
 
     filesystem
@@ -402,7 +402,7 @@ fn event_listing_is_page_size_invariant_and_get_event_round_trips_each_record() 
         .list_events(None, event_page_limit(100))
         .expect("full event log is listed");
     assert_eq!(expected_page.next_after(), None);
-    let expected_records = expected_page.records().to_vec();
+    let expected_records = expected_page.into_records();
     assert!(expected_records.len() >= 6);
 
     let max_limit = u64::try_from(expected_records.len()).expect("event count fits u64") + 1;
@@ -439,5 +439,10 @@ fn event_listing_is_page_size_invariant_and_get_event_round_trips_each_record() 
         }
 
         assert_eq!(paged_records, expected_records, "limit {limit}");
+        let iterator_records = filesystem
+            .events(event_page_limit(limit))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("event iterator succeeds");
+        assert_eq!(iterator_records, expected_records, "iterator limit {limit}");
     }
 }

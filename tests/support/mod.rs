@@ -77,11 +77,7 @@ pub fn configuration_for(
     database_directory: PathBuf,
     mount_point: PathBuf,
 ) -> FilesystemConfiguration {
-    FilesystemConfiguration::builder()
-        .database_directory(database_directory)
-        .mount_point(mount_point)
-        .build()
-        .expect("configuration is valid")
+    FilesystemConfiguration::new(database_directory, mount_point).expect("configuration is valid")
 }
 
 pub fn open_test_filesystem(directories: &TestDirectories) -> Filesystem {
@@ -97,65 +93,38 @@ pub fn mount(filesystem: &Filesystem) -> MountedGuard {
 }
 
 pub fn event_page_limit(value: u64) -> EventPageLimit {
-    EventPageLimit::try_from(value).expect("event page limit is valid")
+    EventPageLimit::new(value).expect("event page limit is valid")
 }
 
 pub fn branch_page_limit(value: u64) -> BranchPageLimit {
-    BranchPageLimit::try_from(value).expect("branch page limit is valid")
+    BranchPageLimit::new(value).expect("branch page limit is valid")
 }
 
 pub fn list_all_events(filesystem: &Filesystem) -> Vec<EventRecord> {
-    let mut events = Vec::new();
-    let mut after = None;
-
-    loop {
-        let page = filesystem
-            .list_events(after, event_page_limit(100))
-            .expect("events are listed");
-        events.extend_from_slice(page.records());
-        match page.next_after() {
-            Some(next_after) => after = Some(next_after),
-            None => return events,
-        }
-    }
+    filesystem
+        .events(event_page_limit(100))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("events are listed")
 }
 
 pub fn list_all_file_events(
     filesystem: &Filesystem,
     file_identifier: FileIdentifier,
 ) -> Vec<EventRecord> {
-    let mut events = Vec::new();
-    let mut after = None;
-
-    loop {
-        let page = filesystem
-            .list_file_events(file_identifier, after, event_page_limit(100))
-            .expect("file events are listed");
-        events.extend_from_slice(page.records());
-        match page.next_after() {
-            Some(next_after) => after = Some(next_after),
-            None => return events,
-        }
-    }
+    filesystem
+        .file_events(file_identifier, event_page_limit(100))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("file events are listed")
 }
 
 pub fn list_all_branch_events(
     filesystem: &Filesystem,
     branch_identifier: BranchIdentifier,
 ) -> Vec<EventRecord> {
-    let mut events = Vec::new();
-    let mut after = None;
-
-    loop {
-        let page = filesystem
-            .list_branch_events(branch_identifier, after, event_page_limit(100))
-            .expect("branch events are listed");
-        events.extend_from_slice(page.records());
-        match page.next_after() {
-            Some(next_after) => after = Some(next_after),
-            None => return events,
-        }
-    }
+    filesystem
+        .branch_events(branch_identifier, event_page_limit(100))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("branch events are listed")
 }
 
 pub fn list_all_branch_file_events(
@@ -163,24 +132,10 @@ pub fn list_all_branch_file_events(
     branch_identifier: BranchIdentifier,
     file_identifier: FileIdentifier,
 ) -> Vec<EventRecord> {
-    let mut events = Vec::new();
-    let mut after = None;
-
-    loop {
-        let page = filesystem
-            .list_branch_file_events(
-                branch_identifier,
-                file_identifier,
-                after,
-                event_page_limit(100),
-            )
-            .expect("branch file events are listed");
-        events.extend_from_slice(page.records());
-        match page.next_after() {
-            Some(next_after) => after = Some(next_after),
-            None => return events,
-        }
-    }
+    filesystem
+        .branch_file_events(branch_identifier, file_identifier, event_page_limit(100))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("branch file events are listed")
 }
 
 pub fn read_snapshot_bytes(filesystem: &Filesystem, snapshot: &FileSnapshot) -> Vec<u8> {
