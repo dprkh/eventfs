@@ -8,9 +8,11 @@ use eventfs::{
 };
 
 fn main() -> Result<()> {
+    // Prepare a local mount point.
     let mount_point_path = PathBuf::from("eventfs.diff.mount");
     fs::create_dir_all(&mount_point_path)?;
 
+    // Open eventfs and mount it in the background.
     let configuration = FilesystemConfiguration::builder()
         .database_directory(PathBuf::from("eventfs.diff.db"))
         .mount_point(mount_point_path.clone())
@@ -18,11 +20,13 @@ fn main() -> Result<()> {
     let filesystem = Filesystem::open(configuration)?;
     let mounted = filesystem.spawn_mount()?;
 
+    // Write two versions of one file through the mounted filesystem.
     let file_path = mount_point_path.join("message.txt");
     fs::write(&file_path, b"hello world\n")?;
     fs::write(&file_path, b"hi mom\n")?;
     mounted.unmount()?;
 
+    // Find the file's write events, then load snapshots from the first and last write.
     let events = list_all_events(&filesystem)?;
     let file_identifier = file_identifier_for_path(&events, "/message.txt")?;
     let file_writes = events
@@ -38,11 +42,13 @@ fn main() -> Result<()> {
     let before = snapshot_bytes_at(&filesystem, file_identifier, first_write.sequence())?;
     let after = snapshot_bytes_at(&filesystem, file_identifier, final_write.sequence())?;
 
+    // Render a minimal line-based diff outside the library.
     print_simple_diff(&before, &after);
     Ok(())
 }
 
 fn list_all_events(filesystem: &Filesystem) -> Result<Vec<EventRecord>> {
+    // Collect every event page into one list.
     let limit = EventPageLimit::try_from(100)?;
     let mut after = None;
     let mut events = Vec::new();
@@ -69,6 +75,7 @@ fn snapshot_bytes_at(
     file_identifier: FileIdentifier,
     sequence: EventSequence,
 ) -> Result<Vec<u8>> {
+    // Read the nearest persisted snapshot at or before the requested event.
     let snapshot = filesystem
         .file_snapshot_at_or_before(file_identifier, sequence)?
         .context("file snapshot exists")?;
@@ -76,6 +83,7 @@ fn snapshot_bytes_at(
 }
 
 fn print_simple_diff(before: &[u8], after: &[u8]) {
+    // Print removed lines first, then added lines.
     let before = String::from_utf8_lossy(before);
     let after = String::from_utf8_lossy(after);
 

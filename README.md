@@ -41,45 +41,43 @@ fn main() -> Result<()> {
 }
 ```
 
-| FUSE operation | Supported |
-| --- | --- |
-| `lookup` | [x] |
-| `getattr` | [x] |
-| `setattr` | [x] |
-| `readlink` | [x] |
-| `mknod` | [x] |
-| `mkdir` | [x] |
-| `unlink` | [x] |
-| `rmdir` | [x] |
-| `symlink` | [x] |
-| `rename` | [x] |
-| `link` | [x] |
-| `open` | [x] |
-| `read` | [x] |
-| `write` | [x] |
-| `flush` | [x] |
-| `release` | [x] |
-| `fsync` | [x] |
-| `opendir` | [x] |
-| `readdir` | [x] |
-| `releasedir` | [x] |
-| `fsyncdir` | [x] |
-| `statfs` | [x] |
-| `setxattr` | [ ] |
-| `getxattr` | [ ] |
-| `listxattr` | [ ] |
-| `removexattr` | [ ] |
-| `access` | [x] |
-| `create` | [x] |
-| `readdirplus` | [ ] |
-| `getlk` | [ ] |
-| `setlk` | [ ] |
-| `bmap` | [ ] |
-| `ioctl` | [ ] |
-| `poll` | [ ] |
-| `fallocate` | [ ] |
-| `lseek` | [ ] |
-| `copy_file_range` | [ ] |
-| `setvolname` | [ ] |
-| `exchange` | [ ] |
-| `getxtimes` | [ ] |
+- [x] `lookup`
+- [x] `getattr`
+- [x] `setattr`
+- [x] `readlink`
+- [x] `mknod`
+- [x] `mkdir`
+- [x] `unlink`
+- [x] `rmdir`
+- [x] `symlink`
+- [x] `rename`
+- [x] `link`
+- [x] `open`
+- [x] `read`
+- [x] `write`
+- [x] `flush`
+- [x] `release`
+- [x] `fsync`
+- [x] `opendir`
+- [x] `readdir`
+- [x] `releasedir`
+- [x] `fsyncdir`
+- [x] `statfs`
+- [ ] `setxattr`
+- [ ] `getxattr`
+- [ ] `listxattr`
+- [ ] `removexattr`
+- [x] `access`
+- [x] `create`
+- [ ] `readdirplus`
+- [ ] `getlk`
+- [ ] `setlk`
+- [ ] `bmap`
+- [ ] `ioctl`
+- [ ] `poll`
+- [ ] `fallocate`
+- [ ] `lseek`
+- [ ] `copy_file_range`
+- [ ] `setvolname`
+- [ ] `exchange`
+- [ ] `getxtimes`
