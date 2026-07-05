@@ -1,6 +1,6 @@
 This library implements a [FUSE](https://www.kernel.org/doc/html/next/filesystems/fuse.html) filesystem that uses [event sourcing](https://learn.microsoft.com/en-us/azure/architecture/patterns/event-sourcing) to store data. This approach provides visibility into filesystem changes and allows restoring the filesystem to any previous point. In particular this library supports branching from specific points in the event history (see [examples](./examples)).
 
-### Example
+# Example
 
 ```rust
 use std::{fs, path::PathBuf};
@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### FUSE operation support
+# FUSE operation support
 
 - [x] `lookup`
 - [x] `getattr`
