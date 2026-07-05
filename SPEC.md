@@ -354,7 +354,7 @@ impl Filesystem {
 - Validated scalar wrapper types MUST expose `new` and `get` and MUST NOT expose duplicate public construction paths.
 - Paginated APIs MUST remain available for explicit cursor control when pagination is part of the contract.
 - Public iterator APIs MUST provide the common sequential read path for paginated records.
-- README and examples MUST demonstrate the intended common-path API for changed public functionality.
+- README and examples MUST demonstrate the default common-path API unless the example's capability requires optional configuration.
 - `FilesystemConfiguration::new` and path-valued public constructors MUST reject empty paths.
 - `FilesystemConfiguration::new` MUST default to `SessionAccessControlList::Owner` and no caller-supplied mount options.
 - `FilesystemConfiguration::with_session_access_control_list` MUST configure the session access control list shared by filesystem clones and mounted sessions opened from the configuration.
