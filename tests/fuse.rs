@@ -8,11 +8,12 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eventfs::{Filesystem, FilesystemError};
+use eventfs::{Filesystem, FilesystemError, FuseOperationError};
 
 use support::{
     TestDirectories, access_path, assert_event_sequences_increase, assert_unsupported_xattrs,
@@ -494,6 +495,107 @@ fn unsupported_fuse_operations_fail() {
 
     fs::write(&file_path, b"contents").expect("file is written");
     assert_unsupported_xattrs(&file_path);
+
+    mounted.unmount().expect("filesystem unmounts");
+}
+
+#[test]
+fn fuse_error_callback_receives_supported_operation_failures() {
+    let directories = TestDirectories::new();
+    let callback_errors = Arc::new(Mutex::new(Vec::new()));
+    let filesystem = filesystem_with_fuse_error_callback(&directories, &callback_errors);
+    let mounted = filesystem
+        .spawn_mount()
+        .expect("filesystem mounts in the background");
+
+    fs::metadata(directories.mount_point_path().join("missing"))
+        .expect_err("missing path metadata fails");
+
+    assert_callback_errors_include(
+        &recorded_callback_errors(&callback_errors),
+        "lookup",
+        libc::ENOENT,
+        false,
+    );
+
+    mounted.unmount().expect("filesystem unmounts");
+}
+
+#[test]
+fn fuse_error_callback_panic_does_not_change_fuse_operation_error() {
+    let directories = TestDirectories::new();
+    let callback_count = Arc::new(AtomicUsize::new(0));
+    let callback_count_for_configuration = Arc::clone(&callback_count);
+    let configuration = directories
+        .configuration()
+        .with_fuse_error_callback(move |_error| {
+            callback_count_for_configuration.fetch_add(1, Ordering::SeqCst);
+            panic!("callback panic is isolated");
+        });
+    let filesystem = Filesystem::open(configuration).expect("filesystem opens");
+    let mounted = filesystem
+        .spawn_mount()
+        .expect("filesystem mounts in the background");
+
+    let error = fs::metadata(directories.mount_point_path().join("missing"))
+        .expect_err("missing path metadata fails");
+
+    assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+    assert!(
+        callback_count.load(Ordering::SeqCst) > 0,
+        "callback runs before its panic is isolated"
+    );
+
+    mounted.unmount().expect("filesystem unmounts");
+}
+
+#[test]
+fn fuse_error_callback_receives_unsupported_operation_failures() {
+    let directories = TestDirectories::new();
+    let callback_errors = Arc::new(Mutex::new(Vec::new()));
+    let filesystem = filesystem_with_fuse_error_callback(&directories, &callback_errors);
+    let mounted = filesystem
+        .spawn_mount()
+        .expect("filesystem mounts in the background");
+    let file_path = directories.mount_point_path().join("file");
+
+    fs::write(&file_path, b"contents").expect("file is written");
+    let mut events = list_all_events(&filesystem).len();
+    assert_unsupported_xattrs(&file_path);
+
+    let errors = recorded_callback_errors(&callback_errors);
+    assert_callback_errors_include(&errors, "setxattr", unsupported_operation_errno(), true);
+    assert!(
+        errors.iter().any(FuseOperationError::is_unsupported),
+        "unsupported operation failure is reported"
+    );
+    expect_events(
+        &mut events,
+        &filesystem,
+        0,
+        "unsupported callback-covered xattrs do not append events",
+    );
+
+    mounted.unmount().expect("filesystem unmounts");
+}
+
+#[test]
+fn fuse_error_callback_is_not_called_for_successful_operations() {
+    let directories = TestDirectories::new();
+    let callback_errors = Arc::new(Mutex::new(Vec::new()));
+    let filesystem = filesystem_with_fuse_error_callback(&directories, &callback_errors);
+    let mounted = filesystem
+        .spawn_mount()
+        .expect("filesystem mounts in the background");
+    let root = directories.mount_point_path();
+
+    fs::metadata(root).expect("root metadata is read");
+    statvfs(root);
+
+    assert!(
+        recorded_callback_errors(&callback_errors).is_empty(),
+        "successful FUSE operations do not invoke the error callback"
+    );
 
     mounted.unmount().expect("filesystem unmounts");
 }
@@ -1636,6 +1738,48 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
     } else {
         Err(last_os_error())
     }
+}
+
+fn filesystem_with_fuse_error_callback(
+    directories: &TestDirectories,
+    errors: &Arc<Mutex<Vec<FuseOperationError>>>,
+) -> Filesystem {
+    let errors = Arc::clone(errors);
+    let configuration = directories
+        .configuration()
+        .with_fuse_error_callback(move |error| {
+            errors
+                .lock()
+                .expect("callback error collection lock is available")
+                .push(error);
+        });
+    Filesystem::open(configuration).expect("filesystem opens")
+}
+
+fn recorded_callback_errors(
+    errors: &Arc<Mutex<Vec<FuseOperationError>>>,
+) -> Vec<FuseOperationError> {
+    errors
+        .lock()
+        .expect("callback error collection lock is available")
+        .clone()
+}
+
+fn assert_callback_errors_include(
+    errors: &[FuseOperationError],
+    operation: &'static str,
+    errno: i32,
+    unsupported: bool,
+) {
+    assert!(
+        errors.iter().any(|error| {
+            error.operation() == operation
+                && error.errno() == errno
+                && error.filesystem_error() == FilesystemError::FilesystemOperation
+                && error.is_unsupported() == unsupported
+        }),
+        "callback errors include operation {operation} with errno {errno}: {errors:?}"
+    );
 }
 
 fn assert_command_succeeds(status: std::process::ExitStatus) {

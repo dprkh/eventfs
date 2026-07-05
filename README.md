@@ -1,30 +1,30 @@
-# Example
+This library implements a [FUSE](https://www.kernel.org/doc/html/next/filesystems/fuse.html) filesystem that uses [event sourcing](https://learn.microsoft.com/en-us/azure/architecture/patterns/event-sourcing) to store data. This approach provides visibility into filesystem changes and allows restoring the filesystem to any previous point. In particular this library supports branching from specific points in the event history (see [examples](./examples)).
+
+### Example
 
 ```rust
 use std::{fs, path::PathBuf};
 
-use anyhow::Result;
-
 use eventfs::{EventPageLimit, Filesystem, FilesystemConfiguration};
 
-fn main() -> Result<()> {
-    // Prepare a local mount point.
-    let mount_point_path = PathBuf::from("eventfs.mount");
-    fs::create_dir_all(&mount_point_path)?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create the local mount point used by FUSE.
+    let mount_point = PathBuf::from("eventfs.mount");
 
-    // Open eventfs and mount it in the background.
-    let configuration = FilesystemConfiguration::new("eventfs.db", mount_point_path.clone())?;
+    fs::create_dir_all(&mount_point)?;
+
+    // Open the filesystem and mount it in the background.
+    let configuration = FilesystemConfiguration::new("eventfs.db", mount_point.clone())?;
+
     let filesystem = Filesystem::open(configuration)?;
-    let _mounted = filesystem.spawn_mount()?;
 
-    // Write and read a file through the mounted filesystem.
-    let file_path = mount_point_path.join("hello-world.txt");
-    fs::write(&file_path, "Hello, world!")?;
-    println!("{}", fs::read_to_string(&file_path)?);
+    let _ = filesystem.spawn_mount()?;
 
-    // Print every event.
-    let limit = EventPageLimit::new(100)?;
-    for event in filesystem.events(limit) {
+    // Write a file through the mounted filesystem.
+    fs::write(mount_point.join("hello.txt"), "Hello from eventfs!")?;
+
+    // Print the events created by filesystem changes.
+    for event in filesystem.events(EventPageLimit::new(10)?) {
         println!("{:?}", event?);
     }
 
@@ -32,7 +32,7 @@ fn main() -> Result<()> {
 }
 ```
 
-# FUSE operation support
+### FUSE operation support
 
 - [x] `lookup`
 - [x] `getattr`

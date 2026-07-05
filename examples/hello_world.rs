@@ -10,7 +10,14 @@ fn main() -> Result<()> {
     fs::create_dir_all(&mount_point_path)?;
 
     // Open eventfs and mount it in the background.
-    let configuration = FilesystemConfiguration::new("eventfs.db", mount_point_path.clone())?;
+    let configuration = FilesystemConfiguration::new("eventfs.db", mount_point_path.clone())?
+        .with_fuse_error_callback(|error| {
+            eprintln!(
+                "FUSE operation {} failed with errno {}",
+                error.operation(),
+                error.errno()
+            );
+        });
     let filesystem = Filesystem::open(configuration)?;
     let _mounted = filesystem.spawn_mount()?;
 

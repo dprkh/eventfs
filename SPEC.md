@@ -8,6 +8,7 @@
 - eventfs MUST NOT expose built-in file diff rendering APIs.
 - eventfs MAY include `examples/hello_world.rs` as a non-contract example that mounts the filesystem, writes and reads one file, and lists events.
 - eventfs MAY include `examples/file_diff.rs` as a non-contract example that computes a diff outside the library from public snapshot and payload range APIs.
+- eventfs MAY include `examples/branching.rs` as a non-contract example that creates, switches, and reads independent branches.
 - eventfs MUST NOT expose public API, dependencies, storage schema, tests, or implementation code for functionality not defined in this specification.
 - New eventfs functionality MUST be specified here before it is added to code.
 
@@ -19,6 +20,7 @@ The public API MUST expose only these library-owned public types:
 pub struct Filesystem;
 pub struct FilesystemConfiguration;
 pub struct MountedFilesystem;
+pub struct FuseOperationError;
 
 pub struct BackupDirectory;
 pub struct BackupIdentifier;
@@ -58,6 +60,18 @@ impl FilesystemConfiguration {
         database_directory: impl Into<std::path::PathBuf>,
         mount_point: impl Into<std::path::PathBuf>,
     ) -> Result<Self, ConfigurationError>;
+
+    pub fn with_fuse_error_callback(
+        self,
+        callback: impl Fn(FuseOperationError) + Send + Sync + 'static,
+    ) -> Self;
+}
+
+impl FuseOperationError {
+    pub fn operation(&self) -> &'static str;
+    pub fn errno(&self) -> i32;
+    pub fn filesystem_error(&self) -> FilesystemError;
+    pub fn is_unsupported(&self) -> bool;
 }
 
 impl BackupDirectory {
@@ -301,6 +315,8 @@ impl Filesystem {
 - Public iterator APIs MUST provide the common sequential read path for paginated records.
 - README and examples MUST demonstrate the intended common-path API for changed public functionality.
 - `FilesystemConfiguration::new` and path-valued public constructors MUST reject empty paths.
+- `FilesystemConfiguration::with_fuse_error_callback` MUST configure one optional callback shared by filesystem clones and mounted sessions opened from the configuration.
+- `FuseOperationError` MUST expose the failed FUSE operation name, the positive platform errno returned to FUSE, the mapped `FilesystemError`, and whether the operation was unsupported.
 - `BackupIdentifier` MUST reject zero.
 - `EventPageLimit` MUST reject zero.
 - `BranchPageLimit` MUST reject zero.
@@ -322,6 +338,10 @@ impl Filesystem {
 - `Filesystem::mount` and `Filesystem::spawn_mount` MUST mount the filesystem at `FilesystemConfiguration.mount_point`.
 - The mounted filesystem MUST support lookup, attribute read, attribute update, node creation, directory creation, file creation, file open, file read, file write, file truncate, flush, file synchronization, directory open, directory read, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, and filesystem statistics.
 - Unsupported FUSE operations MUST return the platform-appropriate unsupported-operation error and MUST NOT append events.
+- Failed supported FUSE operations MUST invoke the configured FUSE error callback once with `FuseOperationError::is_unsupported` returning `false`.
+- Unsupported FUSE operations MUST invoke the configured FUSE error callback once with `FuseOperationError::is_unsupported` returning `true`.
+- Successful FUSE operations MUST NOT invoke the configured FUSE error callback.
+- FUSE error callback failures MUST NOT change the FUSE error returned to the caller.
 - Inode numbers MUST be stable across process restarts.
 - File handles MAY be process-local and MUST NOT be required to reconstruct persistent filesystem state.
 - Filesystem statistics MUST NOT append events or mutate storage.
@@ -455,6 +475,8 @@ Storage requirements:
 - RocksDB failures MUST map to `FilesystemError::Database`.
 - Corrupt storage, corrupt backup repositories, missing backup files, and unknown backup identifiers MUST map to `FilesystemError::Integrity`.
 - FUSE operation failures MUST map to `FilesystemError::FilesystemOperation`.
+- `FuseOperationError::filesystem_error` MUST return `FilesystemError::FilesystemOperation`.
+- Non-FUSE public API failures MUST NOT invoke the configured FUSE error callback.
 - Backup repository creation, backup repository opening, and backup creation failures MUST map to `FilesystemError::Backup`.
 - Import target replacement and import-open failures MUST map to `FilesystemError::Import`.
 
@@ -493,6 +515,8 @@ Implementations MUST include automated tests for:
 - Branch switching, divergence, file event listing, and snapshot reads preserve independent file contents across branches.
 - Event debug formatting does not expose stored file payload bytes.
 - Every supported FUSE operation works through the mounted filesystem.
+- Configured FUSE error callbacks receive failed supported operation errors and unsupported operation errors with the returned errno.
+- Successful FUSE operations do not invoke configured FUSE error callbacks.
 - Mounted FUSE operation tests cover success cases, failure cases, edge cases, event append behavior for mutating operations, and no-event behavior for read-only and unsupported operations.
 - Longer mounted FUSE stress tests cover repeated supported operations, combinations of supported operations, and edge cases.
 - Crash and fault injection around write batches, backup creation, backup import replacement, and mount/unmount state transitions preserves durable consistency.

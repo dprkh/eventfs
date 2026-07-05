@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::num::NonZeroU64;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
@@ -321,10 +322,11 @@ impl Filesystem {
 }
 
 /// Configuration required to open and mount a filesystem.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct FilesystemConfiguration {
     database_directory: PathBuf,
     mount_point: PathBuf,
+    fuse_error_callback: Option<Arc<FuseErrorCallback>>,
 }
 
 impl FilesystemConfiguration {
@@ -339,6 +341,45 @@ impl FilesystemConfiguration {
         mount_point: impl Into<PathBuf>,
     ) -> Result<Self, ConfigurationError> {
         new_filesystem_configuration(database_directory.into(), mount_point.into())
+    }
+
+    /// Configures a callback invoked after failed or unsupported FUSE operations.
+    pub fn with_fuse_error_callback(
+        self,
+        callback: impl Fn(FuseOperationError) + Send + Sync + 'static,
+    ) -> Self {
+        with_fuse_error_callback(self, callback)
+    }
+}
+
+/// Error context passed to configured FUSE operation failure callbacks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FuseOperationError {
+    operation: &'static str,
+    errno: i32,
+    filesystem_error: FilesystemError,
+    unsupported: bool,
+}
+
+impl FuseOperationError {
+    /// Returns the FUSE operation name.
+    pub fn operation(&self) -> &'static str {
+        fuse_operation_error_operation(self)
+    }
+
+    /// Returns the positive platform errno returned to FUSE.
+    pub fn errno(&self) -> i32 {
+        fuse_operation_error_errno(self)
+    }
+
+    /// Returns the mapped public filesystem error.
+    pub fn filesystem_error(&self) -> FilesystemError {
+        fuse_operation_error_filesystem_error(self)
+    }
+
+    /// Returns whether the operation is explicitly unsupported by eventfs.
+    pub fn is_unsupported(&self) -> bool {
+        fuse_operation_error_is_unsupported(self)
     }
 }
 
@@ -849,6 +890,30 @@ impl fmt::Debug for Filesystem {
     }
 }
 
+impl fmt::Debug for FilesystemConfiguration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FilesystemConfiguration")
+            .field("database_directory", &self.database_directory)
+            .field("mount_point", &self.mount_point)
+            .field("fuse_error_callback", &self.fuse_error_callback.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for FilesystemConfiguration {
+    fn eq(&self, other: &Self) -> bool {
+        self.database_directory == other.database_directory
+            && self.mount_point == other.mount_point
+            && fuse_error_callbacks_equal(
+                self.fuse_error_callback.as_ref(),
+                other.fuse_error_callback.as_ref(),
+            )
+    }
+}
+
+impl Eq for FilesystemConfiguration {}
+
 impl fmt::Display for ConfigurationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -873,6 +938,48 @@ impl fmt::Display for FilesystemError {
 }
 
 impl std::error::Error for FilesystemError {}
+
+type FuseErrorCallback = dyn Fn(FuseOperationError) + Send + Sync + 'static;
+
+fn fuse_error_callbacks_equal(
+    left: Option<&Arc<FuseErrorCallback>>,
+    right: Option<&Arc<FuseErrorCallback>>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
+fn fuse_operation_error_operation(error: &FuseOperationError) -> &'static str {
+    error.operation
+}
+
+fn fuse_operation_error_errno(error: &FuseOperationError) -> i32 {
+    error.errno
+}
+
+fn fuse_operation_error_filesystem_error(error: &FuseOperationError) -> FilesystemError {
+    error.filesystem_error
+}
+
+fn fuse_operation_error_is_unsupported(error: &FuseOperationError) -> bool {
+    error.unsupported
+}
+
+fn new_fuse_operation_error(
+    operation: &'static str,
+    errno: fuser::Errno,
+    unsupported: bool,
+) -> FuseOperationError {
+    FuseOperationError {
+        operation,
+        errno: errno.code(),
+        filesystem_error: FilesystemError::FilesystemOperation,
+        unsupported,
+    }
+}
 
 fn events(
     filesystem: &Filesystem,
@@ -1141,6 +1248,10 @@ impl FilesystemConfiguration {
     pub(crate) fn mount_point(&self) -> &Path {
         &self.mount_point
     }
+
+    fn fuse_error_callback(&self) -> Option<&Arc<FuseErrorCallback>> {
+        self.fuse_error_callback.as_ref()
+    }
 }
 
 impl fuser::Filesystem for Filesystem {
@@ -1153,7 +1264,7 @@ impl fuser::Filesystem for Filesystem {
     ) {
         match self.storage.lookup(parent.into(), name) {
             Ok(entry) => reply.entry(&entry.ttl, &entry.attr, fuser::Generation(0)),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("lookup", error)),
         }
     }
 
@@ -1166,7 +1277,7 @@ impl fuser::Filesystem for Filesystem {
     ) {
         match self.storage.getattr(ino.into()) {
             Ok(entry) => reply.attr(&entry.ttl, &entry.attr),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("getattr", error)),
         }
     }
 
@@ -1204,14 +1315,14 @@ impl fuser::Filesystem for Filesystem {
             .setattr(ino.into(), attributes, _req.uid(), _req.gid())
         {
             Ok(entry) => reply.attr(&entry.ttl, &entry.attr),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("setattr", error)),
         }
     }
 
     fn readlink(&self, _req: &fuser::Request, ino: fuser::INodeNo, reply: fuser::ReplyData) {
         match self.storage.readlink(ino.into()) {
             Ok(target) => reply.data(&target),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("readlink", error)),
         }
     }
 
@@ -1237,7 +1348,7 @@ impl fuser::Filesystem for Filesystem {
             storage::CreateNodeKind::Special { mode, rdev },
         ) {
             Ok(entry) => reply.entry(&entry.ttl, &entry.attr, fuser::Generation(0)),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("mknod", error)),
         }
     }
 
@@ -1262,7 +1373,7 @@ impl fuser::Filesystem for Filesystem {
             storage::CreateNodeKind::Directory,
         ) {
             Ok(entry) => reply.entry(&entry.ttl, &entry.attr, fuser::Generation(0)),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("mkdir", error)),
         }
     }
 
@@ -1278,7 +1389,7 @@ impl fuser::Filesystem for Filesystem {
             .unlink(parent.into(), name, _req.uid(), _req.gid())
         {
             Ok(()) => reply.ok(),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("unlink", error)),
         }
     }
 
@@ -1294,7 +1405,7 @@ impl fuser::Filesystem for Filesystem {
             .rmdir(parent.into(), name, _req.uid(), _req.gid())
         {
             Ok(()) => reply.ok(),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("rmdir", error)),
         }
     }
 
@@ -1311,7 +1422,7 @@ impl fuser::Filesystem for Filesystem {
             .create_symlink(parent.into(), link_name, target, _req.uid(), _req.gid())
         {
             Ok(entry) => reply.entry(&entry.ttl, &entry.attr, fuser::Generation(0)),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("symlink", error)),
         }
     }
 
@@ -1339,7 +1450,7 @@ impl fuser::Filesystem for Filesystem {
             )
         }) {
             Ok(()) => reply.ok(),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("rename", error)),
         }
     }
 
@@ -1359,7 +1470,7 @@ impl fuser::Filesystem for Filesystem {
             _req.gid(),
         ) {
             Ok(entry) => reply.entry(&entry.ttl, &entry.attr, fuser::Generation(0)),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("link", error)),
         }
     }
 
@@ -1375,7 +1486,7 @@ impl fuser::Filesystem for Filesystem {
             .open_file(ino.into(), _req.uid(), _req.gid(), _flags)
         {
             Ok(()) => reply.opened(fuser::FileHandle(0), fuser::FopenFlags::empty()),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("open", error)),
         }
     }
 
@@ -1395,7 +1506,7 @@ impl fuser::Filesystem for Filesystem {
             .read_file(ino.into(), offset, size, _req.uid(), _req.gid())
         {
             Ok(bytes) => reply.data(&bytes),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("read", error)),
         }
     }
 
@@ -1416,7 +1527,7 @@ impl fuser::Filesystem for Filesystem {
             .write_file(ino.into(), offset, data, _req.uid(), _req.gid())
         {
             Ok(write) => reply.written(write.written),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("write", error)),
         }
     }
 
@@ -1464,7 +1575,7 @@ impl fuser::Filesystem for Filesystem {
     ) {
         match self.storage.opendir(ino.into()) {
             Ok(()) => reply.opened(fuser::FileHandle(0), fuser::FopenFlags::empty()),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("opendir", error)),
         }
     }
 
@@ -1488,7 +1599,7 @@ impl fuser::Filesystem for Filesystem {
             Ok(()) => {
                 reply.ok();
             }
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("readdir", error)),
         }
     }
 
@@ -1526,7 +1637,7 @@ impl fuser::Filesystem for Filesystem {
                 statistics.maximum_name_length,
                 statistics.fragment_size,
             ),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("statfs", error)),
         }
     }
 
@@ -1540,7 +1651,7 @@ impl fuser::Filesystem for Filesystem {
         _position: u32,
         reply: fuser::ReplyEmpty,
     ) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("setxattr"));
     }
 
     fn getxattr(
@@ -1551,7 +1662,7 @@ impl fuser::Filesystem for Filesystem {
         _size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("getxattr"));
     }
 
     fn listxattr(
@@ -1561,7 +1672,7 @@ impl fuser::Filesystem for Filesystem {
         _size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("listxattr"));
     }
 
     fn removexattr(
@@ -1571,7 +1682,7 @@ impl fuser::Filesystem for Filesystem {
         _name: &OsStr,
         reply: fuser::ReplyEmpty,
     ) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("removexattr"));
     }
 
     fn access(
@@ -1586,7 +1697,7 @@ impl fuser::Filesystem for Filesystem {
             .access(ino.into(), _req.uid(), _req.gid(), mask)
         {
             Ok(()) => reply.ok(),
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("access", error)),
         }
     }
 
@@ -1620,7 +1731,7 @@ impl fuser::Filesystem for Filesystem {
                     fuser::FopenFlags::empty(),
                 );
             }
-            Err(error) => reply.error(error.errno()),
+            Err(error) => reply.error(self.fuse_error("create", error)),
         }
     }
 
@@ -1632,7 +1743,7 @@ impl fuser::Filesystem for Filesystem {
         _offset: u64,
         reply: fuser::ReplyDirectoryPlus,
     ) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("readdirplus"));
     }
 
     fn getlk(
@@ -1647,7 +1758,7 @@ impl fuser::Filesystem for Filesystem {
         _pid: u32,
         reply: fuser::ReplyLock,
     ) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("getlk"));
     }
 
     fn setlk(
@@ -1663,7 +1774,7 @@ impl fuser::Filesystem for Filesystem {
         _sleep: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("setlk"));
     }
 
     fn bmap(
@@ -1674,7 +1785,7 @@ impl fuser::Filesystem for Filesystem {
         _idx: u64,
         reply: fuser::ReplyBmap,
     ) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("bmap"));
     }
 
     fn ioctl(
@@ -1688,7 +1799,7 @@ impl fuser::Filesystem for Filesystem {
         _out_size: u32,
         reply: fuser::ReplyIoctl,
     ) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("ioctl"));
     }
 
     fn poll(
@@ -1701,7 +1812,7 @@ impl fuser::Filesystem for Filesystem {
         _flags: fuser::PollFlags,
         reply: fuser::ReplyPoll,
     ) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("poll"));
     }
 
     fn fallocate(
@@ -1714,7 +1825,7 @@ impl fuser::Filesystem for Filesystem {
         _mode: i32,
         reply: fuser::ReplyEmpty,
     ) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("fallocate"));
     }
 
     fn lseek(
@@ -1726,7 +1837,7 @@ impl fuser::Filesystem for Filesystem {
         _whence: i32,
         reply: fuser::ReplyLseek,
     ) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("lseek"));
     }
 
     fn copy_file_range(
@@ -1742,12 +1853,12 @@ impl fuser::Filesystem for Filesystem {
         _flags: fuser::CopyFileRangeFlags,
         reply: fuser::ReplyWrite,
     ) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("copy_file_range"));
     }
 
     #[cfg(target_os = "macos")]
     fn setvolname(&self, _req: &fuser::Request, _name: &OsStr, reply: fuser::ReplyEmpty) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("setvolname"));
     }
 
     #[cfg(target_os = "macos")]
@@ -1761,12 +1872,12 @@ impl fuser::Filesystem for Filesystem {
         _options: u64,
         reply: fuser::ReplyEmpty,
     ) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("exchange"));
     }
 
     #[cfg(target_os = "macos")]
     fn getxtimes(&self, _req: &fuser::Request, _ino: fuser::INodeNo, reply: fuser::ReplyXTimes) {
-        reply.error(unsupported_operation_error());
+        reply.error(self.unsupported_fuse_error("getxtimes"));
     }
 }
 
@@ -1809,6 +1920,25 @@ impl Filesystem {
 
     pub(crate) fn storage(&self) -> &Arc<Storage> {
         &self.storage
+    }
+
+    fn fuse_error(&self, operation: &'static str, error: storage::FuseError) -> fuser::Errno {
+        let errno = error.errno();
+        self.notify_fuse_error(operation, errno, false);
+        errno
+    }
+
+    fn unsupported_fuse_error(&self, operation: &'static str) -> fuser::Errno {
+        let errno = unsupported_operation_error();
+        self.notify_fuse_error(operation, errno, true);
+        errno
+    }
+
+    fn notify_fuse_error(&self, operation: &'static str, errno: fuser::Errno, unsupported: bool) {
+        if let Some(callback) = self.configuration.fuse_error_callback() {
+            let error = new_fuse_operation_error(operation, errno, unsupported);
+            let _ = catch_unwind(AssertUnwindSafe(|| callback(error)));
+        }
     }
 
     pub(crate) fn mark_mounted(&self) -> Result<(), FilesystemError> {
@@ -1873,7 +2003,16 @@ fn new_filesystem_configuration(
     Ok(FilesystemConfiguration {
         database_directory,
         mount_point,
+        fuse_error_callback: None,
     })
+}
+
+fn with_fuse_error_callback(
+    mut configuration: FilesystemConfiguration,
+    callback: impl Fn(FuseOperationError) + Send + Sync + 'static,
+) -> FilesystemConfiguration {
+    configuration.fuse_error_callback = Some(Arc::new(callback));
+    configuration
 }
 
 fn validate_configuration_path(path: &Path) -> Result<(), ConfigurationError> {
