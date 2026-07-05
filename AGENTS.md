@@ -1,4 +1,4 @@
-Never use your own knowledge. When planning, read ./SPEC.md fully.
+Never use your own knowledge. When planning, read `SPEC.md` fully.
 
 ## Source Organization
 
