@@ -253,6 +253,12 @@ struct WriteState {
     active_branch_head_ordinal: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteDurability {
+    Buffered,
+    Synchronous,
+}
+
 impl WriteState {
     fn next_inode_number(self) -> FuseResult<u64> {
         if self.next_inode_number < INODE_FIRST_ALLOCATED {
@@ -1983,6 +1989,13 @@ impl Storage {
         statistics_from_backing(backing, next_inode_number)
     }
 
+    pub(crate) fn synchronize(&self) -> FuseResult<()> {
+        let _write_state = self.lock_write_state()?;
+        self.database
+            .flush_wal(true)
+            .map_err(|_| FuseError::Database)
+    }
+
     pub(crate) fn setxattr(
         &self,
         inode_number: u64,
@@ -2553,7 +2566,8 @@ impl Storage {
         event_sequence: EventSequence,
         next_inode_number: Option<u64>,
     ) -> FuseResult<()> {
-        write_batch(&self.database, batch).map_err(|_| FuseError::Database)?;
+        write_batch_with_durability(&self.database, batch, WriteDurability::Buffered)
+            .map_err(|_| FuseError::Database)?;
         write_state.record_committed_event(event_sequence);
         if let Some(next_inode_number) = next_inode_number {
             write_state.record_committed_inode_number(next_inode_number);
@@ -4892,13 +4906,24 @@ fn to_fuse_integrity(_error: FilesystemError) -> FuseError {
 }
 
 fn write_batch(database: &DB, batch: WriteBatch) -> Result<(), FilesystemError> {
+    write_batch_with_durability(database, batch, WriteDurability::Synchronous)
+}
+
+fn write_batch_with_durability(
+    database: &DB,
+    batch: WriteBatch,
+    durability: WriteDurability,
+) -> Result<(), FilesystemError> {
+    #[cfg(test)]
+    record_write_batch_durability(durability);
+
     #[cfg(test)]
     if take_write_batch_fault(WriteBatchFault::BeforeWrite) {
         return Err(FilesystemError::Database);
     }
 
     let mut write_options = WriteOptions::default();
-    write_options.set_sync(true);
+    write_options.set_sync(matches!(durability, WriteDurability::Synchronous));
     write_options.disable_wal(false);
     let result = database
         .write_opt(batch, &write_options)
@@ -4923,6 +4948,7 @@ enum WriteBatchFault {
 #[cfg(test)]
 thread_local! {
     static WRITE_BATCH_FAULT: Cell<Option<WriteBatchFault>> = const { Cell::new(None) };
+    static WRITE_BATCH_DURABILITY: Cell<Option<WriteDurability>> = const { Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -4939,6 +4965,20 @@ fn take_write_batch_fault(fault: WriteBatchFault) -> bool {
         } else {
             false
         }
+    })
+}
+
+#[cfg(test)]
+fn record_write_batch_durability(durability: WriteDurability) {
+    WRITE_BATCH_DURABILITY.with(|slot| slot.set(Some(durability)));
+}
+
+#[cfg(test)]
+fn take_write_batch_durability() -> Option<WriteDurability> {
+    WRITE_BATCH_DURABILITY.with(|slot| {
+        let durability = slot.get();
+        slot.set(None);
+        durability
     })
 }
 
@@ -5490,6 +5530,36 @@ mod tests {
 
         let storage = open_database_path(&database).expect("storage reopens after fault");
         assert_eq!(write_state_snapshot(&storage), initial);
+    }
+
+    #[test]
+    fn mounted_mutations_use_buffered_writes_and_direct_batches_remain_synchronous() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let database = temporary.path().join("database");
+        let storage = open_database_path(&database).expect("storage opens");
+        let _ = take_write_batch_durability();
+
+        storage
+            .create_node(
+                INODE_ROOT,
+                OsStr::new("buffered-mutation"),
+                0o644,
+                0,
+                current_credentials(),
+                CreateNodeKind::RegularFile,
+            )
+            .expect("mounted mutation commits");
+        assert_eq!(
+            take_write_batch_durability(),
+            Some(WriteDurability::Buffered)
+        );
+
+        write_batch(storage.database(), WriteBatch::default())
+            .expect("direct batch helper succeeds");
+        assert_eq!(
+            take_write_batch_durability(),
+            Some(WriteDurability::Synchronous)
+        );
     }
 
     #[test]

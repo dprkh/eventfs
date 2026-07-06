@@ -43,58 +43,72 @@ unit, then run on the benchmark host with `./fuse_operations --bench --noplot`.
 Benchmark host:
 
 - DigitalOcean `c-2` CPU-Optimized droplet in `sfo2`
-- 2 Intel vCPUs, 4096 MB RAM, 25 GB disk
-- Intel(R) Xeon(R) Platinum 8168 CPU @ 2.70GHz
-- Ubuntu 24.04.4 LTS x64, Linux 6.8.0-124-generic
-- Root and benchmark host directories on `/dev/vda1` ext4
+- 2 Intel vCPUs, 3.8 GiB RAM, no swap, 25 GB disk
+- Intel(R) Xeon(R) Platinum 8358 CPU @ 2.60GHz
+- Ubuntu 24.04 x64, Linux 6.8.0-124-generic
+- Root and benchmark temporary directories on `/dev/vda1` ext4
 - FUSE 3.14.0
 - Benchmark binary SHA-256:
-  `11db53204932218c78ebe6b3c9796294c026aa6eabd3a1b284cebbbef0b902fe`
+  `332f0070c9e24f6053d6cd27c7208c8ca8a408affb8785271b47177de06b6c4c`
 
 Criterion reports mean time per operation:
 
 | Operation | eventfs mean | host mean | eventfs / host |
 | --- | ---: | ---: | ---: |
-| `lookup` | 1.77 us | 1.71 us | 1.0x |
-| `getattr` | 1.44 us | 1.42 us | 1.0x |
-| `setattr` | 1.62 ms | 3.49 us | 463.6x |
-| `access` | 35.14 us | 1.54 us | 22.9x |
-| `statfs` | 32.72 us | 1.67 us | 19.6x |
-| `mknod` | 1.61 ms | 7.21 us | 223.6x |
-| `mkdir` | 1.80 ms | 20.58 us | 87.5x |
-| `create` | 1.78 ms | 9.11 us | 195.3x |
-| `unlink` | 1.59 ms | 12.26 us | 129.6x |
-| `rmdir` | 1.71 ms | 14.89 us | 115.1x |
-| `rename` | 1.78 ms | 8.97 us | 198.3x |
-| `rename_noreplace` | 1.77 ms | 9.12 us | 194.1x |
-| `link` | 1.76 ms | 5.32 us | 331.1x |
-| `symlink` | 2.27 ms | 8.23 us | 276.2x |
-| `readlink` | 41.60 us | 1.76 us | 23.7x |
-| `open` | 45.84 us | 2.25 us | 20.4x |
-| `read` | 1.14 us | 1.11 us | 1.0x |
-| `write` | 2.05 ms | 1.32 us | 1548.6x |
-| `truncate` | 2.08 ms | 4.45 us | 468.8x |
-| `flush` | 29.09 us | 817.10 ns | 35.6x |
-| `release` | 35.78 us | 1.12 us | 32.1x |
-| `fsync` | 27.64 us | 26.17 us | 1.1x |
-| `copy_file_range` | 2.11 ms | 2.95 us | 715.8x |
-| `opendir` | 42.02 us | 3.11 us | 13.5x |
-| `readdir` | 172.99 us | 6.19 us | 27.9x |
-| `readdirplus` | 374.18 us | 35.60 us | 10.5x |
-| `fsyncdir` | 28.68 us | 1.18 us | 24.3x |
-| `releasedir` | 5.53 us | 1.10 us | 5.0x |
-| `setxattr` | 2.67 ms | 3.66 us | 730.6x |
-| `getxattr` | 127.86 us | 2.16 us | 59.2x |
-| `listxattr` | 80.51 us | 1.96 us | 41.1x |
-| `removexattr` | 2.20 ms | 3.46 us | 636.9x |
-| `getlk` | 78.18 us | 905.45 ns | 86.3x |
-| `setlk` | 78.91 us | 1.11 us | 71.2x |
-| `bmap` | 978.27 ns | 1.18 us | 0.8x |
-| `ioctl` | 79.86 us | 811.60 ns | 98.4x |
-| `poll` | 79.78 us | 879.32 ns | 90.7x |
-| `fallocate_extend` | 210.48 us | 8.58 us | 24.5x |
-| `fallocate_keep_size` | 212.57 us | 8.43 us | 25.2x |
-| `fallocate_punch_hole` | 2.43 ms | 6.15 us | 395.0x |
-| `fallocate_zero_range` | 2.18 ms | 11.72 us | 186.0x |
-| `lseek_data` | 134.07 us | 1.09 us | 123.5x |
-| `lseek_hole` | 135.92 us | 970.25 ns | 140.1x |
+| `lookup` | 968.22 ns | 901.04 ns | 1.1x |
+| `getattr` | 740.21 ns | 737.59 ns | 1.0x |
+| `setattr` | 53.543 us | 2.2561 us | 23.7x |
+| `access` | 32.717 us | 734.32 ns | 44.6x |
+| `statfs` | 31.113 us | 909.04 ns | 34.2x |
+| `mknod` | 89.561 us | 5.2850 us | 16.9x |
+| `mkdir` | 91.145 us | 14.585 us | 6.2x |
+| `create` | 92.955 us | 6.5674 us | 14.2x |
+| `unlink` | 71.810 us | 8.6320 us | 8.3x |
+| `rmdir` | 74.567 us | 10.957 us | 6.8x |
+| `rename` | 102.17 us | 6.4034 us | 16.0x |
+| `rename_noreplace` | 101.99 us | 6.5282 us | 15.6x |
+| `link` | 99.578 us | 3.5533 us | 28.0x |
+| `symlink` | 101.71 us | 5.7821 us | 17.6x |
+| `readlink` | 37.300 us | 916.93 ns | 40.7x |
+| `open` | 34.745 us | 1.3152 us | 26.4x |
+| `read` | 490.74 ns | 537.27 ns | 0.9x |
+| `write` | 154.89 us | 747.69 ns | 207.2x |
+| `truncate` | 157.99 us | 3.1089 us | 50.8x |
+| `flush` | 27.127 us | 334.74 ns | 81.0x |
+| `release` | 24.526 us | 585.73 ns | 41.9x |
+| `fsync` | 60.436 us | 26.270 us | 2.3x |
+| `copy_file_range` | 147.53 us | 1.9812 us | 74.5x |
+| `opendir` | 53.816 us | 1.7222 us | 31.2x |
+| `readdir` | 123.48 us | 4.2413 us | 29.1x |
+| `readdirplus` | 258.98 us | 20.143 us | 12.9x |
+| `fsyncdir` | 63.865 us | 408.28 ns | 156.4x |
+| `releasedir` | 5.2092 us | 569.03 ns | 9.2x |
+| `setxattr` | 178.65 us | 2.3739 us | 75.3x |
+| `getxattr` | 83.247 us | 1.2457 us | 66.8x |
+| `listxattr` | 56.712 us | 1.1131 us | 50.9x |
+| `removexattr` | 176.73 us | 2.2281 us | 79.3x |
+| `getlk` | 56.062 us | 404.68 ns | 138.5x |
+| `setlk` | 56.958 us | 528.92 ns | 107.7x |
+| `bmap` | 409.19 ns | 632.62 ns | 0.6x |
+| `ioctl` | 57.325 us | 315.37 ns | 181.8x |
+| `poll` | 56.580 us | 402.35 ns | 140.6x |
+| `fallocate_extend` | 124.80 us | 6.6773 us | 18.7x |
+| `fallocate_keep_size` | 125.31 us | 6.3765 us | 19.7x |
+| `fallocate_punch_hole` | 258.66 us | 4.0346 us | 64.1x |
+| `fallocate_zero_range` | 260.33 us | 8.4055 us | 31.0x |
+| `lseek_data` | 88.582 us | 535.84 ns | 165.3x |
+| `lseek_hole` | 88.763 us | 448.63 ns | 197.9x |
+
+A later write-only profiling run on the same droplet size measured
+`write/eventfs` at 139.42 us and `write/host` at 1.3250 us. Direct storage
+instrumentation in that run measured these mean write-path costs:
+
+| Write path bucket | Mean |
+| --- | ---: |
+| Prepare inode and namespace | 18.496 us |
+| Load content extents | 22.866 us |
+| Compute overwrite chunks | 2.187 us |
+| Put content and manifests | 7.657 us |
+| Build event | 798 ns |
+| Commit event and indexes | 53.251 us |
+| RocksDB batch and WAL write | 26.736 us |

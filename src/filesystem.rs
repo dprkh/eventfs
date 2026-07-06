@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::num::NonZeroU64;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::SystemTime;
 
@@ -21,6 +23,8 @@ pub struct Filesystem {
     storage: Arc<Storage>,
     mount_state: Arc<Mutex<MountState>>,
     lock_table: Arc<(Mutex<LockTable>, Condvar)>,
+    handle_table: Arc<Mutex<HandleTable>>,
+    next_handle: Arc<AtomicU64>,
 }
 
 impl Filesystem {
@@ -1418,15 +1422,14 @@ impl fuser::Filesystem for Filesystem {
         config: &mut fuser::KernelConfig,
     ) -> std::io::Result<()> {
         trace_fuse_operation("init");
-        let mut capabilities =
+        let capabilities =
             fuser::InitFlags::FUSE_POSIX_LOCKS | fuser::InitFlags::FUSE_DO_READDIRPLUS;
         #[cfg(target_os = "macos")]
-        {
-            capabilities |= fuser::InitFlags::FUSE_ALLOCATE
-                | fuser::InitFlags::FUSE_EXCHANGE_DATA
-                | fuser::InitFlags::FUSE_VOL_RENAME
-                | fuser::InitFlags::FUSE_XTIMES;
-        }
+        let capabilities = capabilities
+            | fuser::InitFlags::FUSE_ALLOCATE
+            | fuser::InitFlags::FUSE_EXCHANGE_DATA
+            | fuser::InitFlags::FUSE_VOL_RENAME
+            | fuser::InitFlags::FUSE_XTIMES;
         let _ = config.add_capabilities(capabilities);
         Ok(())
     }
@@ -1498,10 +1501,17 @@ impl fuser::Filesystem for Filesystem {
             bkuptime,
             flags: flags.map(|flags| flags.bits()),
         };
-        match self
+        let result = self
             .storage
             .setattr(ino.into(), attributes, _req.uid(), _req.gid())
-        {
+            .and_then(|entry| {
+                self.synchronize_if_needed(
+                    self.mount_synchronization_required()
+                        || _fh.is_some_and(|handle| self.handle_synchronization_required(handle)),
+                )?;
+                Ok(entry)
+            });
+        match result {
             Ok(entry) => reply.attr(&entry.ttl, &entry.attr),
             Err(error) => reply.error(self.fuse_error("setattr", error)),
         }
@@ -1526,17 +1536,24 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyEntry,
     ) {
         trace_fuse_operation("mknod");
-        match self.storage.create_node(
-            parent.into(),
-            name,
-            mode,
-            umask,
-            storage::FuseCredentials {
-                uid: _req.uid(),
-                gid: _req.gid(),
-            },
-            storage::CreateNodeKind::Special { mode, rdev },
-        ) {
+        let result = self
+            .storage
+            .create_node(
+                parent.into(),
+                name,
+                mode,
+                umask,
+                storage::FuseCredentials {
+                    uid: _req.uid(),
+                    gid: _req.gid(),
+                },
+                storage::CreateNodeKind::Special { mode, rdev },
+            )
+            .and_then(|entry| {
+                self.synchronize_if_needed(self.directory_synchronization_required())?;
+                Ok(entry)
+            });
+        match result {
             Ok(entry) => reply.entry(&entry.ttl, &entry.attr, fuser::Generation(0)),
             Err(error) => reply.error(self.fuse_error("mknod", error)),
         }
@@ -1552,17 +1569,24 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyEntry,
     ) {
         trace_fuse_operation("mkdir");
-        match self.storage.create_node(
-            parent.into(),
-            name,
-            mode,
-            umask,
-            storage::FuseCredentials {
-                uid: _req.uid(),
-                gid: _req.gid(),
-            },
-            storage::CreateNodeKind::Directory,
-        ) {
+        let result = self
+            .storage
+            .create_node(
+                parent.into(),
+                name,
+                mode,
+                umask,
+                storage::FuseCredentials {
+                    uid: _req.uid(),
+                    gid: _req.gid(),
+                },
+                storage::CreateNodeKind::Directory,
+            )
+            .and_then(|entry| {
+                self.synchronize_if_needed(self.directory_synchronization_required())?;
+                Ok(entry)
+            });
+        match result {
             Ok(entry) => reply.entry(&entry.ttl, &entry.attr, fuser::Generation(0)),
             Err(error) => reply.error(self.fuse_error("mkdir", error)),
         }
@@ -1576,10 +1600,11 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyEmpty,
     ) {
         trace_fuse_operation("unlink");
-        match self
+        let result = self
             .storage
             .unlink(parent.into(), name, _req.uid(), _req.gid())
-        {
+            .and_then(|()| self.synchronize_if_needed(self.directory_synchronization_required()));
+        match result {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(self.fuse_error("unlink", error)),
         }
@@ -1593,10 +1618,11 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyEmpty,
     ) {
         trace_fuse_operation("rmdir");
-        match self
+        let result = self
             .storage
             .rmdir(parent.into(), name, _req.uid(), _req.gid())
-        {
+            .and_then(|()| self.synchronize_if_needed(self.directory_synchronization_required()));
+        match result {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(self.fuse_error("rmdir", error)),
         }
@@ -1611,10 +1637,14 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyEntry,
     ) {
         trace_fuse_operation("symlink");
-        match self
+        let result = self
             .storage
             .create_symlink(parent.into(), link_name, target, _req.uid(), _req.gid())
-        {
+            .and_then(|entry| {
+                self.synchronize_if_needed(self.directory_synchronization_required())?;
+                Ok(entry)
+            });
+        match result {
             Ok(entry) => reply.entry(&entry.ttl, &entry.attr, fuser::Generation(0)),
             Err(error) => reply.error(self.fuse_error("symlink", error)),
         }
@@ -1631,19 +1661,22 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyEmpty,
     ) {
         trace_fuse_operation("rename");
-        match rename_mode(flags).and_then(|no_replace| {
-            self.storage.rename(
-                parent.into(),
-                name,
-                newparent.into(),
-                newname,
-                no_replace,
-                storage::FuseCredentials {
-                    uid: _req.uid(),
-                    gid: _req.gid(),
-                },
-            )
-        }) {
+        let result = rename_mode(flags)
+            .and_then(|no_replace| {
+                self.storage.rename(
+                    parent.into(),
+                    name,
+                    newparent.into(),
+                    newname,
+                    no_replace,
+                    storage::FuseCredentials {
+                        uid: _req.uid(),
+                        gid: _req.gid(),
+                    },
+                )
+            })
+            .and_then(|()| self.synchronize_if_needed(self.directory_synchronization_required()));
+        match result {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(self.fuse_error("rename", error)),
         }
@@ -1658,13 +1691,20 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyEntry,
     ) {
         trace_fuse_operation("link");
-        match self.storage.hard_link(
-            ino.into(),
-            newparent.into(),
-            newname,
-            _req.uid(),
-            _req.gid(),
-        ) {
+        let result = self
+            .storage
+            .hard_link(
+                ino.into(),
+                newparent.into(),
+                newname,
+                _req.uid(),
+                _req.gid(),
+            )
+            .and_then(|entry| {
+                self.synchronize_if_needed(self.directory_synchronization_required())?;
+                Ok(entry)
+            });
+        match result {
             Ok(entry) => reply.entry(&entry.ttl, &entry.attr, fuser::Generation(0)),
             Err(error) => reply.error(self.fuse_error("link", error)),
         }
@@ -1682,7 +1722,10 @@ impl fuser::Filesystem for Filesystem {
             .storage
             .open_file(ino.into(), _req.uid(), _req.gid(), _flags)
         {
-            Ok(()) => reply.opened(fuser::FileHandle(0), fuser::FopenFlags::empty()),
+            Ok(()) => match self.record_open_handle(_flags) {
+                Ok(handle) => reply.opened(handle, fuser::FopenFlags::empty()),
+                Err(error) => reply.error(self.fuse_error("open", error)),
+            },
             Err(error) => reply.error(self.fuse_error("open", error)),
         }
     }
@@ -1712,19 +1755,23 @@ impl fuser::Filesystem for Filesystem {
         &self,
         _req: &fuser::Request,
         ino: fuser::INodeNo,
-        _fh: fuser::FileHandle,
+        fh: fuser::FileHandle,
         offset: u64,
         data: &[u8],
         _write_flags: fuser::WriteFlags,
-        _flags: fuser::OpenFlags,
+        flags: fuser::OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
         trace_fuse_operation("write");
-        match self
+        let result = self
             .storage
             .write_file(ino.into(), offset, data, _req.uid(), _req.gid())
-        {
+            .and_then(|write| {
+                self.synchronize_if_needed(self.write_synchronization_required(fh, flags))?;
+                Ok(write)
+            });
+        match result {
             Ok(write) => reply.written(write.written),
             Err(error) => reply.error(self.fuse_error("write", error)),
         }
@@ -1747,7 +1794,7 @@ impl fuser::Filesystem for Filesystem {
         &self,
         _req: &fuser::Request,
         _ino: fuser::INodeNo,
-        _fh: fuser::FileHandle,
+        fh: fuser::FileHandle,
         _flags: fuser::OpenFlags,
         lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
@@ -1757,6 +1804,7 @@ impl fuser::Filesystem for Filesystem {
         if let Some(lock_owner) = lock_owner {
             self.clear_file_locks_for_owner(lock_owner);
         }
+        self.forget_open_handle(fh);
         reply.ok();
     }
 
@@ -1769,7 +1817,10 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyEmpty,
     ) {
         trace_fuse_operation("fsync");
-        reply.ok();
+        match self.storage.synchronize() {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(self.fuse_error("fsync", error)),
+        }
     }
 
     fn opendir(
@@ -1781,7 +1832,10 @@ impl fuser::Filesystem for Filesystem {
     ) {
         trace_fuse_operation("opendir");
         match self.storage.opendir(ino.into()) {
-            Ok(()) => reply.opened(fuser::FileHandle(0), fuser::FopenFlags::empty()),
+            Ok(()) => match self.record_open_handle(_flags) {
+                Ok(handle) => reply.opened(handle, fuser::FopenFlags::empty()),
+                Err(error) => reply.error(self.fuse_error("opendir", error)),
+            },
             Err(error) => reply.error(self.fuse_error("opendir", error)),
         }
     }
@@ -1815,11 +1869,12 @@ impl fuser::Filesystem for Filesystem {
         &self,
         _req: &fuser::Request,
         _ino: fuser::INodeNo,
-        _fh: fuser::FileHandle,
+        fh: fuser::FileHandle,
         _flags: fuser::OpenFlags,
         reply: fuser::ReplyEmpty,
     ) {
         trace_fuse_operation("releasedir");
+        self.forget_open_handle(fh);
         reply.ok();
     }
 
@@ -1832,7 +1887,10 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyEmpty,
     ) {
         trace_fuse_operation("fsyncdir");
-        reply.ok();
+        match self.storage.synchronize() {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(self.fuse_error("fsyncdir", error)),
+        }
     }
 
     fn statfs(&self, _req: &fuser::Request, _ino: fuser::INodeNo, reply: fuser::ReplyStatfs) {
@@ -1866,6 +1924,7 @@ impl fuser::Filesystem for Filesystem {
         let result = if position == 0 {
             self.storage
                 .setxattr(ino.into(), name, value, flags, req.uid(), req.gid())
+                .and_then(|()| self.synchronize_if_needed(self.mount_synchronization_required()))
         } else {
             Err(storage::FuseError::Errno(fuser::Errno::EINVAL))
         };
@@ -1912,7 +1971,11 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyEmpty,
     ) {
         trace_fuse_operation("removexattr");
-        match self.storage.removexattr(ino.into(), name, req.uid()) {
+        let result = self
+            .storage
+            .removexattr(ino.into(), name, req.uid())
+            .and_then(|()| self.synchronize_if_needed(self.mount_synchronization_required()));
+        match result {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(self.fuse_error("removexattr", error)),
         }
@@ -1946,26 +2009,34 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyCreate,
     ) {
         trace_fuse_operation("create");
-        match self.storage.create_node(
-            parent.into(),
-            name,
-            mode,
-            umask,
-            storage::FuseCredentials {
-                uid: _req.uid(),
-                gid: _req.gid(),
-            },
-            storage::CreateNodeKind::RegularFile,
-        ) {
-            Ok(entry) => {
-                reply.created(
+        let result = self
+            .storage
+            .create_node(
+                parent.into(),
+                name,
+                mode,
+                umask,
+                storage::FuseCredentials {
+                    uid: _req.uid(),
+                    gid: _req.gid(),
+                },
+                storage::CreateNodeKind::RegularFile,
+            )
+            .and_then(|entry| {
+                self.synchronize_if_needed(self.directory_synchronization_required())?;
+                Ok(entry)
+            });
+        match result {
+            Ok(entry) => match self.record_open_handle(fuser::OpenFlags(_flags)) {
+                Ok(handle) => reply.created(
                     &entry.ttl,
                     &entry.attr,
                     fuser::Generation(0),
-                    fuser::FileHandle(0),
+                    handle,
                     fuser::FopenFlags::empty(),
-                );
-            }
+                ),
+                Err(error) => reply.error(self.fuse_error("create", error)),
+            },
             Err(error) => reply.error(self.fuse_error("create", error)),
         }
     }
@@ -2112,10 +2183,16 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyEmpty,
     ) {
         trace_fuse_operation("fallocate");
-        match self
+        let result = self
             .storage
             .fallocate(ino.into(), offset, length, mode, req.uid(), req.gid())
-        {
+            .and_then(|()| {
+                self.synchronize_if_needed(
+                    self.mount_synchronization_required()
+                        || self.handle_synchronization_required(_fh),
+                )
+            });
+        match result {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(self.fuse_error("fallocate", error)),
         }
@@ -2152,15 +2229,23 @@ impl fuser::Filesystem for Filesystem {
     ) {
         trace_fuse_operation("copy_file_range");
         let result = if flags.is_empty() {
-            self.storage.copy_file_range(
-                ino_in.into(),
-                offset_in,
-                ino_out.into(),
-                offset_out,
-                len,
-                req.uid(),
-                req.gid(),
-            )
+            self.storage
+                .copy_file_range(
+                    ino_in.into(),
+                    offset_in,
+                    ino_out.into(),
+                    offset_out,
+                    len,
+                    req.uid(),
+                    req.gid(),
+                )
+                .and_then(|write| {
+                    self.synchronize_if_needed(
+                        self.mount_synchronization_required()
+                            || self.handle_synchronization_required(_fh_out),
+                    )?;
+                    Ok(write)
+                })
         } else {
             Err(storage::FuseError::Errno(fuser::Errno::EINVAL))
         };
@@ -2173,7 +2258,11 @@ impl fuser::Filesystem for Filesystem {
     #[cfg(target_os = "macos")]
     fn setvolname(&self, _req: &fuser::Request, name: &OsStr, reply: fuser::ReplyEmpty) {
         trace_fuse_operation("setvolname");
-        match self.storage.set_volume_name(name) {
+        let result = self
+            .storage
+            .set_volume_name(name)
+            .and_then(|()| self.synchronize_if_needed(self.mount_synchronization_required()));
+        match result {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(self.fuse_error("setvolname", error)),
         }
@@ -2192,14 +2281,16 @@ impl fuser::Filesystem for Filesystem {
     ) {
         trace_fuse_operation("exchange");
         let result = if options == 0 {
-            self.storage.exchange(
-                parent.into(),
-                name,
-                newparent.into(),
-                newname,
-                req.uid(),
-                req.gid(),
-            )
+            self.storage
+                .exchange(
+                    parent.into(),
+                    name,
+                    newparent.into(),
+                    newname,
+                    req.uid(),
+                    req.gid(),
+                )
+                .and_then(|()| self.synchronize_if_needed(self.mount_synchronization_required()))
         } else {
             Err(storage::FuseError::Errno(fuser::Errno::EINVAL))
         };
@@ -2270,6 +2361,10 @@ fn lock_type(typ: i32) -> Result<i32, storage::FuseError> {
     }
 }
 
+fn open_flags_synchronous(flags: fuser::OpenFlags) -> bool {
+    flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0
+}
+
 impl Filesystem {
     pub(crate) fn configuration(&self) -> &FilesystemConfiguration {
         &self.configuration
@@ -2287,6 +2382,84 @@ impl Filesystem {
         let errno = error.errno();
         self.notify_fuse_error(operation, errno, false);
         errno
+    }
+
+    fn record_open_handle(
+        &self,
+        flags: fuser::OpenFlags,
+    ) -> Result<fuser::FileHandle, storage::FuseError> {
+        let handle = self.allocate_handle()?;
+        let mut table = self
+            .handle_table
+            .lock()
+            .map_err(|_| storage::FuseError::Errno(fuser::Errno::EIO))?;
+        table.handles.insert(handle.0, OpenHandle { flags });
+        Ok(handle)
+    }
+
+    fn forget_open_handle(&self, handle: fuser::FileHandle) {
+        if let Ok(mut table) = self.handle_table.lock() {
+            table.handles.remove(&handle.0);
+        }
+    }
+
+    fn allocate_handle(&self) -> Result<fuser::FileHandle, storage::FuseError> {
+        self.next_handle
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                value.checked_add(1)
+            })
+            .map(fuser::FileHandle)
+            .map_err(|_| storage::FuseError::Errno(fuser::Errno::EIO))
+    }
+
+    fn write_synchronization_required(
+        &self,
+        handle: fuser::FileHandle,
+        flags: fuser::OpenFlags,
+    ) -> bool {
+        self.mount_synchronization_required()
+            || open_flags_synchronous(flags)
+            || self.handle_synchronization_required(handle)
+    }
+
+    fn handle_synchronization_required(&self, handle: fuser::FileHandle) -> bool {
+        self.handle(handle)
+            .is_some_and(|open_handle| open_flags_synchronous(open_handle.flags))
+    }
+
+    fn handle(&self, handle: fuser::FileHandle) -> Option<OpenHandle> {
+        self.handle_table
+            .lock()
+            .ok()
+            .and_then(|table| table.handles.get(&handle.0).copied())
+    }
+
+    fn directory_synchronization_required(&self) -> bool {
+        self.mount_synchronization_required()
+            || self
+                .configuration
+                .mount_options()
+                .iter()
+                .any(|option| matches!(option, MountOption::DirSync))
+    }
+
+    fn mount_synchronization_required(&self) -> bool {
+        self.configuration
+            .mount_options()
+            .iter()
+            .fold(false, |synchronous, option| match option {
+                MountOption::Sync => true,
+                MountOption::Async => false,
+                _ => synchronous,
+            })
+    }
+
+    fn synchronize_if_needed(&self, required: bool) -> Result<(), storage::FuseError> {
+        if required {
+            self.storage.synchronize()
+        } else {
+            Ok(())
+        }
     }
 
     fn set_file_lock(
@@ -2385,6 +2558,16 @@ struct MountState {
 }
 
 #[derive(Debug, Default)]
+struct HandleTable {
+    handles: BTreeMap<u64, OpenHandle>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OpenHandle {
+    flags: fuser::OpenFlags,
+}
+
+#[derive(Debug, Default)]
 struct LockTable {
     locks: Vec<FileLock>,
 }
@@ -2476,6 +2659,8 @@ fn open_filesystem(configuration: FilesystemConfiguration) -> Result<Filesystem,
         storage,
         mount_state: Arc::new(Mutex::new(MountState::default())),
         lock_table: Arc::new((Mutex::new(LockTable::default()), Condvar::new())),
+        handle_table: Arc::new(Mutex::new(HandleTable::default())),
+        next_handle: Arc::new(AtomicU64::new(1)),
     })
 }
 
@@ -3105,6 +3290,54 @@ mod tests {
                 .code(),
             fuser::Errno::EINVAL.code()
         );
+    }
+
+    #[test]
+    fn synchronization_policy_tracks_mount_options_and_open_flags() {
+        assert!(!open_flags_synchronous(fuser::OpenFlags(libc::O_WRONLY)));
+        assert!(open_flags_synchronous(fuser::OpenFlags(
+            libc::O_WRONLY | libc::O_DSYNC
+        )));
+        assert!(open_flags_synchronous(fuser::OpenFlags(
+            libc::O_WRONLY | libc::O_SYNC
+        )));
+
+        let default = TestFilesystem::new("sync-policy-default");
+        assert!(!default.filesystem.mount_synchronization_required());
+        assert!(!default.filesystem.directory_synchronization_required());
+
+        let synchronous =
+            TestFilesystem::new_with_configuration("sync-policy-sync", |configuration| {
+                configuration.with_mount_options([MountOption::Sync])
+            });
+        assert!(synchronous.filesystem.mount_synchronization_required());
+        assert!(synchronous.filesystem.directory_synchronization_required());
+
+        let async_override =
+            TestFilesystem::new_with_configuration("sync-policy-async-override", |configuration| {
+                configuration.with_mount_options([MountOption::Sync, MountOption::Async])
+            });
+        assert!(!async_override.filesystem.mount_synchronization_required());
+        assert!(
+            !async_override
+                .filesystem
+                .directory_synchronization_required()
+        );
+
+        let dirsync =
+            TestFilesystem::new_with_configuration("sync-policy-dirsync", |configuration| {
+                configuration.with_mount_options([MountOption::DirSync])
+            });
+        assert!(!dirsync.filesystem.mount_synchronization_required());
+        assert!(dirsync.filesystem.directory_synchronization_required());
+
+        let handle = default
+            .filesystem
+            .record_open_handle(fuser::OpenFlags(libc::O_RDWR | libc::O_SYNC))
+            .expect("open handle is recorded");
+        assert!(default.filesystem.handle_synchronization_required(handle));
+        default.filesystem.forget_open_handle(handle);
+        assert!(!default.filesystem.handle_synchronization_required(handle));
     }
 
     #[test]

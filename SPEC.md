@@ -409,7 +409,10 @@ impl Filesystem {
 - `removexattr` MUST append an extended-attribute-removed event on success.
 - `readdirplus` MUST return the same entries as `readdir` with stable attributes from one storage snapshot.
 - `getlk` and `setlk` MUST implement process-local advisory byte-range locks, including blocking waits when requested, and MUST NOT append events.
-- `flush` and `release` MUST clear byte-range locks held by the released lock owner.
+- `flush` and `release` MUST clear byte-range locks held by the released lock owner and MUST NOT force storage synchronization.
+- `fsync` and `fsyncdir` MUST synchronize all previously committed mounted filesystem mutations to persistent storage before returning success.
+- `fsync` and `fsyncdir` MAY synchronize committed mutations outside the requested inode or directory.
+- File writes opened with synchronized I/O flags and mounted operations covered by `MountOption::Sync` or `MountOption::DirSync` MUST synchronize affected committed mutations before returning success.
 - `bmap` MUST return the requested logical block index after inode validation and MUST NOT append events.
 - `ioctl` MUST expose no eventfs-specific commands, MUST return `ENOTTY` for every command after inode validation, and MUST NOT append events.
 - `poll` MUST report regular files and directories as immediately readable and writable according to requested events and access checks, and MUST NOT append events.
@@ -424,17 +427,19 @@ impl Filesystem {
 
 ## Event Semantics
 
-- Every mutating supported FUSE operation that changes logical filesystem state MUST create exactly one durable event.
+- Every mutating supported FUSE operation that changes logical filesystem state MUST create exactly one committed event before returning success.
 - Supported FUSE operations that do not change logical filesystem state MUST NOT append events.
 - Events MUST be assigned strictly increasing `u64` event sequences.
 - Event sequence assignment, event append, branch head update, branch root update, branch event index updates, per-file event index updates, namespace root update, content manifest root updates, event payload manifest updates, file snapshot manifest updates, and filesystem metadata updates created for the event MUST commit in one RocksDB write batch.
+- Committed events MUST be immediately visible through mounted reads, event listing, branch state, file snapshots, and event payload range reads in the same eventfs process.
+- Committed mounted filesystem mutations MUST NOT be required to survive system crash or reboot until a successful filesystem synchronization operation covers them.
 - Committed event keys MUST NOT be overwritten or deleted.
 - Every event MUST store schema version, sequence, kind, UTC creation time, affected file identifier when applicable, secondary affected file identifier when applicable, path when applicable, secondary path when applicable, and byte range when applicable.
 - Branch events MUST store branch identifier, branch position, and first-parent event sequence.
-- File write events MUST store old file size, new file size, overwritten byte length, and written byte length in the durable event record.
-- File write events MUST store overwritten bytes and written bytes as durable event payload manifests outside event metadata.
-- File truncate events MUST store old file size, new file size, and removed byte length in the durable event record.
-- File truncate events MUST store removed bytes for shrink operations as durable event payload manifests outside event metadata.
+- File write events MUST store old file size, new file size, overwritten byte length, and written byte length in the event record.
+- File write events MUST store overwritten bytes and written bytes as event payload manifests outside event metadata.
+- File truncate events MUST store old file size, new file size, and removed byte length in the event record.
+- File truncate events MUST store removed bytes for shrink operations as event payload manifests outside event metadata.
 - Zero-filled file extension MUST be represented by old and new file sizes, not repeated zero bytes.
 - `EventKind` MUST include filesystem initialization, node creation, directory creation, file creation, file write, file truncate, metadata change, node unlink, directory removal, node rename, hard link creation, symbolic link creation, extended attribute set, extended attribute removal, file range zeroing, file contents exchange, and volume rename.
 - Extended attribute set and removal, file range zeroing, file contents exchange, volume rename, file-range copy destination writes, and size-growing allocation MUST append events when they change logical filesystem state.
@@ -523,7 +528,9 @@ Storage requirements:
 - Missing column families required by the stored schema version MUST be rejected as corrupt storage.
 - Missing column families introduced after the stored compatible schema version MUST be created during migration.
 - Reads required by FUSE MUST use materialized current filesystem state, not event-log replay.
-- Mutating filesystem operations MUST use synchronous RocksDB write batches.
+- Mounted mutating filesystem operations MUST keep RocksDB write-ahead logging enabled.
+- Mounted mutating filesystem operations MUST use non-synchronous RocksDB write batches unless synchronized I/O semantics require synchronization before success.
+- Filesystem synchronization operations MUST synchronize the RocksDB write-ahead log to persistent storage.
 
 ## Local Backup And Import
 
@@ -630,6 +637,7 @@ Implementations MUST include automated tests for:
 - Successful FUSE operations do not invoke configured FUSE error callbacks.
 - Mounted FUSE operation tests cover success cases, failure cases, edge cases, event append behavior for mutating operations, and no-event behavior for read-only and unsupported operations.
 - Longer mounted FUSE stress tests cover repeated supported operations, combinations of supported operations, and edge cases.
-- Crash and fault injection around write batches, backup creation, backup import replacement, and mount/unmount state transitions preserves durable consistency.
+- Crash and fault injection around write batches, filesystem synchronization, backup creation, backup import replacement, and mount/unmount state transitions preserves committed state consistency.
+- Synced mounted mutations MUST recover after simulated system crash, and unsynced mounted mutations MAY be absent after simulated system crash.
 - Concurrency and load tests cover branch switching, branch deletion, mounted writes, and event, branch, and file listing.
 - Filesystem statistics report backing block capacity, eventfs inode capacity, and do not append events.
