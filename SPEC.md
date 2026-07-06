@@ -5,6 +5,7 @@
 - eventfs MUST provide a Rust library crate named `eventfs`.
 - eventfs MUST implement an event-sourced filesystem mounted through FUSE and persisted in RocksDB.
 - eventfs MUST support local incremental backup creation, local backup import, paginated event listing, branch-aware per-file event listing, persisted file snapshots, branch switching, and the mounted FUSE operations defined in this specification.
+- eventfs MUST include a Linux-only Criterion benchmark comparing supported mounted FUSE operation speed against the current host's normal filesystem.
 - eventfs MUST NOT expose built-in file diff rendering APIs.
 - eventfs MAY include `examples/hello_world.rs` as a non-contract example that mounts the filesystem, writes and reads one file, and lists events.
 - eventfs MAY include `examples/file_diff.rs` as a non-contract example that computes a diff outside the library from public snapshot and payload range APIs.
@@ -426,14 +427,14 @@ impl Filesystem {
 - Every mutating supported FUSE operation that changes logical filesystem state MUST create exactly one durable event.
 - Supported FUSE operations that do not change logical filesystem state MUST NOT append events.
 - Events MUST be assigned strictly increasing `u64` event sequences.
-- Event sequence assignment, event append, branch head update, branch event index updates, per-file event index updates, current extent updates, event payload extent updates, file snapshot extent updates, extended attribute updates, and filesystem metadata updates created for the event MUST commit in one RocksDB write batch.
+- Event sequence assignment, event append, branch head update, branch root update, branch event index updates, per-file event index updates, namespace root update, content manifest root updates, event payload manifest updates, file snapshot manifest updates, and filesystem metadata updates created for the event MUST commit in one RocksDB write batch.
 - Committed event keys MUST NOT be overwritten or deleted.
 - Every event MUST store schema version, sequence, kind, UTC creation time, affected file identifier when applicable, secondary affected file identifier when applicable, path when applicable, secondary path when applicable, and byte range when applicable.
 - Branch events MUST store branch identifier, branch position, and first-parent event sequence.
 - File write events MUST store old file size, new file size, overwritten byte length, and written byte length in the durable event record.
-- File write events MUST store overwritten bytes and written bytes as durable event payload extents outside event metadata.
+- File write events MUST store overwritten bytes and written bytes as durable event payload manifests outside event metadata.
 - File truncate events MUST store old file size, new file size, and removed byte length in the durable event record.
-- File truncate events MUST store removed bytes for shrink operations as durable event payload extents outside event metadata.
+- File truncate events MUST store removed bytes for shrink operations as durable event payload manifests outside event metadata.
 - Zero-filled file extension MUST be represented by old and new file sizes, not repeated zero bytes.
 - `EventKind` MUST include filesystem initialization, node creation, directory creation, file creation, file write, file truncate, metadata change, node unlink, directory removal, node rename, hard link creation, symbolic link creation, extended attribute set, extended attribute removal, file range zeroing, file contents exchange, and volume rename.
 - Extended attribute set and removal, file range zeroing, file contents exchange, volume rename, file-range copy destination writes, and size-growing allocation MUST append events when they change logical filesystem state.
@@ -442,7 +443,8 @@ impl Filesystem {
 - `current_branch` MUST return the currently active branch.
 - `list_branches` MUST return branches ordered by branch identifier with pagination.
 - `create_branch` MUST create a uniquely named branch from an existing branch position.
-- `create_branch` MUST materialize the new branch's file contents from snapshots at the requested branch position.
+- `create_branch` MUST copy the namespace root from the requested branch position.
+- `create_branch` MUST NOT duplicate content chunks, content manifest nodes, namespace nodes, or per-file snapshot records.
 - `switch_branch` MUST change the active branch only when the filesystem is not mounted and MUST NOT append an event.
 - `delete_branch` MUST delete only the branch name/ref and MUST NOT delete committed events or content chunks.
 - `delete_branch` MUST reject the active branch and the initial branch.
@@ -457,8 +459,7 @@ impl Filesystem {
 - `read_file_snapshot_range` MUST return the requested snapshot byte range and MUST return an empty vector for bytes beyond the snapshot file size.
 - Event listing MUST scan event indexes and MUST NOT replay stored file chunks.
 - Event record debug formatting MUST NOT expose stored file payload bytes.
-- File snapshots MUST be maintained as derived extent manifests from committed file events and stored outside event metadata.
-- File snapshots MUST include branch fork snapshots for regular files present at the requested branch position.
+- File snapshots MUST be maintained as derived content manifest roots from committed file events and stored outside event metadata.
 - File snapshots MUST bound the number of file content events a caller must replay after the returned snapshot to reconstruct a file at a later event sequence.
 - The initial branch MUST be named `main`.
 
@@ -467,9 +468,6 @@ impl Filesystem {
 The RocksDB database MUST contain these column families:
 
 - `events`
-- `inodes`
-- `directory_entries`
-- `extended_attributes`
 - `filesystem_metadata`
 - `file_events`
 - `branches`
@@ -477,36 +475,44 @@ The RocksDB database MUST contain these column families:
 - `branch_events`
 - `branch_file_events`
 - `content_chunks`
-- `current_file_extents`
-- `file_snapshot_extents`
-- `event_payload_extents`
+- `content_manifest_nodes`
+- `namespace_nodes`
+- `branch_roots`
+- `file_snapshot_manifests`
+- `event_payload_manifests`
 
 Storage requirements:
 
 - `events` keys MUST be big-endian event sequences.
-- `inodes` keys MUST be ordered by branch identifier and inode number.
-- `directory_entries` keys MUST be ordered by branch identifier, parent inode number, and name.
-- `extended_attributes` keys MUST be ordered by branch identifier, inode number, and attribute name.
 - `file_events` keys MUST be ordered by file identifier and event sequence.
 - `branch_events` keys MUST be ordered by branch identifier and branch position.
 - `branch_file_events` keys MUST be ordered by branch identifier, file identifier, and branch position.
 - `content_chunks` keys MUST be cryptographic content identifiers.
-- `current_file_extents` keys MUST be ordered by branch identifier, file identifier, and logical byte offset.
-- `file_snapshot_extents` keys MUST be ordered by branch identifier, file identifier, branch position, and logical byte offset.
-- `event_payload_extents` keys MUST be ordered by event sequence, payload part, and logical byte offset.
+- `content_manifest_nodes` keys MUST be cryptographic content manifest identifiers.
+- `namespace_nodes` keys MUST be cryptographic namespace identifiers.
+- `branch_roots` keys MUST be ordered by branch identifier and branch position.
+- `file_snapshot_manifests` keys MUST be ordered by branch identifier, file identifier, and branch position.
+- `event_payload_manifests` keys MUST be ordered by event sequence and payload part.
 - `content_chunks` MUST use RocksDB integrated BlobDB.
 - Content chunks MUST be immutable whole BlobDB values.
-- File state, file snapshots, and event payloads MUST be represented by extent manifests that reference `content_chunks`.
+- Content manifest nodes MUST be immutable values that reference `content_chunks`.
+- Namespace nodes MUST be immutable values that represent inode metadata, directory entries, extended attributes, and regular file content manifest roots.
+- Current file state MUST be read from the active branch namespace root.
+- File snapshots and event payloads MUST be represented by content manifest roots.
+- Branch records MUST store the branch head namespace root.
+- `branch_roots` MUST store each committed branch position's namespace root.
 - Content chunks MUST be created with FastCDC v2020 using minimum 16 KiB, target 64 KiB, maximum 256 KiB, and seed 0.
 - Content chunk identifiers MUST be cryptographic digests of chunk bytes and MUST NOT use FastCDC rolling fingerprints.
+- Content manifest identifiers MUST be cryptographic digests of canonical content manifest bytes.
+- Namespace identifiers MUST be cryptographic digests of canonical namespace bytes.
 - eventfs MUST use RocksDB pinned reads for durable byte content whenever the API or internal operation can borrow the value.
 - eventfs MUST NOT materialize owned byte buffers for durable byte content unless mutation, FUSE output, serialization, or caller-owned copies require it.
 - `filesystem_metadata` MUST store storage schema version, next inode number, last committed event sequence, next branch identifier, active branch identifier, and volume name.
 - Stored inodes MUST include backup time and creation time.
 - `Filesystem::open` MUST create a missing database and required column families for a new database directory.
-- Storage schema version `7` MUST be the first released storage schema compatibility baseline.
+- Storage schema version `8` MUST be the first supported storage schema compatibility baseline.
 - `Filesystem::open` MUST reject existing databases missing metadata required by their stored schema version.
-- `Filesystem::open` MUST reject storage schema versions older than `7`.
+- `Filesystem::open` MUST reject storage schema versions older than `8`.
 - `Filesystem::open` MUST reject storage schema versions newer than the compiled current storage schema version before mutating storage.
 - `Filesystem::open` MUST automatically migrate compatible released storage schema versions to the compiled current storage schema version before returning.
 - Storage schema migrations MUST run in storage schema version order.
@@ -562,6 +568,18 @@ Storage requirements:
 - Backup repository creation, backup repository opening, and backup creation failures MUST map to `FilesystemError::Backup`.
 - Import target replacement and import-open failures MUST map to `FilesystemError::Import`.
 
+## Benchmarks
+
+- eventfs MUST provide a Criterion benchmark target named `fuse_operations`.
+- `fuse_operations` MUST compile only on Linux and MUST fail to compile on non-Linux targets with an explicit Linux-only error.
+- `fuse_operations` MUST mount eventfs through the public `FilesystemConfiguration`, `Filesystem::open`, and `Filesystem::spawn_mount` APIs.
+- `fuse_operations` MUST benchmark every supported Linux mounted FUSE operation with an equivalent operation on a sibling directory in the current host's normal filesystem.
+- `fuse_operations` MUST benchmark lookup, attribute read, attribute update, node creation, directory creation, file creation, file open, file read, file write, file truncate, flush, file synchronization, directory open, directory read, directory read with attributes, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, filesystem statistics, extended attributes, POSIX byte-range locks, block mapping, ioctl rejection, poll readiness, space allocation, sparse seek, and file-range copy.
+- `fuse_operations` MUST NOT benchmark fuser lifecycle or cache callbacks that have no normal-filesystem operation baseline.
+- `fuse_operations` MUST exclude macOS-only mounted operations.
+- `fuse_operations` MUST exclude per-iteration setup and cleanup from timed measurements for mutating operations.
+- `fuse_operations` MUST group eventfs and host filesystem measurements by FUSE operation name.
+
 ## Acceptance Tests
 
 Acceptance test requirements:
@@ -581,9 +599,9 @@ Implementations MUST include automated tests for:
 - Local backup creates increasing non-zero BackupEngine backup identifiers in a persistent backup directory.
 - Local import verifies a requested BackupEngine backup, replaces existing target data, and opens and migrates the imported database before success.
 - Local backup and import reject overlapping source, backup, and target directories after path normalization.
-- Opening storage schema version `7` succeeds and preserves public filesystem behavior.
+- Opening storage schema version `8` succeeds and preserves public filesystem behavior.
 - Opening every compatible released storage schema version migrates it to the current storage schema version.
-- Opening storage schema versions older than `7` fails without mutation.
+- Opening storage schema versions older than `8` fails without mutation.
 - Opening storage schema versions newer than the compiled current storage schema version fails without mutation.
 - Interrupted storage schema migrations either resume migration on reopen or leave a valid compatible released schema.
 - Opening a compatible released database with missing column families introduced after its stored schema version creates those column families during migration.
@@ -597,6 +615,7 @@ Implementations MUST include automated tests for:
 - File snapshots and file event payloads can reconstruct file bytes before and after a write or truncate event.
 - Snapshot and event payload content is read through range APIs backed by content chunk reads.
 - Content chunks are deduplicated by content identifier.
+- Branch creation copies namespace root identifiers and does not duplicate content chunks, content manifest nodes, namespace nodes, or file snapshot manifest records.
 - Cross-chunk reads, overwrites, truncates, and sparse zero-filled ranges return correct bytes.
 - Branch creation from a branch position creates an independent branch.
 - Branch switching changes the mounted filesystem's future active state only when unmounted.

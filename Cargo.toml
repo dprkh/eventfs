@@ -24,3 +24,9 @@ tracing = { version = "0.1", optional = true }
 
 [dev-dependencies]
 anyhow = "1.0"
+criterion = "0.8.2"
+linux-raw-sys = { version = "0.12.1", default-features = false, features = ["ioctl"] }
+
+[[bench]]
+name = "fuse_operations"
+harness = false

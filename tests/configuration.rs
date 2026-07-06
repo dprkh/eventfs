@@ -175,7 +175,7 @@ fn opening_storage_schema_baseline_preserves_existing_database() {
     let events_before_reopen = list_all_events(&filesystem);
 
     drop(filesystem);
-    write_configuration_schema_version(directories.database_directory_path(), 7);
+    write_configuration_schema_version(directories.database_directory_path(), 8);
 
     let reopened =
         Filesystem::open(directories.configuration()).expect("baseline schema database opens");
@@ -184,13 +184,13 @@ fn opening_storage_schema_baseline_preserves_existing_database() {
     drop(reopened);
     assert_eq!(
         read_configuration_schema_version(directories.database_directory_path()),
-        7
+        8
     );
 }
 
 #[test]
 fn opening_storage_schema_outside_compatibility_window_fails_without_mutation() {
-    for schema_version in [6, u64::MAX] {
+    for schema_version in [7, u64::MAX] {
         let directories = TestDirectories::new();
         let filesystem = open_test_filesystem(&directories);
 
@@ -215,7 +215,7 @@ fn opening_database_missing_column_family_required_by_stored_schema_returns_inte
     drop(filesystem);
     drop_configuration_column_family(
         directories.database_directory_path(),
-        CONFIGURATION_COLUMN_FAMILY_EVENT_PAYLOAD_EXTENTS,
+        CONFIGURATION_COLUMN_FAMILY_EVENT_PAYLOAD_MANIFESTS,
     );
     let error = Filesystem::open(directories.configuration())
         .expect_err("missing required stored-schema column family is rejected");
@@ -224,7 +224,7 @@ fn opening_database_missing_column_family_required_by_stored_schema_returns_inte
 }
 
 const CONFIGURATION_COLUMN_FAMILY_FILESYSTEM_METADATA: &str = "filesystem_metadata";
-const CONFIGURATION_COLUMN_FAMILY_EVENT_PAYLOAD_EXTENTS: &str = "event_payload_extents";
+const CONFIGURATION_COLUMN_FAMILY_EVENT_PAYLOAD_MANIFESTS: &str = "event_payload_manifests";
 const CONFIGURATION_METADATA_KEY_STORAGE_SCHEMA_VERSION: &[u8] = b"schema_version";
 
 fn write_configuration_schema_version(database_directory: &std::path::Path, version: u64) {

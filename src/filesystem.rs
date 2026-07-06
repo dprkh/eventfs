@@ -1244,7 +1244,7 @@ impl EventRecord {
         byte_length: Option<u64>,
     ) -> Self {
         Self {
-            schema_version: 7,
+            schema_version: 8,
             sequence,
             kind,
             created_at,

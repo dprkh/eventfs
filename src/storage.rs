@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rocksdb::{
     BlockBasedIndexType, BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DB,
-    DataBlockIndexType, Direction, IteratorMode, Options, SliceTransform, WriteBatch, WriteOptions,
+    DataBlockIndexType, Options, SliceTransform, WriteBatch, WriteOptions,
 };
 use serde::{Deserialize, Serialize};
 use time::UtcDateTime;
@@ -164,8 +164,8 @@ fn storage(database: DB, write_state: WriteState) -> Storage {
 
 type FuseResult<T> = Result<T, FuseError>;
 
-const STORAGE_SCHEMA_VERSION_BASELINE: u64 = 7;
-const STORAGE_SCHEMA_VERSION_CURRENT: u64 = 7;
+const STORAGE_SCHEMA_VERSION_BASELINE: u64 = 8;
+const STORAGE_SCHEMA_VERSION_CURRENT: u64 = 8;
 
 const EVENT_SEQUENCE_INITIAL: EventSequence = EventSequence::new(0);
 const BRANCH_IDENTIFIER_INITIAL: BranchIdentifier = BranchIdentifier::new(1);
@@ -192,9 +192,6 @@ const ROCKSDB_MAX_WRITE_BUFFER_NUMBER: i32 = 4;
 const ROCKSDB_BLOB_MIN_SIZE: u64 = 1;
 
 const COLUMN_FAMILY_EVENTS: &str = "events";
-const COLUMN_FAMILY_INODES: &str = "inodes";
-const COLUMN_FAMILY_DIRECTORY_ENTRIES: &str = "directory_entries";
-const COLUMN_FAMILY_EXTENDED_ATTRIBUTES: &str = "extended_attributes";
 const COLUMN_FAMILY_FILESYSTEM_METADATA: &str = "filesystem_metadata";
 const COLUMN_FAMILY_FILE_EVENTS: &str = "file_events";
 const COLUMN_FAMILY_BRANCHES: &str = "branches";
@@ -202,14 +199,13 @@ const COLUMN_FAMILY_BRANCH_NAMES: &str = "branch_names";
 const COLUMN_FAMILY_BRANCH_EVENTS: &str = "branch_events";
 const COLUMN_FAMILY_BRANCH_FILE_EVENTS: &str = "branch_file_events";
 const COLUMN_FAMILY_CONTENT_CHUNKS: &str = "content_chunks";
-const COLUMN_FAMILY_CURRENT_FILE_EXTENTS: &str = "current_file_extents";
-const COLUMN_FAMILY_FILE_SNAPSHOT_EXTENTS: &str = "file_snapshot_extents";
-const COLUMN_FAMILY_EVENT_PAYLOAD_EXTENTS: &str = "event_payload_extents";
+const COLUMN_FAMILY_CONTENT_MANIFEST_NODES: &str = "content_manifest_nodes";
+const COLUMN_FAMILY_NAMESPACE_NODES: &str = "namespace_nodes";
+const COLUMN_FAMILY_BRANCH_ROOTS: &str = "branch_roots";
+const COLUMN_FAMILY_FILE_SNAPSHOT_MANIFESTS: &str = "file_snapshot_manifests";
+const COLUMN_FAMILY_EVENT_PAYLOAD_MANIFESTS: &str = "event_payload_manifests";
 const COLUMN_FAMILY_REQUIRED: &[&str] = &[
     COLUMN_FAMILY_EVENTS,
-    COLUMN_FAMILY_INODES,
-    COLUMN_FAMILY_DIRECTORY_ENTRIES,
-    COLUMN_FAMILY_EXTENDED_ATTRIBUTES,
     COLUMN_FAMILY_FILESYSTEM_METADATA,
     COLUMN_FAMILY_FILE_EVENTS,
     COLUMN_FAMILY_BRANCHES,
@@ -217,9 +213,11 @@ const COLUMN_FAMILY_REQUIRED: &[&str] = &[
     COLUMN_FAMILY_BRANCH_EVENTS,
     COLUMN_FAMILY_BRANCH_FILE_EVENTS,
     COLUMN_FAMILY_CONTENT_CHUNKS,
-    COLUMN_FAMILY_CURRENT_FILE_EXTENTS,
-    COLUMN_FAMILY_FILE_SNAPSHOT_EXTENTS,
-    COLUMN_FAMILY_EVENT_PAYLOAD_EXTENTS,
+    COLUMN_FAMILY_CONTENT_MANIFEST_NODES,
+    COLUMN_FAMILY_NAMESPACE_NODES,
+    COLUMN_FAMILY_BRANCH_ROOTS,
+    COLUMN_FAMILY_FILE_SNAPSHOT_MANIFESTS,
+    COLUMN_FAMILY_EVENT_PAYLOAD_MANIFESTS,
 ];
 
 const METADATA_KEY_STORAGE_SCHEMA_VERSION: &[u8] = b"schema_version";
@@ -234,6 +232,8 @@ const EVENT_PAYLOAD_PART_OVERWRITTEN: u8 = b'o';
 const EVENT_PAYLOAD_PART_WRITTEN: u8 = b'w';
 const EVENT_PAYLOAD_PART_REMOVED: u8 = b'r';
 const CONTENT_CHUNK_HASH_BLAKE3: u8 = 1;
+const CONTENT_MANIFEST_HASH_BLAKE3: u8 = 2;
+const NAMESPACE_HASH_BLAKE3: u8 = 3;
 
 #[derive(Clone, Debug)]
 struct BackingFileSystemStatistics {
@@ -317,6 +317,7 @@ struct StoredInode {
     parent: u64,
     name: Vec<u8>,
     symlink_target: Option<Vec<u8>>,
+    content_manifest_identifier: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -332,8 +333,15 @@ struct StoredBranch {
     status: BranchStatus,
     head_sequence: u64,
     head_ordinal: u64,
+    namespace_identifier: Vec<u8>,
     fork_branch_identifier: Option<u64>,
     fork_ordinal: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+struct StoredBranchRoot {
+    sequence: u64,
+    namespace_identifier: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -396,6 +404,45 @@ struct StoredExtent {
 struct StoredSnapshotMetadata {
     file_size: u64,
     sequence: u64,
+    content_manifest_identifier: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+struct StoredEventPayloadManifest {
+    byte_length: u64,
+    content_manifest_identifier: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContentManifestIdentifier<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> ContentManifestIdentifier<'a> {
+    fn from_bytes(bytes: &'a [u8]) -> Result<Self, FilesystemError> {
+        validate_prefixed_blake3_identifier_shape(bytes, CONTENT_MANIFEST_HASH_BLAKE3)?;
+        Ok(Self { bytes })
+    }
+
+    fn as_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NamespaceIdentifier<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> NamespaceIdentifier<'a> {
+    fn from_bytes(bytes: &'a [u8]) -> Result<Self, FilesystemError> {
+        validate_prefixed_blake3_identifier_shape(bytes, NAMESPACE_HASH_BLAKE3)?;
+        Ok(Self { bytes })
+    }
+
+    fn as_bytes(self) -> &'a [u8] {
+        self.bytes
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -425,17 +472,11 @@ enum EventPayloadExtents {
     },
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 struct MaterializedBranchState {
     inodes: BTreeMap<u64, StoredInode>,
     directory_entries: BTreeMap<(u64, Vec<u8>), StoredDirectoryEntry>,
     extended_attributes: BTreeMap<(u64, Vec<u8>), Vec<u8>>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct DirectoryEntryLocation<'a> {
-    parent: u64,
-    name: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -528,6 +569,22 @@ impl MaterializedBranchState {
                 .insert((put.inode_number, put.name.clone()), put.value.clone());
         }
     }
+}
+
+fn update_parent_after_entry_removal(
+    removed_inode: &StoredInode,
+    parent_inode: &mut StoredInode,
+    timestamp: StoredTime,
+) {
+    if removed_inode.kind == StoredNodeKind::Directory {
+        parent_inode.nlink = parent_inode.nlink.saturating_sub(1);
+    }
+    touch_loaded_directory(parent_inode, timestamp);
+}
+
+fn touch_loaded_directory(inode: &mut StoredInode, timestamp: StoredTime) {
+    inode.mtime = timestamp;
+    inode.ctime = timestamp;
 }
 
 impl Storage {
@@ -658,6 +715,10 @@ impl Storage {
             self.branch_sequence_at_position(from)?
                 .ok_or(FilesystemError::Integrity)?
         };
+        let source_root = self.branch_root_at_position(from)?;
+        if source_root.sequence != fork_sequence.get() {
+            return Err(FilesystemError::Integrity);
+        }
         let branch_identifier = BranchIdentifier::new(write_state.next_branch_identifier);
         if self
             .database
@@ -677,6 +738,7 @@ impl Storage {
             status: BranchStatus::Open,
             head_sequence: fork_sequence.get(),
             head_ordinal: from.ordinal(),
+            namespace_identifier: source_root.namespace_identifier.clone(),
             fork_branch_identifier: Some(from.branch_identifier().get()),
             fork_ordinal: Some(from.ordinal()),
         };
@@ -691,7 +753,12 @@ impl Storage {
             name.as_str().as_bytes(),
             encode_u64(branch_identifier.get()),
         );
-        self.copy_branch_state_at_position(&mut batch, from, branch_identifier, fork_sequence)?;
+        self.put_branch_root(
+            &mut batch,
+            BranchPosition::new(branch_identifier, from.ordinal()),
+            fork_sequence,
+            &source_root.namespace_identifier,
+        )?;
         self.put_metadata_u64(
             &mut batch,
             METADATA_KEY_NEXT_BRANCH_IDENTIFIER,
@@ -1088,6 +1155,11 @@ impl Storage {
             parent,
             name: name_bytes.clone(),
             symlink_target,
+            content_manifest_identifier: if stored_kind == StoredNodeKind::RegularFile {
+                Some(empty_content_manifest_identifier().map_err(to_fuse_integrity)?)
+            } else {
+                None
+            },
         };
         let event = EventRecord::new(
             event_sequence,
@@ -1099,20 +1171,18 @@ impl Storage {
             None,
         );
 
-        let mut batch = WriteBatch::default();
-        self.put_inode(&mut batch, inode_number, &inode)?;
         let mut mutation = StoredMutation::default();
         mutation.put_inode(inode_number, &inode);
+        let mut batch = WriteBatch::default();
         let entry = StoredDirectoryEntry {
             inode: inode_number,
             kind: stored_kind,
         };
-        self.put_directory_entry(&mut batch, parent, &name_bytes, entry.clone())?;
         mutation.put_directory_entry(parent, &name_bytes, &entry);
         if stored_kind == StoredNodeKind::Directory {
             parent_inode.nlink = parent_inode.nlink.saturating_add(1);
         }
-        self.touch_loaded_directory(&mut batch, parent, &mut parent_inode, now)?;
+        touch_loaded_directory(&mut parent_inode, now);
         mutation.put_inode(parent, &parent_inode);
         self.commit_event(&mut batch, event_sequence, &event, mutation)?;
         self.put_metadata_u64(
@@ -1188,6 +1258,7 @@ impl Storage {
             parent,
             name: name_bytes.clone(),
             symlink_target: Some(target_bytes),
+            content_manifest_identifier: None,
         };
         let event = EventRecord::new(
             event_sequence,
@@ -1199,17 +1270,15 @@ impl Storage {
             None,
         );
 
-        let mut batch = WriteBatch::default();
-        self.put_inode(&mut batch, inode_number, &inode)?;
         let mut mutation = StoredMutation::default();
         mutation.put_inode(inode_number, &inode);
+        let mut batch = WriteBatch::default();
         let entry = StoredDirectoryEntry {
             inode: inode_number,
             kind: StoredNodeKind::Symlink,
         };
-        self.put_directory_entry(&mut batch, parent, &name_bytes, entry.clone())?;
         mutation.put_directory_entry(parent, &name_bytes, &entry);
-        self.touch_loaded_directory(&mut batch, parent, &mut parent_inode, now)?;
+        touch_loaded_directory(&mut parent_inode, now);
         mutation.put_inode(parent, &parent_inode);
         self.commit_event(&mut batch, event_sequence, &event, mutation)?;
         self.put_metadata_u64(
@@ -1295,14 +1364,15 @@ impl Storage {
             }
             let old_size = inode.size;
             let existing_extents = self
-                .current_file_extent_manifest(
+                .file_content_manifest_extents(
                     self.active_branch_identifier(),
                     FileIdentifier::new(inode_number),
                 )
                 .map_err(to_fuse_integrity)?;
             self.validate_stored_extents(&existing_extents)?;
             let final_extents = current_extents_after_truncate(&existing_extents, size)?;
-            self.replace_current_file_extents(&mut batch, inode_number, &final_extents)?;
+            let content_manifest_identifier =
+                self.put_content_manifest(&mut batch, &final_extents)?;
             if size < old_size {
                 payload_extents = EventPayloadExtents::FileTruncate {
                     removed_extents: slice_extents(&existing_extents, size, old_size, 0)
@@ -1311,6 +1381,7 @@ impl Storage {
             }
             snapshot_extents = Some(final_extents);
             inode.size = size;
+            inode.content_manifest_identifier = Some(content_manifest_identifier);
             inode.mtime = now;
             event_kind = EventKind::FileTruncated;
             offset = Some(old_size.min(size));
@@ -1322,7 +1393,6 @@ impl Storage {
             };
         }
         inode.ctime = now;
-        self.put_inode(&mut batch, inode_number, &inode)?;
         let mut mutation = StoredMutation::default();
         mutation.put_inode(inode_number, &inode);
 
@@ -1427,10 +1497,7 @@ impl Storage {
         let mut removed_destination = None;
 
         if let Some(destination) = existing_destination {
-            if destination.inode == entry.inode {
-                self.delete_directory_entry(&mut batch, parent, &name_bytes)?;
-                self.put_directory_entry(&mut batch, new_parent, &new_name_bytes, entry.clone())?;
-            } else {
+            if destination.inode != entry.inode {
                 let destination_inode = self
                     .inode(destination.inode)
                     .map_err(to_fuse_integrity)?
@@ -1451,23 +1518,12 @@ impl Storage {
                 } else {
                     new_parent_inode.as_mut().ok_or(FuseError::Integrity)?
                 };
-                self.remove_entry_in_batch(
-                    &mut batch,
-                    DirectoryEntryLocation {
-                        parent: new_parent,
-                        name: &new_name_bytes,
-                    },
-                    destination,
-                    destination_inode,
+                update_parent_after_entry_removal(
+                    &destination_inode,
                     destination_parent_inode,
                     now,
-                )?;
-                self.delete_directory_entry(&mut batch, parent, &name_bytes)?;
-                self.put_directory_entry(&mut batch, new_parent, &new_name_bytes, entry.clone())?;
+                );
             }
-        } else {
-            self.delete_directory_entry(&mut batch, parent, &name_bytes)?;
-            self.put_directory_entry(&mut batch, new_parent, &new_name_bytes, entry.clone())?;
         }
 
         if entry.kind == StoredNodeKind::Directory && parent != new_parent {
@@ -1478,10 +1534,9 @@ impl Storage {
         inode.parent = new_parent;
         inode.name = new_name_bytes.clone();
         inode.ctime = now;
-        self.put_inode(&mut batch, entry.inode, &inode)?;
-        self.touch_loaded_directory(&mut batch, parent, &mut old_parent_inode, now)?;
+        touch_loaded_directory(&mut old_parent_inode, now);
         if let Some(new_parent_inode) = &mut new_parent_inode {
-            self.touch_loaded_directory(&mut batch, new_parent, new_parent_inode, now)?;
+            touch_loaded_directory(new_parent_inode, now);
         }
 
         let event = EventRecord::new(
@@ -1558,16 +1613,14 @@ impl Storage {
             &self.database,
         )?;
         let mut batch = WriteBatch::default();
-        self.put_inode(&mut batch, inode_number, &inode)?;
         let mut mutation = StoredMutation::default();
         mutation.put_inode(inode_number, &inode);
         let entry = StoredDirectoryEntry {
             inode: inode_number,
             kind: inode.kind,
         };
-        self.put_directory_entry(&mut batch, new_parent, &name_bytes, entry.clone())?;
         mutation.put_directory_entry(new_parent, &name_bytes, &entry);
-        self.touch_loaded_directory(&mut batch, new_parent, &mut parent_inode, now)?;
+        touch_loaded_directory(&mut parent_inode, now);
         mutation.put_inode(new_parent, &parent_inode);
         let event = EventRecord::new(
             event_sequence,
@@ -1663,7 +1716,7 @@ impl Storage {
         let now = StoredTime::now();
         let old_size = inode.size;
         let existing_extents = self
-            .current_file_extent_manifest(
+            .file_content_manifest_extents(
                 self.active_branch_identifier(),
                 FileIdentifier::new(inode_number),
             )
@@ -1687,16 +1740,6 @@ impl Storage {
             &written_current_extents,
         )?;
         let mut batch = WriteBatch::default();
-        self.delete_current_file_extents(&mut batch, inode_number)?;
-        self.put_existing_extents(
-            &mut batch,
-            ExtentSet::Current {
-                branch: self.active_branch_identifier(),
-                file_identifier: FileIdentifier::new(inode_number),
-            },
-            &slice_extents(&existing_extents, 0, offset.min(old_size), 0)
-                .map_err(to_fuse_integrity)?,
-        )?;
         self.put_pending_extents(
             &mut batch,
             ExtentSet::Current {
@@ -1707,20 +1750,11 @@ impl Storage {
             &written_current_extents,
             &written_chunks,
         )?;
-        if end < old_size {
-            self.put_existing_extents(
-                &mut batch,
-                ExtentSet::Current {
-                    branch: self.active_branch_identifier(),
-                    file_identifier: FileIdentifier::new(inode_number),
-                },
-                &slice_extents(&existing_extents, end, old_size, end).map_err(to_fuse_integrity)?,
-            )?;
-        }
+        let content_manifest_identifier = self.put_content_manifest(&mut batch, &final_extents)?;
         inode.size = new_size;
+        inode.content_manifest_identifier = Some(content_manifest_identifier);
         inode.mtime = now;
         inode.ctime = now;
-        self.put_inode(&mut batch, inode_number, &inode)?;
         let mut mutation = StoredMutation::default();
         mutation.put_inode(inode_number, &inode);
 
@@ -1780,9 +1814,13 @@ impl Storage {
         F: FnMut(DirectoryEntrySnapshot) -> bool,
     {
         let snapshot = self.database.snapshot();
-        let inode = self
-            .inode_from_snapshot(&snapshot, inode_number)
-            .map_err(to_fuse_integrity)?
+        let state = self
+            .namespace_state_from_snapshot(&snapshot, self.active_branch_identifier())
+            .map_err(to_fuse_integrity)?;
+        let inode = state
+            .inodes
+            .get(&inode_number)
+            .cloned()
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
         if inode.kind != StoredNodeKind::Directory {
             return Err(FuseError::Errno(fuser::Errno::ENOTDIR));
@@ -1813,25 +1851,17 @@ impl Storage {
             return Ok(());
         }
 
-        let entries_cf = self.directory_entries().map_err(|_| FuseError::Integrity)?;
-        let branch = self.active_branch_identifier();
-        let prefix = encode_branch_parent_prefix(branch.get(), inode_number);
         let mut entry_offset = 3;
-        for item in
-            snapshot.iterator_cf(entries_cf, IteratorMode::From(&prefix, Direction::Forward))
-        {
-            let (key, value) = item.map_err(|_| FuseError::Database)?;
-            if !key.starts_with(&prefix) {
+        for ((parent, name), entry) in state.directory_entries.range((inode_number, Vec::new())..) {
+            if *parent != inode_number {
                 break;
             }
-            let name = key[16..].to_vec();
             if entry_offset > offset {
-                let entry = decode_directory_entry(&value).map_err(to_fuse_integrity)?;
                 if !emit(DirectoryEntrySnapshot {
                     inode: entry.inode,
                     offset: entry_offset + 1,
                     kind: fuser_file_type(entry.kind),
-                    name: OsString::from_vec(name),
+                    name: OsString::from_vec(name.clone()),
                 }) {
                     return Ok(());
                 }
@@ -1851,9 +1881,13 @@ impl Storage {
         F: FnMut(DirectoryEntryPlusSnapshot) -> bool,
     {
         let snapshot = self.database.snapshot();
-        let inode = self
-            .inode_from_snapshot(&snapshot, inode_number)
-            .map_err(to_fuse_integrity)?
+        let state = self
+            .namespace_state_from_snapshot(&snapshot, self.active_branch_identifier())
+            .map_err(to_fuse_integrity)?;
+        let inode = state
+            .inodes
+            .get(&inode_number)
+            .cloned()
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
         if inode.kind != StoredNodeKind::Directory {
             return Err(FuseError::Errno(fuser::Errno::ENOTDIR));
@@ -1878,9 +1912,10 @@ impl Storage {
             } else {
                 inode.parent
             };
-            let parent_inode = self
-                .inode_from_snapshot(&snapshot, parent_number)
-                .map_err(to_fuse_integrity)?
+            let parent_inode = state
+                .inodes
+                .get(&parent_number)
+                .cloned()
                 .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
             if !emit(DirectoryEntryPlusSnapshot {
                 inode: parent_number,
@@ -1895,28 +1930,21 @@ impl Storage {
             }
         }
 
-        let entries_cf = self.directory_entries().map_err(|_| FuseError::Integrity)?;
-        let branch = self.active_branch_identifier();
-        let prefix = encode_branch_parent_prefix(branch.get(), inode_number);
         let mut entry_offset = 3;
-        for item in
-            snapshot.iterator_cf(entries_cf, IteratorMode::From(&prefix, Direction::Forward))
-        {
-            let (key, value) = item.map_err(|_| FuseError::Database)?;
-            if !key.starts_with(&prefix) {
+        for ((parent, name), entry) in state.directory_entries.range((inode_number, Vec::new())..) {
+            if *parent != inode_number {
                 break;
             }
-            let name = key[16..].to_vec();
             if entry_offset > offset {
-                let entry = decode_directory_entry(&value).map_err(to_fuse_integrity)?;
-                let entry_inode = self
-                    .inode_from_snapshot(&snapshot, entry.inode)
-                    .map_err(to_fuse_integrity)?
+                let entry_inode = state
+                    .inodes
+                    .get(&entry.inode)
+                    .cloned()
                     .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
                 if !emit(DirectoryEntryPlusSnapshot {
                     inode: entry.inode,
                     offset: entry_offset + 1,
-                    name: OsString::from_vec(name),
+                    name: OsString::from_vec(name.clone()),
                     entry: EntrySnapshot {
                         ttl: FUSE_ATTRIBUTE_TTL,
                         attr: inode_attr(entry.inode, &entry_inode),
@@ -1994,8 +2022,6 @@ impl Storage {
         let now = StoredTime::now();
         inode.ctime = now;
         let mut batch = WriteBatch::default();
-        self.put_inode(&mut batch, inode_number, &inode)?;
-        self.put_extended_attribute(&mut batch, inode_number, &name_bytes, value)?;
         let mut mutation = StoredMutation::default();
         mutation.put_inode(inode_number, &inode);
         mutation.put_extended_attribute(inode_number, &name_bytes, value);
@@ -2028,22 +2054,19 @@ impl Storage {
     }
 
     pub(crate) fn listxattr(&self, inode_number: u64) -> FuseResult<ExtendedAttributeList> {
-        self.inode(inode_number)
-            .map_err(to_fuse_integrity)?
+        let state = self.active_namespace_state().map_err(to_fuse_integrity)?;
+        state
+            .inodes
+            .get(&inode_number)
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        let extended_attributes = self.extended_attributes().map_err(to_fuse_integrity)?;
-        let branch = self.active_branch_identifier();
-        let prefix = encode_branch_file_prefix(branch.get(), inode_number);
         let mut bytes = Vec::new();
-        for item in self.database.iterator_cf(
-            extended_attributes,
-            IteratorMode::From(&prefix, Direction::Forward),
-        ) {
-            let (key, _value) = item.map_err(|_| FuseError::Database)?;
-            if !key.starts_with(&prefix) {
+        for ((attribute_inode, name), _value) in state
+            .extended_attributes
+            .range((inode_number, Vec::new())..)
+        {
+            if *attribute_inode != inode_number {
                 break;
             }
-            let name = key.get(16..).ok_or(FuseError::Integrity)?;
             bytes.extend_from_slice(name);
             bytes.push(0);
         }
@@ -2071,8 +2094,6 @@ impl Storage {
         let now = StoredTime::now();
         inode.ctime = now;
         let mut batch = WriteBatch::default();
-        self.put_inode(&mut batch, inode_number, &inode)?;
-        self.delete_extended_attribute(&mut batch, inode_number, &name_bytes)?;
         let mut mutation = StoredMutation::default();
         mutation.put_inode(inode_number, &inode);
         mutation.delete_extended_attribute(inode_number, &name_bytes);
@@ -2218,7 +2239,7 @@ impl Storage {
             return Err(FuseError::Errno(fuser::Errno::ENXIO));
         }
         let extents = self
-            .current_file_extent_manifest(
+            .file_content_manifest_extents(
                 self.active_branch_identifier(),
                 FileIdentifier::new(inode_number),
             )
@@ -2376,13 +2397,13 @@ impl Storage {
             &self.database,
         )?;
         let extents = self
-            .current_file_extent_manifest(
+            .file_content_manifest_extents(
                 self.active_branch_identifier(),
                 FileIdentifier::new(entry.inode),
             )
             .map_err(to_fuse_integrity)?;
         let new_extents = self
-            .current_file_extent_manifest(
+            .file_content_manifest_extents(
                 self.active_branch_identifier(),
                 FileIdentifier::new(new_entry.inode),
             )
@@ -2394,18 +2415,18 @@ impl Storage {
         let now = StoredTime::now();
         let old_size = inode.size;
         let new_old_size = new_inode.size;
+        let mut batch = WriteBatch::default();
+        let content_manifest_identifier = self.put_content_manifest(&mut batch, &new_extents)?;
+        let new_content_manifest_identifier = self.put_content_manifest(&mut batch, &extents)?;
         inode.size = new_old_size;
+        inode.content_manifest_identifier = Some(content_manifest_identifier);
         inode.mtime = now;
         inode.ctime = now;
         new_inode.size = old_size;
+        new_inode.content_manifest_identifier = Some(new_content_manifest_identifier);
         new_inode.mtime = now;
         new_inode.ctime = now;
 
-        let mut batch = WriteBatch::default();
-        self.replace_current_file_extents(&mut batch, entry.inode, &new_extents)?;
-        self.replace_current_file_extents(&mut batch, new_entry.inode, &extents)?;
-        self.put_inode(&mut batch, entry.inode, &inode)?;
-        self.put_inode(&mut batch, new_entry.inode, &new_inode)?;
         let mut mutation = StoredMutation::default();
         mutation.put_inode(entry.inode, &inode);
         mutation.put_inode(new_entry.inode, &new_inode);
@@ -2472,7 +2493,7 @@ impl Storage {
             old_size.max(requested_end)
         };
         let existing_extents = self
-            .current_file_extent_manifest(
+            .file_content_manifest_extents(
                 self.active_branch_identifier(),
                 FileIdentifier::new(inode_number),
             )
@@ -2487,11 +2508,11 @@ impl Storage {
         let event_sequence = write_state.next_event_sequence()?;
         let now = StoredTime::now();
         let mut batch = WriteBatch::default();
-        self.replace_current_file_extents(&mut batch, inode_number, &final_extents)?;
+        let content_manifest_identifier = self.put_content_manifest(&mut batch, &final_extents)?;
         inode.size = new_size;
+        inode.content_manifest_identifier = Some(content_manifest_identifier);
         inode.mtime = now;
         inode.ctime = now;
-        self.put_inode(&mut batch, inode_number, &inode)?;
         let mut mutation = StoredMutation::default();
         mutation.put_inode(inode_number, &inode);
         let event = EventRecord::new(
@@ -2582,17 +2603,7 @@ impl Storage {
             &self.database,
         )?;
         let mut batch = WriteBatch::default();
-        self.remove_entry_in_batch(
-            &mut batch,
-            DirectoryEntryLocation {
-                parent,
-                name: &name_bytes,
-            },
-            entry.clone(),
-            inode,
-            &mut parent_inode,
-            now,
-        )?;
+        update_parent_after_entry_removal(&inode, &mut parent_inode, now);
         let event = EventRecord::new(
             event_sequence,
             if directory {
@@ -2619,36 +2630,6 @@ impl Storage {
         }
         self.commit_event(&mut batch, event_sequence, &event, mutation)?;
         self.commit_mutation(&mut write_state, batch, event_sequence, None)
-    }
-
-    fn remove_entry_in_batch(
-        &self,
-        batch: &mut WriteBatch,
-        location: DirectoryEntryLocation<'_>,
-        entry: StoredDirectoryEntry,
-        mut inode: StoredInode,
-        parent_inode: &mut StoredInode,
-        now: StoredTime,
-    ) -> FuseResult<()> {
-        self.delete_directory_entry(batch, location.parent, location.name)?;
-
-        if inode.kind == StoredNodeKind::Directory {
-            self.delete_inode(batch, entry.inode)?;
-            self.delete_current_file_extents(batch, entry.inode)?;
-            parent_inode.nlink = parent_inode.nlink.saturating_sub(1);
-            self.touch_loaded_directory(batch, location.parent, parent_inode, now)?;
-        } else {
-            inode.nlink = inode.nlink.saturating_sub(1);
-            inode.ctime = now;
-            if inode.nlink == 0 {
-                self.delete_inode(batch, entry.inode)?;
-                self.delete_current_file_extents(batch, entry.inode)?;
-            } else {
-                self.put_inode(batch, entry.inode, &inode)?;
-            }
-            self.touch_loaded_directory(batch, location.parent, parent_inode, now)?;
-        }
-        Ok(())
     }
 
     fn entry_snapshot(&self, inode_number: u64) -> FuseResult<EntrySnapshot> {
@@ -2701,17 +2682,11 @@ impl Storage {
     }
 
     fn directory_is_empty(&self, inode_number: u64) -> FuseResult<bool> {
-        let entries = self.directory_entries().map_err(|_| FuseError::Integrity)?;
-        let branch = self.active_branch_identifier();
-        let prefix = encode_branch_parent_prefix(branch.get(), inode_number);
-        let mut iterator = self
-            .database
-            .iterator_cf(entries, IteratorMode::From(&prefix, Direction::Forward));
-        match iterator.next() {
-            Some(Ok((key, _value))) if key.starts_with(&prefix) => Ok(false),
-            Some(Ok(_)) | None => Ok(true),
-            Some(Err(_)) => Err(FuseError::Database),
-        }
+        let state = self.active_namespace_state().map_err(to_fuse_integrity)?;
+        Ok(!state
+            .directory_entries
+            .keys()
+            .any(|(parent, _name)| *parent == inode_number))
     }
 
     fn directory_is_self_or_descendant(
@@ -2736,13 +2711,11 @@ impl Storage {
     }
 
     fn inode(&self, inode_number: u64) -> Result<Option<StoredInode>, FilesystemError> {
-        let inodes = self.inodes()?;
-        let branch = self.active_branch_identifier();
-        self.database
-            .get_pinned_cf(inodes, encode_branch_inode_key(branch.get(), inode_number))
-            .map_err(|_| FilesystemError::Database)?
-            .map(|value| decode_inode(&value))
-            .transpose()
+        Ok(self
+            .active_namespace_state()?
+            .inodes
+            .get(&inode_number)
+            .cloned())
     }
 
     fn event(&self, sequence: EventSequence) -> Result<Option<EventRecord>, FilesystemError> {
@@ -2827,6 +2800,61 @@ impl Storage {
             .and_then(|value| decode_branch(&value))
     }
 
+    fn active_namespace_state(&self) -> Result<MaterializedBranchState, FilesystemError> {
+        self.namespace_state_for_branch(self.active_branch_identifier())
+    }
+
+    fn namespace_state_for_branch(
+        &self,
+        branch_identifier: BranchIdentifier,
+    ) -> Result<MaterializedBranchState, FilesystemError> {
+        let branch = self.stored_branch(branch_identifier)?;
+        self.namespace_state(&branch.namespace_identifier)
+    }
+
+    fn namespace_state(
+        &self,
+        namespace_identifier: &[u8],
+    ) -> Result<MaterializedBranchState, FilesystemError> {
+        let namespace_identifier = NamespaceIdentifier::from_bytes(namespace_identifier)?;
+        let namespace_nodes = self.namespace_nodes()?;
+        let value = self
+            .database
+            .get_pinned_cf(namespace_nodes, namespace_identifier.as_bytes())
+            .map_err(|_| FilesystemError::Database)?
+            .ok_or(FilesystemError::Integrity)?;
+        validate_namespace(namespace_identifier.as_bytes(), &value)?;
+        decode_namespace_state(&value)
+    }
+
+    fn namespace_state_from_snapshot(
+        &self,
+        snapshot: &rocksdb::Snapshot<'_>,
+        branch_identifier: BranchIdentifier,
+    ) -> Result<MaterializedBranchState, FilesystemError> {
+        let branches = self.branches()?;
+        let branch = snapshot
+            .get_pinned_cf(branches, encode_u64(branch_identifier.get()))
+            .map_err(|_| FilesystemError::Database)?
+            .ok_or(FilesystemError::Integrity)
+            .and_then(|value| decode_branch(&value))?;
+        let namespace_nodes = self.namespace_nodes()?;
+        let value = snapshot
+            .get_pinned_cf(namespace_nodes, &branch.namespace_identifier)
+            .map_err(|_| FilesystemError::Database)?
+            .ok_or(FilesystemError::Integrity)?;
+        validate_namespace(&branch.namespace_identifier, &value)?;
+        decode_namespace_state(&value)
+    }
+
+    fn put_namespace_state(
+        &self,
+        batch: &mut WriteBatch,
+        state: &MaterializedBranchState,
+    ) -> Result<Vec<u8>, FilesystemError> {
+        put_namespace_state_in_database(&self.database, batch, state)
+    }
+
     fn branch_record(
         &self,
         branch_identifier: BranchIdentifier,
@@ -2855,24 +2883,115 @@ impl Storage {
         file_identifier: FileIdentifier,
         position: BranchPosition,
     ) -> Result<Option<FileSnapshot>, FilesystemError> {
-        let snapshots = self.file_snapshot_extents()?;
+        let manifests = self.file_snapshot_manifests()?;
         let prefix = encode_snapshot_file_prefix(branch.get(), file_identifier.get());
-        let mut iterator = self.database.raw_iterator_cf(snapshots);
-        iterator.seek_for_prev(encode_snapshot_extent_key(
+        let mut iterator = self.database.raw_iterator_cf(manifests);
+        iterator.seek_for_prev(encode_file_snapshot_manifest_key(
             branch.get(),
             file_identifier.get(),
             position.ordinal(),
-            u64::MAX,
         ));
         while iterator.valid() {
             let key = iterator.key().ok_or(FilesystemError::Database)?;
             if !key.starts_with(&prefix) {
                 break;
             }
-            let (ordinal, offset) = decode_snapshot_ordinal_and_offset(key)?;
-            if offset == u64::MAX {
-                let metadata =
-                    decode_snapshot_metadata(iterator.value().ok_or(FilesystemError::Database)?)?;
+            let (key_branch, key_file, ordinal) = decode_file_snapshot_manifest_key(key)?;
+            if key_branch != branch.get() || key_file != file_identifier.get() {
+                return Err(FilesystemError::Integrity);
+            }
+            let metadata =
+                decode_snapshot_metadata(iterator.value().ok_or(FilesystemError::Database)?)?;
+            return Ok(Some(FileSnapshot::new(
+                file_identifier,
+                EventSequence::new(metadata.sequence),
+                BranchPosition::new(branch, ordinal),
+                metadata.file_size,
+            )));
+        }
+        iterator.status().map_err(|_| FilesystemError::Database)?;
+
+        self.branch_root_snapshot_at_or_before_position(file_identifier, position)
+    }
+
+    fn snapshot_metadata_from_branch_root(
+        &self,
+        file_identifier: FileIdentifier,
+        root: &StoredBranchRoot,
+    ) -> Result<Option<StoredSnapshotMetadata>, FilesystemError> {
+        let state = self.namespace_state(&root.namespace_identifier)?;
+        let Some(inode) = state.inodes.get(&file_identifier.get()) else {
+            return Ok(None);
+        };
+        if inode.kind != StoredNodeKind::RegularFile {
+            return Ok(None);
+        }
+        Ok(Some(StoredSnapshotMetadata {
+            file_size: inode.size,
+            sequence: root.sequence,
+            content_manifest_identifier: inode
+                .content_manifest_identifier
+                .clone()
+                .unwrap_or(empty_content_manifest_identifier()?),
+        }))
+    }
+
+    fn branch_root_snapshot_at_or_before_position(
+        &self,
+        file_identifier: FileIdentifier,
+        position: BranchPosition,
+    ) -> Result<Option<FileSnapshot>, FilesystemError> {
+        let branch_roots = self.branch_roots()?;
+        let prefix = encode_u64(position.branch_identifier().get());
+        let mut iterator = self.database.raw_iterator_cf(branch_roots);
+        iterator.seek_for_prev(encode_branch_position_key(
+            position.branch_identifier().get(),
+            position.ordinal(),
+        ));
+        while iterator.valid() {
+            let key = iterator.key().ok_or(FilesystemError::Database)?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let ordinal = decode_branch_position_ordinal(key)?;
+            let root = decode_branch_root(iterator.value().ok_or(FilesystemError::Database)?)?;
+            if let Some(metadata) =
+                self.snapshot_metadata_from_branch_root(file_identifier, &root)?
+            {
+                return Ok(Some(FileSnapshot::new(
+                    file_identifier,
+                    EventSequence::new(metadata.sequence),
+                    BranchPosition::new(position.branch_identifier(), ordinal),
+                    metadata.file_size,
+                )));
+            }
+            iterator.prev();
+        }
+        iterator.status().map_err(|_| FilesystemError::Database)?;
+        Ok(None)
+    }
+
+    fn branch_root_snapshot_at_or_before_sequence(
+        &self,
+        branch: BranchIdentifier,
+        file_identifier: FileIdentifier,
+        sequence: EventSequence,
+    ) -> Result<Option<FileSnapshot>, FilesystemError> {
+        let branch_roots = self.branch_roots()?;
+        let prefix = encode_u64(branch.get());
+        let mut iterator = self.database.raw_iterator_cf(branch_roots);
+        iterator.seek_for_prev(encode_branch_position_key(branch.get(), u64::MAX));
+        while iterator.valid() {
+            let key = iterator.key().ok_or(FilesystemError::Database)?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let ordinal = decode_branch_position_ordinal(key)?;
+            let root = decode_branch_root(iterator.value().ok_or(FilesystemError::Database)?)?;
+            if root.sequence <= sequence.get()
+                && let Some(metadata) =
+                    self.snapshot_metadata_from_branch_root(file_identifier, &root)?
+            {
                 return Ok(Some(FileSnapshot::new(
                     file_identifier,
                     EventSequence::new(metadata.sequence),
@@ -2892,13 +3011,12 @@ impl Storage {
         file_identifier: FileIdentifier,
         sequence: EventSequence,
     ) -> Result<Option<FileSnapshot>, FilesystemError> {
-        let snapshots = self.file_snapshot_extents()?;
+        let manifests = self.file_snapshot_manifests()?;
         let prefix = encode_snapshot_file_prefix(branch.get(), file_identifier.get());
-        let mut iterator = self.database.raw_iterator_cf(snapshots);
-        iterator.seek_for_prev(encode_snapshot_extent_key(
+        let mut iterator = self.database.raw_iterator_cf(manifests);
+        iterator.seek_for_prev(encode_file_snapshot_manifest_key(
             branch.get(),
             file_identifier.get(),
-            u64::MAX,
             u64::MAX,
         ));
         while iterator.valid() {
@@ -2906,23 +3024,25 @@ impl Storage {
             if !key.starts_with(&prefix) {
                 break;
             }
-            let (ordinal, offset) = decode_snapshot_ordinal_and_offset(key)?;
-            if offset == u64::MAX {
-                let metadata =
-                    decode_snapshot_metadata(iterator.value().ok_or(FilesystemError::Database)?)?;
-                if metadata.sequence <= sequence.get() {
-                    return Ok(Some(FileSnapshot::new(
-                        file_identifier,
-                        EventSequence::new(metadata.sequence),
-                        BranchPosition::new(branch, ordinal),
-                        metadata.file_size,
-                    )));
-                }
+            let (key_branch, key_file, ordinal) = decode_file_snapshot_manifest_key(key)?;
+            if key_branch != branch.get() || key_file != file_identifier.get() {
+                return Err(FilesystemError::Integrity);
+            }
+            let metadata =
+                decode_snapshot_metadata(iterator.value().ok_or(FilesystemError::Database)?)?;
+            if metadata.sequence <= sequence.get() {
+                return Ok(Some(FileSnapshot::new(
+                    file_identifier,
+                    EventSequence::new(metadata.sequence),
+                    BranchPosition::new(branch, ordinal),
+                    metadata.file_size,
+                )));
             }
             iterator.prev();
         }
         iterator.status().map_err(|_| FilesystemError::Database)?;
-        Ok(None)
+
+        self.branch_root_snapshot_at_or_before_sequence(branch, file_identifier, sequence)
     }
 
     fn inode_from_snapshot(
@@ -2930,13 +3050,11 @@ impl Storage {
         snapshot: &rocksdb::Snapshot<'_>,
         inode_number: u64,
     ) -> Result<Option<StoredInode>, FilesystemError> {
-        let inodes = self.inodes()?;
-        let branch = self.active_branch_identifier();
-        snapshot
-            .get_pinned_cf(inodes, encode_branch_inode_key(branch.get(), inode_number))
-            .map_err(|_| FilesystemError::Database)?
-            .map(|value| decode_inode(&value))
-            .transpose()
+        Ok(self
+            .namespace_state_from_snapshot(snapshot, self.active_branch_identifier())?
+            .inodes
+            .get(&inode_number)
+            .cloned())
     }
 
     fn directory_entry(
@@ -2944,433 +3062,70 @@ impl Storage {
         parent: u64,
         name: &[u8],
     ) -> Result<Option<StoredDirectoryEntry>, FilesystemError> {
-        let entries = self.directory_entries()?;
-        let branch = self.active_branch_identifier();
-        self.database
-            .get_pinned_cf(
-                entries,
-                encode_directory_entry_key(branch.get(), parent, name),
-            )
-            .map_err(|_| FilesystemError::Database)?
-            .map(|value| decode_directory_entry(&value))
-            .transpose()
+        Ok(self
+            .active_namespace_state()?
+            .directory_entries
+            .get(&(parent, name.to_vec()))
+            .cloned())
     }
 
     fn extended_attribute(&self, inode_number: u64, name: &[u8]) -> FuseResult<Option<Vec<u8>>> {
-        let extended_attributes = self.extended_attributes().map_err(to_fuse_integrity)?;
-        let branch = self.active_branch_identifier();
-        self.database
-            .get_pinned_cf(
-                extended_attributes,
-                encode_extended_attribute_key(branch.get(), inode_number, name),
-            )
-            .map_err(|_| FuseError::Database)
-            .map(|value| value.map(|value| value.to_vec()))
+        self.active_namespace_state()
+            .map_err(to_fuse_integrity)
+            .map(|state| {
+                state
+                    .extended_attributes
+                    .get(&(inode_number, name.to_vec()))
+                    .cloned()
+            })
     }
 
-    fn put_inode(
-        &self,
-        batch: &mut WriteBatch,
-        inode_number: u64,
-        inode: &StoredInode,
-    ) -> FuseResult<()> {
-        let inodes = self.inodes().map_err(|_| FuseError::Integrity)?;
-        let branch = self.active_branch_identifier();
-        batch.put_cf(
-            inodes,
-            encode_branch_inode_key(branch.get(), inode_number),
-            encode_inode(inode).map_err(|_| FuseError::Database)?,
-        );
-        Ok(())
-    }
-
-    fn delete_inode(&self, batch: &mut WriteBatch, inode_number: u64) -> FuseResult<()> {
-        let inodes = self.inodes().map_err(|_| FuseError::Integrity)?;
-        let branch = self.active_branch_identifier();
-        batch.delete_cf(inodes, encode_branch_inode_key(branch.get(), inode_number));
-        self.delete_extended_attributes_for_inode(batch, inode_number)?;
-        Ok(())
-    }
-
-    fn delete_extended_attributes_for_inode(
-        &self,
-        batch: &mut WriteBatch,
-        inode_number: u64,
-    ) -> FuseResult<()> {
-        let extended_attributes = self
-            .extended_attributes()
-            .map_err(|_| FuseError::Integrity)?;
-        let branch = self.active_branch_identifier();
-        let prefix = encode_branch_file_prefix(branch.get(), inode_number);
-        for item in self.database.iterator_cf(
-            extended_attributes,
-            IteratorMode::From(&prefix, Direction::Forward),
-        ) {
-            let (key, _value) = item.map_err(|_| FuseError::Database)?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            batch.delete_cf(extended_attributes, key);
-        }
-        Ok(())
-    }
-
-    fn put_directory_entry(
-        &self,
-        batch: &mut WriteBatch,
-        parent: u64,
-        name: &[u8],
-        entry: StoredDirectoryEntry,
-    ) -> FuseResult<()> {
-        let entries = self.directory_entries().map_err(|_| FuseError::Integrity)?;
-        let branch = self.active_branch_identifier();
-        batch.put_cf(
-            entries,
-            encode_directory_entry_key(branch.get(), parent, name),
-            encode_directory_entry(&entry).map_err(|_| FuseError::Database)?,
-        );
-        Ok(())
-    }
-
-    fn delete_directory_entry(
-        &self,
-        batch: &mut WriteBatch,
-        parent: u64,
-        name: &[u8],
-    ) -> FuseResult<()> {
-        let entries = self.directory_entries().map_err(|_| FuseError::Integrity)?;
-        let branch = self.active_branch_identifier();
-        batch.delete_cf(
-            entries,
-            encode_directory_entry_key(branch.get(), parent, name),
-        );
-        Ok(())
-    }
-
-    fn put_extended_attribute(
-        &self,
-        batch: &mut WriteBatch,
-        inode_number: u64,
-        name: &[u8],
-        value: &[u8],
-    ) -> FuseResult<()> {
-        let extended_attributes = self.extended_attributes().map_err(to_fuse_integrity)?;
-        let branch = self.active_branch_identifier();
-        batch.put_cf(
-            extended_attributes,
-            encode_extended_attribute_key(branch.get(), inode_number, name),
-            value,
-        );
-        Ok(())
-    }
-
-    fn delete_extended_attribute(
-        &self,
-        batch: &mut WriteBatch,
-        inode_number: u64,
-        name: &[u8],
-    ) -> FuseResult<()> {
-        let extended_attributes = self.extended_attributes().map_err(to_fuse_integrity)?;
-        let branch = self.active_branch_identifier();
-        batch.delete_cf(
-            extended_attributes,
-            encode_extended_attribute_key(branch.get(), inode_number, name),
-        );
-        Ok(())
-    }
-
-    fn touch_loaded_directory(
-        &self,
-        batch: &mut WriteBatch,
-        inode_number: u64,
-        inode: &mut StoredInode,
-        timestamp: StoredTime,
-    ) -> FuseResult<()> {
-        inode.mtime = timestamp;
-        inode.ctime = timestamp;
-        self.put_inode(batch, inode_number, inode)
-    }
-
-    fn delete_current_file_extents(
-        &self,
-        batch: &mut WriteBatch,
-        inode_number: u64,
-    ) -> FuseResult<()> {
-        let extents = self
-            .current_file_extents()
-            .map_err(|_| FuseError::Integrity)?;
-        let branch = self.active_branch_identifier();
-        let prefix = encode_current_file_prefix(branch.get(), inode_number);
-        for item in self
-            .database
-            .iterator_cf(extents, IteratorMode::From(&prefix, Direction::Forward))
-        {
-            let (key, _value) = item.map_err(|_| FuseError::Database)?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            batch.delete_cf(extents, key);
-        }
-        Ok(())
-    }
-
-    fn replace_current_file_extents(
-        &self,
-        batch: &mut WriteBatch,
-        inode_number: u64,
-        extents: &[StoredExtent],
-    ) -> FuseResult<()> {
-        self.delete_current_file_extents(batch, inode_number)?;
-        self.put_existing_extents(
-            batch,
-            ExtentSet::Current {
-                branch: self.active_branch_identifier(),
-                file_identifier: FileIdentifier::new(inode_number),
-            },
-            extents,
-        )
-    }
-
-    fn current_file_extent_manifest(
+    fn file_content_manifest_extents(
         &self,
         branch: BranchIdentifier,
         file_identifier: FileIdentifier,
     ) -> Result<Vec<StoredExtent>, FilesystemError> {
-        let extents = self.current_file_extents()?;
-        let prefix = encode_current_file_prefix(branch.get(), file_identifier.get());
-        let mut manifest = Vec::new();
-        for item in self
-            .database
-            .iterator_cf(extents, IteratorMode::From(&prefix, Direction::Forward))
-        {
-            let (key, value) = item.map_err(|_| FilesystemError::Database)?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            let extent = decode_extent(&value)?;
-            if decode_extent_offset_from_current_key(&key)? != extent.logical_offset {
-                return Err(FilesystemError::Integrity);
-            }
-            manifest.push(extent);
-        }
-        Ok(manifest)
+        let state = self.namespace_state_for_branch(branch)?;
+        let inode = state
+            .inodes
+            .get(&file_identifier.get())
+            .ok_or(FilesystemError::Integrity)?;
+        let identifier = inode
+            .content_manifest_identifier
+            .as_deref()
+            .ok_or(FilesystemError::Integrity)?;
+        self.content_manifest_extents(identifier)
     }
 
-    fn materialize_branch_state_at_position(
+    fn branch_root_at_position(
         &self,
         position: BranchPosition,
-    ) -> Result<MaterializedBranchState, FilesystemError> {
-        let mut visited = BTreeSet::new();
-        self.materialize_branch_state_at_position_inner(position, &mut visited)
+    ) -> Result<StoredBranchRoot, FilesystemError> {
+        self.database
+            .get_pinned_cf(
+                self.branch_roots()?,
+                encode_branch_position_key(position.branch_identifier().get(), position.ordinal()),
+            )
+            .map_err(|_| FilesystemError::Database)?
+            .ok_or(FilesystemError::Integrity)
+            .and_then(|value| decode_branch_root(&value))
     }
 
-    fn materialize_branch_state_at_position_inner(
+    fn put_branch_root(
         &self,
+        batch: &mut WriteBatch,
         position: BranchPosition,
-        visited: &mut BTreeSet<u64>,
-    ) -> Result<MaterializedBranchState, FilesystemError> {
-        let branch_identifier = position.branch_identifier();
-        if !visited.insert(branch_identifier.get()) {
-            return Err(FilesystemError::Integrity);
-        }
-        let branch = self.stored_branch(branch_identifier)?;
-        if position.ordinal() > branch.head_ordinal {
-            return Err(FilesystemError::Integrity);
-        }
-
-        let (mut state, start_ordinal) = match (branch.fork_branch_identifier, branch.fork_ordinal)
-        {
-            (Some(fork_branch), Some(fork_ordinal)) => {
-                if position.ordinal() < fork_ordinal {
-                    return Err(FilesystemError::Integrity);
-                }
-                let fork_position =
-                    BranchPosition::new(BranchIdentifier::new(fork_branch), fork_ordinal);
-                (
-                    self.materialize_branch_state_at_position_inner(fork_position, visited)?,
-                    fork_ordinal
-                        .checked_add(1)
-                        .ok_or(FilesystemError::Integrity)?,
-                )
-            }
-            (None, None) => (MaterializedBranchState::default(), 0),
-            _ => return Err(FilesystemError::Integrity),
-        };
-        self.apply_branch_events_to_state(
-            &mut state,
-            branch_identifier,
-            start_ordinal,
-            position.ordinal(),
-        )?;
-        visited.remove(&branch_identifier.get());
-        Ok(state)
-    }
-
-    fn apply_branch_events_to_state(
-        &self,
-        state: &mut MaterializedBranchState,
-        branch: BranchIdentifier,
-        start_ordinal: u64,
-        end_ordinal: u64,
-    ) -> Result<(), FilesystemError> {
-        if start_ordinal > end_ordinal {
-            return Ok(());
-        }
-        let branch_events = self.branch_events()?;
-        let prefix = encode_u64(branch.get());
-        let mut iterator = self.database.raw_iterator_cf(branch_events);
-        iterator.seek(encode_branch_position_key(branch.get(), start_ordinal));
-        while iterator.valid() {
-            let key = iterator.key().ok_or(FilesystemError::Database)?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            if key.len() != 16 {
-                return Err(FilesystemError::Integrity);
-            }
-            let ordinal = decode_u64(&key[8..])?;
-            if ordinal > end_ordinal {
-                break;
-            }
-            let sequence = decode_u64(iterator.value().ok_or(FilesystemError::Database)?)
-                .map(EventSequence::new)?;
-            let event = self
-                .stored_event(sequence)?
-                .ok_or(FilesystemError::Integrity)?;
-            validate_branch_event_record(&event.record, branch, ordinal)?;
-            state.apply(&event.mutation);
-            iterator.next();
-        }
-        iterator.status().map_err(|_| FilesystemError::Database)
-    }
-
-    fn copy_branch_state_at_position(
-        &self,
-        batch: &mut WriteBatch,
-        source_position: BranchPosition,
-        target: BranchIdentifier,
-        fork_sequence: EventSequence,
-    ) -> Result<(), FilesystemError> {
-        let source = source_position.branch_identifier();
-        let inodes = self.inodes()?;
-        let directory_entries = self.directory_entries()?;
-        let state = self.materialize_branch_state_at_position(source_position)?;
-        for ((parent, name), entry) in &state.directory_entries {
-            batch.put_cf(
-                directory_entries,
-                encode_directory_entry_key(target.get(), *parent, name),
-                encode_directory_entry(entry)?,
-            );
-        }
-        let extended_attributes = self.extended_attributes()?;
-        for ((inode_number, name), value) in &state.extended_attributes {
-            batch.put_cf(
-                extended_attributes,
-                encode_extended_attribute_key(target.get(), *inode_number, name),
-                value,
-            );
-        }
-        for (inode_number, inode) in &state.inodes {
-            let mut inode = inode.clone();
-            if inode.kind == StoredNodeKind::RegularFile {
-                let file_identifier = FileIdentifier::new(*inode_number);
-                if let Some(snapshot) = self.file_snapshot_metadata_at_or_before(
-                    source,
-                    file_identifier,
-                    source_position,
-                )? {
-                    inode.size = snapshot.file_size();
-                    self.copy_snapshot_extents_to_branch(
-                        batch,
-                        snapshot.branch_position(),
-                        target,
-                        file_identifier,
-                        source_position.ordinal(),
-                    )?;
-                    self.put_branch_file_snapshot_metadata(
-                        batch,
-                        target,
-                        file_identifier,
-                        source_position.ordinal(),
-                        snapshot.file_size(),
-                        fork_sequence,
-                    )?;
-                } else {
-                    return Err(FilesystemError::Integrity);
-                }
-            }
-            batch.put_cf(
-                inodes,
-                encode_branch_inode_key(target.get(), *inode_number),
-                encode_inode(&inode)?,
-            );
-        }
-        Ok(())
-    }
-
-    fn copy_snapshot_extents_to_branch(
-        &self,
-        batch: &mut WriteBatch,
-        source_position: BranchPosition,
-        target: BranchIdentifier,
-        file_identifier: FileIdentifier,
-        target_ordinal: u64,
-    ) -> Result<(), FilesystemError> {
-        let snapshots = self.file_snapshot_extents()?;
-        let current_extents = self.current_file_extents()?;
-        let prefix = encode_snapshot_extent_prefix(
-            source_position.branch_identifier().get(),
-            file_identifier.get(),
-            source_position.ordinal(),
-        );
-        for item in self
-            .database
-            .iterator_cf(snapshots, IteratorMode::From(&prefix, Direction::Forward))
-        {
-            let (key, value) = item.map_err(|_| FilesystemError::Database)?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            let (_ordinal, offset) = decode_snapshot_ordinal_and_offset(&key)?;
-            if offset == u64::MAX {
-                break;
-            }
-            batch.put_cf(
-                current_extents,
-                encode_current_file_extent_key(target.get(), file_identifier.get(), offset),
-                value.as_ref(),
-            );
-            batch.put_cf(
-                snapshots,
-                encode_snapshot_extent_key(
-                    target.get(),
-                    file_identifier.get(),
-                    target_ordinal,
-                    offset,
-                ),
-                value.as_ref(),
-            );
-        }
-        Ok(())
-    }
-
-    fn put_branch_file_snapshot_metadata(
-        &self,
-        batch: &mut WriteBatch,
-        branch: BranchIdentifier,
-        file_identifier: FileIdentifier,
-        ordinal: u64,
-        file_size: u64,
         sequence: EventSequence,
+        namespace_identifier: &[u8],
     ) -> Result<(), FilesystemError> {
-        let metadata = StoredSnapshotMetadata {
-            file_size,
+        let root = StoredBranchRoot {
             sequence: sequence.get(),
+            namespace_identifier: namespace_identifier.to_vec(),
         };
         batch.put_cf(
-            self.file_snapshot_extents()?,
-            encode_snapshot_extent_key(branch.get(), file_identifier.get(), ordinal, u64::MAX),
-            encode_snapshot_metadata(&metadata)?,
+            self.branch_roots()?,
+            encode_branch_position_key(position.branch_identifier().get(), position.ordinal()),
+            encode_branch_root(&root)?,
         );
         Ok(())
     }
@@ -3412,6 +3167,13 @@ impl Storage {
             .map_err(|_| FuseError::Integrity)?;
         let first_parent = EventSequence::new(branch.head_sequence);
         let branch_position = BranchPosition::new(branch_identifier, branch.head_ordinal + 1);
+        let mut namespace = self
+            .namespace_state(&branch.namespace_identifier)
+            .map_err(|_| FuseError::Integrity)?;
+        namespace.apply(&mutation);
+        let namespace_identifier = self
+            .put_namespace_state(batch, &namespace)
+            .map_err(|_| FuseError::Integrity)?;
         let event = event
             .clone()
             .with_branch(branch_identifier, branch_position, first_parent);
@@ -3426,6 +3188,7 @@ impl Storage {
         }
         branch.head_sequence = event_sequence.get();
         branch.head_ordinal = branch_position.ordinal();
+        branch.namespace_identifier = namespace_identifier.clone();
         batch.put_cf(
             events,
             event_key,
@@ -3440,14 +3203,22 @@ impl Storage {
             encode_u64(branch_identifier.get()),
             encode_branch(&branch).map_err(|_| FuseError::Database)?,
         );
-        self.put_event_payloads(batch, event_sequence, payload_extents)?;
+        self.put_event_payloads(batch, event_sequence, &event, payload_extents)?;
         self.put_file_event_index(batch, event_sequence, &event)?;
         self.put_branch_event_index(batch, event_sequence, branch_position)?;
         self.put_branch_file_event_index(batch, event_sequence, &event)?;
+        self.put_branch_root(
+            batch,
+            branch_position,
+            event_sequence,
+            &namespace_identifier,
+        )
+        .map_err(|_| FuseError::Integrity)?;
         self.put_file_snapshot_for_event(
             batch,
             event_sequence,
             &event,
+            &namespace,
             snapshot_extents,
             secondary_snapshot_extents,
         )?;
@@ -3463,6 +3234,7 @@ impl Storage {
         &self,
         batch: &mut WriteBatch,
         event_sequence: EventSequence,
+        event: &EventRecord,
         payload_extents: EventPayloadExtents,
     ) -> FuseResult<()> {
         match payload_extents {
@@ -3471,31 +3243,28 @@ impl Storage {
                 overwritten_extents,
                 written_extents,
             } => {
-                self.put_existing_extents(
+                self.put_event_payload_manifest(
                     batch,
-                    ExtentSet::EventPayload {
-                        sequence: event_sequence,
-                        part: EVENT_PAYLOAD_PART_OVERWRITTEN,
-                    },
+                    event_sequence,
+                    EVENT_PAYLOAD_PART_OVERWRITTEN,
+                    event.overwritten_byte_length().unwrap_or(0),
                     &overwritten_extents,
                 )?;
-                self.put_existing_extents(
+                self.put_event_payload_manifest(
                     batch,
-                    ExtentSet::EventPayload {
-                        sequence: event_sequence,
-                        part: EVENT_PAYLOAD_PART_WRITTEN,
-                    },
+                    event_sequence,
+                    EVENT_PAYLOAD_PART_WRITTEN,
+                    event.written_byte_length().unwrap_or(0),
                     &written_extents,
                 )?;
                 Ok(())
             }
             EventPayloadExtents::FileTruncate { removed_extents } => {
-                self.put_existing_extents(
+                self.put_event_payload_manifest(
                     batch,
-                    ExtentSet::EventPayload {
-                        sequence: event_sequence,
-                        part: EVENT_PAYLOAD_PART_REMOVED,
-                    },
+                    event_sequence,
+                    EVENT_PAYLOAD_PART_REMOVED,
+                    event.removed_byte_length().unwrap_or(0),
                     &removed_extents,
                 )?;
                 Ok(())
@@ -3503,10 +3272,36 @@ impl Storage {
         }
     }
 
+    fn put_event_payload_manifest(
+        &self,
+        batch: &mut WriteBatch,
+        event_sequence: EventSequence,
+        part: u8,
+        byte_length: u64,
+        extents: &[StoredExtent],
+    ) -> FuseResult<()> {
+        if byte_length == 0 {
+            return Ok(());
+        }
+        validate_extent_bounds(extents, byte_length)?;
+        let content_manifest_identifier = self.put_content_manifest(batch, extents)?;
+        let manifest = StoredEventPayloadManifest {
+            byte_length,
+            content_manifest_identifier,
+        };
+        batch.put_cf(
+            self.event_payload_manifests()
+                .map_err(|_| FuseError::Integrity)?,
+            encode_event_payload_manifest_key(event_sequence.get(), part),
+            encode_event_payload_manifest(&manifest).map_err(|_| FuseError::Database)?,
+        );
+        Ok(())
+    }
+
     fn put_pending_extents(
         &self,
         batch: &mut WriteBatch,
-        extent_set: ExtentSet,
+        _extent_set: ExtentSet,
         bytes: &[u8],
         extents: &[StoredExtent],
         pending: &[PendingExtent],
@@ -3520,19 +3315,6 @@ impl Storage {
                 &stored.chunk_identifier,
                 &bytes[pending.byte_range()],
             )?;
-            self.put_stored_extent(batch, extent_set, stored)?;
-        }
-        Ok(())
-    }
-
-    fn put_existing_extents(
-        &self,
-        batch: &mut WriteBatch,
-        extent_set: ExtentSet,
-        extents: &[StoredExtent],
-    ) -> FuseResult<()> {
-        for extent in extents {
-            self.put_stored_extent(batch, extent_set, extent)?;
         }
         Ok(())
     }
@@ -3581,49 +3363,50 @@ impl Storage {
         Ok(())
     }
 
-    fn put_stored_extent(
+    fn put_content_manifest(
         &self,
         batch: &mut WriteBatch,
-        extent_set: ExtentSet,
-        stored: &StoredExtent,
-    ) -> FuseResult<()> {
-        match extent_set {
-            ExtentSet::Current {
-                branch,
-                file_identifier,
-            } => batch.put_cf(
-                self.current_file_extents()
-                    .map_err(|_| FuseError::Integrity)?,
-                encode_current_file_extent_key(
-                    branch.get(),
-                    file_identifier.get(),
-                    stored.logical_offset,
-                ),
-                encode_extent(stored).map_err(|_| FuseError::Database)?,
-            ),
-            ExtentSet::Snapshot {
-                branch,
-                file_identifier,
-                ordinal,
-            } => batch.put_cf(
-                self.file_snapshot_extents()
-                    .map_err(|_| FuseError::Integrity)?,
-                encode_snapshot_extent_key(
-                    branch.get(),
-                    file_identifier.get(),
-                    ordinal,
-                    stored.logical_offset,
-                ),
-                encode_extent(stored).map_err(|_| FuseError::Database)?,
-            ),
-            ExtentSet::EventPayload { sequence, part } => batch.put_cf(
-                self.event_payload_extents()
-                    .map_err(|_| FuseError::Integrity)?,
-                encode_event_payload_extent_key(sequence.get(), part, stored.logical_offset),
-                encode_extent(stored).map_err(|_| FuseError::Database)?,
-            ),
+        extents: &[StoredExtent],
+    ) -> FuseResult<Vec<u8>> {
+        let bytes = encode_content_manifest(extents).map_err(|_| FuseError::Database)?;
+        let identifier = content_manifest_identifier_for_bytes(&bytes);
+        let manifests = self
+            .content_manifest_nodes()
+            .map_err(|_| FuseError::Integrity)?;
+        if let Some(existing) = self
+            .database
+            .get_pinned_cf(manifests, &identifier)
+            .map_err(|_| FuseError::Database)?
+        {
+            validate_content_manifest(&identifier, &existing).map_err(to_fuse_integrity)?;
+            if existing.as_ref() != bytes {
+                return Err(FuseError::Integrity);
+            }
+        } else if !extents.is_empty() {
+            batch.put_cf(manifests, &identifier, bytes);
         }
-        Ok(())
+        Ok(identifier)
+    }
+
+    fn content_manifest_extents(
+        &self,
+        content_manifest_identifier: &[u8],
+    ) -> Result<Vec<StoredExtent>, FilesystemError> {
+        let content_manifest_identifier =
+            ContentManifestIdentifier::from_bytes(content_manifest_identifier)?;
+        let empty_identifier =
+            empty_content_manifest_identifier().map_err(|_| FilesystemError::Integrity)?;
+        if content_manifest_identifier.as_bytes() == empty_identifier.as_slice() {
+            return Ok(Vec::new());
+        }
+        let manifests = self.content_manifest_nodes()?;
+        let value = self
+            .database
+            .get_pinned_cf(manifests, content_manifest_identifier.as_bytes())
+            .map_err(|_| FilesystemError::Database)?
+            .ok_or(FilesystemError::Integrity)?;
+        validate_content_manifest(content_manifest_identifier.as_bytes(), &value)?;
+        decode_content_manifest(&value)
     }
 
     fn read_extent_range(
@@ -3640,38 +3423,8 @@ impl Storage {
         let end = offset
             .checked_add(length as u64)
             .ok_or(FilesystemError::Integrity)?;
-        let (cf, prefix, start_key) = self.extent_scan(extent_set, offset)?;
-        let snapshot = self.database.snapshot();
-        let mut iterator = snapshot.raw_iterator_cf(cf);
-
-        iterator.seek_for_prev(&start_key);
-        if iterator.valid() {
-            let key = iterator.key().ok_or(FilesystemError::Database)?;
-            if key.starts_with(&prefix) && !is_snapshot_metadata_key(key)? {
-                let extent = decode_extent(iterator.value().ok_or(FilesystemError::Database)?)?;
-                let extent_end = extent
-                    .logical_offset
-                    .checked_add(extent.length)
-                    .ok_or(FilesystemError::Integrity)?;
-                if extent_end <= offset {
-                    iterator.next();
-                }
-            } else {
-                iterator.seek(start_key);
-            }
-        } else {
-            iterator.seek(start_key);
-        }
-        while iterator.valid() {
-            let key = iterator.key().ok_or(FilesystemError::Database)?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            if is_snapshot_metadata_key(key)? {
-                break;
-            }
-            let value = iterator.value().ok_or(FilesystemError::Database)?;
-            let extent = decode_extent(value)?;
+        let extents = self.extent_manifest(extent_set)?;
+        for extent in extents {
             if extent.logical_offset >= end {
                 break;
             }
@@ -3702,51 +3455,71 @@ impl Storage {
                 bytes[destination_start..destination_start + read_len]
                     .copy_from_slice(&chunk[chunk_start..chunk_end]);
             }
-            iterator.next();
         }
-        iterator.status().map_err(|_| FilesystemError::Database)?;
         Ok(bytes)
     }
 
-    fn extent_scan(
-        &self,
-        extent_set: ExtentSet,
-        offset: u64,
-    ) -> Result<(&ColumnFamily, Vec<u8>, Vec<u8>), FilesystemError> {
+    fn extent_manifest(&self, extent_set: ExtentSet) -> Result<Vec<StoredExtent>, FilesystemError> {
         match extent_set {
             ExtentSet::Current {
                 branch,
                 file_identifier,
-            } => {
-                let prefix = encode_current_file_prefix(branch.get(), file_identifier.get());
-                let start_key =
-                    encode_current_file_extent_key(branch.get(), file_identifier.get(), offset)
-                        .to_vec();
-                Ok((self.current_file_extents()?, prefix, start_key))
-            }
+            } => self.file_content_manifest_extents(branch, file_identifier),
             ExtentSet::Snapshot {
                 branch,
                 file_identifier,
                 ordinal,
             } => {
-                let prefix =
-                    encode_snapshot_extent_prefix(branch.get(), file_identifier.get(), ordinal);
-                let start_key = encode_snapshot_extent_key(
-                    branch.get(),
-                    file_identifier.get(),
-                    ordinal,
-                    offset,
-                )
-                .to_vec();
-                Ok((self.file_snapshot_extents()?, prefix, start_key))
+                let manifest = self.file_snapshot_manifest(
+                    branch,
+                    file_identifier,
+                    BranchPosition::new(branch, ordinal),
+                )?;
+                self.content_manifest_extents(&manifest.content_manifest_identifier)
             }
             ExtentSet::EventPayload { sequence, part } => {
-                let prefix = encode_event_payload_extent_prefix(sequence.get(), part);
-                let start_key =
-                    encode_event_payload_extent_key(sequence.get(), part, offset).to_vec();
-                Ok((self.event_payload_extents()?, prefix, start_key))
+                let manifests = self.event_payload_manifests()?;
+                let value = self
+                    .database
+                    .get_pinned_cf(
+                        manifests,
+                        encode_event_payload_manifest_key(sequence.get(), part),
+                    )
+                    .map_err(|_| FilesystemError::Database)?
+                    .ok_or(FilesystemError::Integrity)?;
+                let manifest = decode_event_payload_manifest(&value)?;
+                self.content_manifest_extents(&manifest.content_manifest_identifier)
             }
         }
+    }
+
+    fn file_snapshot_manifest(
+        &self,
+        branch: BranchIdentifier,
+        file_identifier: FileIdentifier,
+        position: BranchPosition,
+    ) -> Result<StoredSnapshotMetadata, FilesystemError> {
+        if position.branch_identifier() != branch {
+            return Err(FilesystemError::Integrity);
+        }
+        let manifests = self.file_snapshot_manifests()?;
+        if let Some(value) = self
+            .database
+            .get_pinned_cf(
+                manifests,
+                encode_file_snapshot_manifest_key(
+                    branch.get(),
+                    file_identifier.get(),
+                    position.ordinal(),
+                ),
+            )
+            .map_err(|_| FilesystemError::Database)?
+        {
+            return decode_snapshot_metadata(&value);
+        }
+        let root = self.branch_root_at_position(position)?;
+        self.snapshot_metadata_from_branch_root(file_identifier, &root)?
+            .ok_or(FilesystemError::Integrity)
     }
 
     fn put_file_event_index(
@@ -3815,6 +3588,7 @@ impl Storage {
         batch: &mut WriteBatch,
         event_sequence: EventSequence,
         event: &EventRecord,
+        namespace: &MaterializedBranchState,
         snapshot_extents: Option<&[StoredExtent]>,
         secondary_snapshot_extents: Option<&[StoredExtent]>,
     ) -> FuseResult<()> {
@@ -3839,6 +3613,7 @@ impl Storage {
                 event,
                 file_identifier,
                 branch_position,
+                namespace,
                 snapshot_extents,
             )?;
         }
@@ -3849,6 +3624,7 @@ impl Storage {
                 event,
                 file_identifier,
                 branch_position,
+                namespace,
                 secondary_snapshot_extents,
             )?;
         }
@@ -3862,76 +3638,34 @@ impl Storage {
         event: &EventRecord,
         file_identifier: FileIdentifier,
         branch_position: BranchPosition,
+        namespace: &MaterializedBranchState,
         snapshot_extents: Option<&[StoredExtent]>,
     ) -> FuseResult<()> {
         let file_size = event_snapshot_file_size(event, file_identifier).unwrap_or(0);
-        if let Some(extents) = snapshot_extents {
-            self.put_existing_extents(
-                batch,
-                ExtentSet::Snapshot {
-                    branch: branch_position.branch_identifier(),
-                    file_identifier,
-                    ordinal: branch_position.ordinal(),
-                },
-                extents,
-            )?;
+        let content_manifest_identifier = if let Some(extents) = snapshot_extents {
+            self.put_content_manifest(batch, extents)?
         } else {
-            self.copy_current_extents_to_snapshot(batch, file_identifier, branch_position)?;
-        }
+            namespace
+                .inodes
+                .get(&file_identifier.get())
+                .and_then(|inode| inode.content_manifest_identifier.clone())
+                .unwrap_or(empty_content_manifest_identifier().map_err(to_fuse_integrity)?)
+        };
         let metadata = StoredSnapshotMetadata {
             file_size,
             sequence: event_sequence.get(),
+            content_manifest_identifier,
         };
         batch.put_cf(
-            self.file_snapshot_extents()
+            self.file_snapshot_manifests()
                 .map_err(|_| FuseError::Integrity)?,
-            encode_snapshot_extent_key(
+            encode_file_snapshot_manifest_key(
                 branch_position.branch_identifier().get(),
                 file_identifier.get(),
                 branch_position.ordinal(),
-                u64::MAX,
             ),
             encode_snapshot_metadata(&metadata).map_err(|_| FuseError::Database)?,
         );
-        Ok(())
-    }
-
-    fn copy_current_extents_to_snapshot(
-        &self,
-        batch: &mut WriteBatch,
-        file_identifier: FileIdentifier,
-        branch_position: BranchPosition,
-    ) -> FuseResult<()> {
-        let current_extents = self
-            .current_file_extents()
-            .map_err(|_| FuseError::Integrity)?;
-        let snapshot_extents = self
-            .file_snapshot_extents()
-            .map_err(|_| FuseError::Integrity)?;
-        let prefix = encode_current_file_prefix(
-            branch_position.branch_identifier().get(),
-            file_identifier.get(),
-        );
-        for item in self.database.iterator_cf(
-            current_extents,
-            IteratorMode::From(&prefix, Direction::Forward),
-        ) {
-            let (key, value) = item.map_err(|_| FuseError::Database)?;
-            if !key.starts_with(&prefix) {
-                break;
-            }
-            let offset = decode_extent_offset_from_current_key(&key).map_err(to_fuse_integrity)?;
-            batch.put_cf(
-                snapshot_extents,
-                encode_snapshot_extent_key(
-                    branch_position.branch_identifier().get(),
-                    file_identifier.get(),
-                    branch_position.ordinal(),
-                    offset,
-                ),
-                value,
-            );
-        }
         Ok(())
     }
 
@@ -3944,24 +3678,6 @@ impl Storage {
     fn events(&self) -> Result<&ColumnFamily, FilesystemError> {
         self.database
             .cf_handle(COLUMN_FAMILY_EVENTS)
-            .ok_or(FilesystemError::Integrity)
-    }
-
-    fn inodes(&self) -> Result<&ColumnFamily, FilesystemError> {
-        self.database
-            .cf_handle(COLUMN_FAMILY_INODES)
-            .ok_or(FilesystemError::Integrity)
-    }
-
-    fn directory_entries(&self) -> Result<&ColumnFamily, FilesystemError> {
-        self.database
-            .cf_handle(COLUMN_FAMILY_DIRECTORY_ENTRIES)
-            .ok_or(FilesystemError::Integrity)
-    }
-
-    fn extended_attributes(&self) -> Result<&ColumnFamily, FilesystemError> {
-        self.database
-            .cf_handle(COLUMN_FAMILY_EXTENDED_ATTRIBUTES)
             .ok_or(FilesystemError::Integrity)
     }
 
@@ -4001,21 +3717,33 @@ impl Storage {
             .ok_or(FilesystemError::Integrity)
     }
 
-    fn current_file_extents(&self) -> Result<&ColumnFamily, FilesystemError> {
+    fn content_manifest_nodes(&self) -> Result<&ColumnFamily, FilesystemError> {
         self.database
-            .cf_handle(COLUMN_FAMILY_CURRENT_FILE_EXTENTS)
+            .cf_handle(COLUMN_FAMILY_CONTENT_MANIFEST_NODES)
             .ok_or(FilesystemError::Integrity)
     }
 
-    fn file_snapshot_extents(&self) -> Result<&ColumnFamily, FilesystemError> {
+    fn namespace_nodes(&self) -> Result<&ColumnFamily, FilesystemError> {
         self.database
-            .cf_handle(COLUMN_FAMILY_FILE_SNAPSHOT_EXTENTS)
+            .cf_handle(COLUMN_FAMILY_NAMESPACE_NODES)
             .ok_or(FilesystemError::Integrity)
     }
 
-    fn event_payload_extents(&self) -> Result<&ColumnFamily, FilesystemError> {
+    fn branch_roots(&self) -> Result<&ColumnFamily, FilesystemError> {
         self.database
-            .cf_handle(COLUMN_FAMILY_EVENT_PAYLOAD_EXTENTS)
+            .cf_handle(COLUMN_FAMILY_BRANCH_ROOTS)
+            .ok_or(FilesystemError::Integrity)
+    }
+
+    fn file_snapshot_manifests(&self) -> Result<&ColumnFamily, FilesystemError> {
+        self.database
+            .cf_handle(COLUMN_FAMILY_FILE_SNAPSHOT_MANIFESTS)
+            .ok_or(FilesystemError::Integrity)
+    }
+
+    fn event_payload_manifests(&self) -> Result<&ColumnFamily, FilesystemError> {
+        self.database
+            .cf_handle(COLUMN_FAMILY_EVENT_PAYLOAD_MANIFESTS)
             .ok_or(FilesystemError::Integrity)
     }
 
@@ -4082,29 +3810,22 @@ fn column_family_options(name: &str, block_cache: &Cache) -> Options {
     let mut options = Options::default();
     let uses_fixed_prefix = matches!(
         name,
-        COLUMN_FAMILY_INODES
-            | COLUMN_FAMILY_DIRECTORY_ENTRIES
-            | COLUMN_FAMILY_EXTENDED_ATTRIBUTES
-            | COLUMN_FAMILY_FILE_EVENTS
+        COLUMN_FAMILY_FILE_EVENTS
             | COLUMN_FAMILY_BRANCH_EVENTS
             | COLUMN_FAMILY_BRANCH_FILE_EVENTS
-            | COLUMN_FAMILY_CURRENT_FILE_EXTENTS
-            | COLUMN_FAMILY_FILE_SNAPSHOT_EXTENTS
-            | COLUMN_FAMILY_EVENT_PAYLOAD_EXTENTS
+            | COLUMN_FAMILY_BRANCH_ROOTS
+            | COLUMN_FAMILY_FILE_SNAPSHOT_MANIFESTS
+            | COLUMN_FAMILY_EVENT_PAYLOAD_MANIFESTS
     );
     apply_rocksdb_performance_options(&mut options, block_cache, uses_fixed_prefix);
     match name {
-        COLUMN_FAMILY_INODES | COLUMN_FAMILY_FILE_EVENTS | COLUMN_FAMILY_BRANCH_EVENTS => {
+        COLUMN_FAMILY_FILE_EVENTS | COLUMN_FAMILY_BRANCH_EVENTS | COLUMN_FAMILY_BRANCH_ROOTS => {
             options.set_prefix_extractor(SliceTransform::create_fixed_prefix(8));
         }
-        COLUMN_FAMILY_DIRECTORY_ENTRIES
-        | COLUMN_FAMILY_EXTENDED_ATTRIBUTES
-        | COLUMN_FAMILY_BRANCH_FILE_EVENTS
-        | COLUMN_FAMILY_CURRENT_FILE_EXTENTS
-        | COLUMN_FAMILY_FILE_SNAPSHOT_EXTENTS => {
+        COLUMN_FAMILY_BRANCH_FILE_EVENTS | COLUMN_FAMILY_FILE_SNAPSHOT_MANIFESTS => {
             options.set_prefix_extractor(SliceTransform::create_fixed_prefix(16));
         }
-        COLUMN_FAMILY_EVENT_PAYLOAD_EXTENTS => {
+        COLUMN_FAMILY_EVENT_PAYLOAD_MANIFESTS => {
             options.set_prefix_extractor(SliceTransform::create_fixed_prefix(9));
         }
         _ => {}
@@ -4150,12 +3871,6 @@ fn initialize_new_database(database: &DB) -> Result<(), FilesystemError> {
     let events = database
         .cf_handle(COLUMN_FAMILY_EVENTS)
         .ok_or(FilesystemError::Integrity)?;
-    let inodes = database
-        .cf_handle(COLUMN_FAMILY_INODES)
-        .ok_or(FilesystemError::Integrity)?;
-    let _extended_attributes = database
-        .cf_handle(COLUMN_FAMILY_EXTENDED_ATTRIBUTES)
-        .ok_or(FilesystemError::Integrity)?;
     let branches = database
         .cf_handle(COLUMN_FAMILY_BRANCHES)
         .ok_or(FilesystemError::Integrity)?;
@@ -4164,6 +3879,9 @@ fn initialize_new_database(database: &DB) -> Result<(), FilesystemError> {
         .ok_or(FilesystemError::Integrity)?;
     let branch_events = database
         .cf_handle(COLUMN_FAMILY_BRANCH_EVENTS)
+        .ok_or(FilesystemError::Integrity)?;
+    let branch_roots = database
+        .cf_handle(COLUMN_FAMILY_BRANCH_ROOTS)
         .ok_or(FilesystemError::Integrity)?;
     let initial_branch_position = BranchPosition::new(BRANCH_IDENTIFIER_INITIAL, 0);
     let initialized = EventRecord::new(
@@ -4180,15 +3898,6 @@ fn initialize_new_database(database: &DB) -> Result<(), FilesystemError> {
         initial_branch_position,
         EVENT_SEQUENCE_INITIAL,
     );
-    let main_branch = StoredBranch {
-        identifier: BRANCH_IDENTIFIER_INITIAL.get(),
-        name: BRANCH_NAME_INITIAL.to_owned(),
-        status: BranchStatus::Open,
-        head_sequence: EVENT_SEQUENCE_INITIAL.get(),
-        head_ordinal: 0,
-        fork_branch_identifier: None,
-        fork_ordinal: None,
-    };
     let now = StoredTime::now();
     let root = StoredInode {
         kind: StoredNodeKind::Directory,
@@ -4207,9 +3916,24 @@ fn initialize_new_database(database: &DB) -> Result<(), FilesystemError> {
         parent: INODE_ROOT,
         name: Vec::new(),
         symlink_target: None,
+        content_manifest_identifier: None,
     };
 
     let mut batch = WriteBatch::default();
+    let mut initial_state = MaterializedBranchState::default();
+    initial_state.inodes.insert(INODE_ROOT, root.clone());
+    let namespace_identifier =
+        put_namespace_state_in_database(database, &mut batch, &initial_state)?;
+    let main_branch = StoredBranch {
+        identifier: BRANCH_IDENTIFIER_INITIAL.get(),
+        name: BRANCH_NAME_INITIAL.to_owned(),
+        status: BranchStatus::Open,
+        head_sequence: EVENT_SEQUENCE_INITIAL.get(),
+        head_ordinal: 0,
+        namespace_identifier: namespace_identifier.clone(),
+        fork_branch_identifier: None,
+        fork_ordinal: None,
+    };
     batch.put_cf(
         metadata,
         METADATA_KEY_STORAGE_SCHEMA_VERSION,
@@ -4266,9 +3990,12 @@ fn initialize_new_database(database: &DB) -> Result<(), FilesystemError> {
         encode_u64(EVENT_SEQUENCE_INITIAL.get()),
     );
     batch.put_cf(
-        inodes,
-        encode_branch_inode_key(BRANCH_IDENTIFIER_INITIAL.get(), INODE_ROOT),
-        encode_inode(&root)?,
+        branch_roots,
+        encode_branch_position_key(BRANCH_IDENTIFIER_INITIAL.get(), 0),
+        encode_branch_root(&StoredBranchRoot {
+            sequence: EVENT_SEQUENCE_INITIAL.get(),
+            namespace_identifier,
+        })?,
     );
     write_batch(database, batch)
 }
@@ -4414,17 +4141,26 @@ fn validate_existing_database(database: &DB) -> Result<(), FilesystemError> {
     let active_branch_identifier =
         read_metadata_u64(database, METADATA_KEY_ACTIVE_BRANCH_IDENTIFIER)?;
     validate_allocator_metadata(database, next_inode_number, next_branch_identifier)?;
-    let inodes = database
-        .cf_handle(COLUMN_FAMILY_INODES)
+    let active_branch =
+        stored_branch_in_database(database, BranchIdentifier::new(active_branch_identifier))?;
+    let active_root = branch_root_at_position_in_database(
+        database,
+        BranchPosition::new(
+            BranchIdentifier::new(active_branch_identifier),
+            active_branch.head_ordinal,
+        ),
+    )?;
+    if active_root.sequence != active_branch.head_sequence
+        || active_root.namespace_identifier != active_branch.namespace_identifier
+    {
+        return Err(FilesystemError::Integrity);
+    }
+    let state =
+        namespace_state_for_identifier_in_database(database, &active_branch.namespace_identifier)?;
+    let root = state
+        .inodes
+        .get(&INODE_ROOT)
         .ok_or(FilesystemError::Integrity)?;
-    let root = database
-        .get_pinned_cf(
-            inodes,
-            encode_branch_inode_key(active_branch_identifier, INODE_ROOT),
-        )
-        .map_err(|_| FilesystemError::Database)?
-        .ok_or(FilesystemError::Integrity)?;
-    let root = decode_inode(&root)?;
     if root.kind != StoredNodeKind::Directory {
         return Err(FilesystemError::Integrity);
     }
@@ -4448,18 +4184,20 @@ fn validate_allocator_metadata(
 }
 
 fn max_stored_inode_number(database: &DB) -> Result<u64, FilesystemError> {
-    let inodes = database
-        .cf_handle(COLUMN_FAMILY_INODES)
+    let namespace_nodes = database
+        .cf_handle(COLUMN_FAMILY_NAMESPACE_NODES)
         .ok_or(FilesystemError::Integrity)?;
     let mut maximum = INODE_ROOT;
-    let mut iterator = database.raw_iterator_cf(inodes);
+    let mut iterator = database.raw_iterator_cf(namespace_nodes);
     iterator.seek_to_first();
     while iterator.valid() {
         let key = iterator.key().ok_or(FilesystemError::Database)?;
-        if key.len() != 16 {
-            return Err(FilesystemError::Integrity);
+        let value = iterator.value().ok_or(FilesystemError::Database)?;
+        validate_namespace(key, value)?;
+        let state = decode_namespace_state(value)?;
+        for inode_number in state.inodes.keys() {
+            maximum = maximum.max(*inode_number);
         }
-        maximum = maximum.max(decode_u64(&key[8..])?);
         iterator.next();
     }
     iterator.status().map_err(|_| FilesystemError::Database)?;
@@ -4657,6 +4395,19 @@ fn current_extents_after_zero(
     Ok(extents)
 }
 
+fn validate_extent_bounds(extents: &[StoredExtent], byte_length: u64) -> FuseResult<()> {
+    for extent in extents {
+        let end = extent
+            .logical_offset
+            .checked_add(extent.length)
+            .ok_or(FuseError::Integrity)?;
+        if end > byte_length {
+            return Err(FuseError::Integrity);
+        }
+    }
+    Ok(())
+}
+
 fn seek_data(extents: &[StoredExtent], offset: u64, file_size: u64) -> FuseResult<u64> {
     for extent in extents {
         let extent_end = extent
@@ -4710,6 +4461,85 @@ fn validate_content_chunk(identifier: &[u8], bytes: &[u8]) -> Result<(), Filesys
     Ok(())
 }
 
+fn put_namespace_state_in_database(
+    database: &DB,
+    batch: &mut WriteBatch,
+    state: &MaterializedBranchState,
+) -> Result<Vec<u8>, FilesystemError> {
+    let bytes = encode_namespace_state(state)?;
+    let identifier = namespace_identifier_for_bytes(&bytes);
+    let namespace_nodes = database
+        .cf_handle(COLUMN_FAMILY_NAMESPACE_NODES)
+        .ok_or(FilesystemError::Integrity)?;
+    if let Some(existing) = database
+        .get_pinned_cf(namespace_nodes, &identifier)
+        .map_err(|_| FilesystemError::Database)?
+    {
+        validate_namespace(&identifier, &existing)?;
+        if existing.as_ref() != bytes {
+            return Err(FilesystemError::Integrity);
+        }
+    } else {
+        batch.put_cf(namespace_nodes, &identifier, bytes);
+    }
+    Ok(identifier)
+}
+
+fn stored_branch_in_database(
+    database: &DB,
+    branch_identifier: BranchIdentifier,
+) -> Result<StoredBranch, FilesystemError> {
+    let branches = database
+        .cf_handle(COLUMN_FAMILY_BRANCHES)
+        .ok_or(FilesystemError::Integrity)?;
+    database
+        .get_pinned_cf(branches, encode_u64(branch_identifier.get()))
+        .map_err(|_| FilesystemError::Database)?
+        .ok_or(FilesystemError::Integrity)
+        .and_then(|value| decode_branch(&value))
+}
+
+fn branch_root_at_position_in_database(
+    database: &DB,
+    position: BranchPosition,
+) -> Result<StoredBranchRoot, FilesystemError> {
+    let branch_roots = database
+        .cf_handle(COLUMN_FAMILY_BRANCH_ROOTS)
+        .ok_or(FilesystemError::Integrity)?;
+    database
+        .get_pinned_cf(
+            branch_roots,
+            encode_branch_position_key(position.branch_identifier().get(), position.ordinal()),
+        )
+        .map_err(|_| FilesystemError::Database)?
+        .ok_or(FilesystemError::Integrity)
+        .and_then(|value| decode_branch_root(&value))
+}
+
+fn namespace_state_for_identifier_in_database(
+    database: &DB,
+    namespace_identifier: &[u8],
+) -> Result<MaterializedBranchState, FilesystemError> {
+    let namespace_identifier = NamespaceIdentifier::from_bytes(namespace_identifier)?;
+    let namespace_nodes = database
+        .cf_handle(COLUMN_FAMILY_NAMESPACE_NODES)
+        .ok_or(FilesystemError::Integrity)?;
+    let value = database
+        .get_pinned_cf(namespace_nodes, namespace_identifier.as_bytes())
+        .map_err(|_| FilesystemError::Database)?
+        .ok_or(FilesystemError::Integrity)?;
+    validate_namespace(namespace_identifier.as_bytes(), &value)?;
+    decode_namespace_state(&value)
+}
+
+fn namespace_state_for_branch_in_database(
+    database: &DB,
+    branch: BranchIdentifier,
+) -> Result<MaterializedBranchState, FilesystemError> {
+    let stored = stored_branch_in_database(database, branch)?;
+    namespace_state_for_identifier_in_database(database, &stored.namespace_identifier)
+}
+
 fn child_event_path(
     branch: BranchIdentifier,
     parent: u64,
@@ -4744,9 +4574,8 @@ fn inode_path_bytes(
     if inode_number == INODE_ROOT {
         return Ok(vec![b'/']);
     }
-    let inodes = database
-        .cf_handle(COLUMN_FAMILY_INODES)
-        .ok_or(FuseError::Integrity)?;
+    let state =
+        namespace_state_for_branch_in_database(database, branch).map_err(to_fuse_integrity)?;
     let mut current = inode_number;
     let mut visited = BTreeSet::new();
     let mut components: Vec<Vec<u8>> = Vec::new();
@@ -4764,12 +4593,11 @@ fn inode_path_bytes(
         if !visited.insert(current) {
             return Err(FuseError::Integrity);
         }
-        let inode_value = database
-            .get_pinned_cf(inodes, encode_branch_inode_key(branch.get(), current))
-            .map_err(|_| FuseError::Database)?
+        let inode = state
+            .inodes
+            .get(&current)
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        let inode = decode_inode(&inode_value).map_err(to_fuse_integrity)?;
-        components.push(inode.name);
+        components.push(inode.name.clone());
         current = inode.parent;
     }
     Err(FuseError::Integrity)
@@ -5131,22 +4959,6 @@ fn decode_stored_event_at_key(key: &[u8], value: &[u8]) -> Result<StoredEvent, F
     Ok(event)
 }
 
-fn encode_inode(inode: &StoredInode) -> Result<Vec<u8>, FilesystemError> {
-    postcard::to_allocvec(inode).map_err(|_| FilesystemError::Database)
-}
-
-fn decode_inode(value: &[u8]) -> Result<StoredInode, FilesystemError> {
-    postcard::from_bytes(value).map_err(|_| FilesystemError::Integrity)
-}
-
-fn encode_directory_entry(entry: &StoredDirectoryEntry) -> Result<Vec<u8>, FilesystemError> {
-    postcard::to_allocvec(entry).map_err(|_| FilesystemError::Database)
-}
-
-fn decode_directory_entry(value: &[u8]) -> Result<StoredDirectoryEntry, FilesystemError> {
-    postcard::from_bytes(value).map_err(|_| FilesystemError::Integrity)
-}
-
 fn encode_branch(branch: &StoredBranch) -> Result<Vec<u8>, FilesystemError> {
     postcard::to_allocvec(branch).map_err(|_| FilesystemError::Database)
 }
@@ -5155,11 +4967,11 @@ fn decode_branch(value: &[u8]) -> Result<StoredBranch, FilesystemError> {
     postcard::from_bytes(value).map_err(|_| FilesystemError::Integrity)
 }
 
-fn encode_extent(extent: &StoredExtent) -> Result<Vec<u8>, FilesystemError> {
-    postcard::to_allocvec(extent).map_err(|_| FilesystemError::Database)
+fn encode_branch_root(root: &StoredBranchRoot) -> Result<Vec<u8>, FilesystemError> {
+    postcard::to_allocvec(root).map_err(|_| FilesystemError::Database)
 }
 
-fn decode_extent(value: &[u8]) -> Result<StoredExtent, FilesystemError> {
+fn decode_branch_root(value: &[u8]) -> Result<StoredBranchRoot, FilesystemError> {
     postcard::from_bytes(value).map_err(|_| FilesystemError::Integrity)
 }
 
@@ -5169,6 +4981,85 @@ fn encode_snapshot_metadata(metadata: &StoredSnapshotMetadata) -> Result<Vec<u8>
 
 fn decode_snapshot_metadata(value: &[u8]) -> Result<StoredSnapshotMetadata, FilesystemError> {
     postcard::from_bytes(value).map_err(|_| FilesystemError::Integrity)
+}
+
+fn encode_event_payload_manifest(
+    manifest: &StoredEventPayloadManifest,
+) -> Result<Vec<u8>, FilesystemError> {
+    postcard::to_allocvec(manifest).map_err(|_| FilesystemError::Database)
+}
+
+fn decode_event_payload_manifest(
+    value: &[u8],
+) -> Result<StoredEventPayloadManifest, FilesystemError> {
+    postcard::from_bytes(value).map_err(|_| FilesystemError::Integrity)
+}
+
+fn encode_content_manifest(extents: &[StoredExtent]) -> Result<Vec<u8>, FilesystemError> {
+    postcard::to_allocvec(extents).map_err(|_| FilesystemError::Database)
+}
+
+fn decode_content_manifest(value: &[u8]) -> Result<Vec<StoredExtent>, FilesystemError> {
+    postcard::from_bytes(value).map_err(|_| FilesystemError::Integrity)
+}
+
+fn content_manifest_identifier_for_bytes(bytes: &[u8]) -> Vec<u8> {
+    prefixed_blake3_identifier(CONTENT_MANIFEST_HASH_BLAKE3, bytes)
+}
+
+fn empty_content_manifest_identifier() -> Result<Vec<u8>, FilesystemError> {
+    encode_content_manifest(&[]).map(|bytes| content_manifest_identifier_for_bytes(&bytes))
+}
+
+fn validate_content_manifest(identifier: &[u8], bytes: &[u8]) -> Result<(), FilesystemError> {
+    ContentManifestIdentifier::from_bytes(identifier)?;
+    validate_prefixed_blake3_identifier(identifier, CONTENT_MANIFEST_HASH_BLAKE3, bytes)
+}
+
+fn encode_namespace_state(state: &MaterializedBranchState) -> Result<Vec<u8>, FilesystemError> {
+    postcard::to_allocvec(state).map_err(|_| FilesystemError::Database)
+}
+
+fn decode_namespace_state(value: &[u8]) -> Result<MaterializedBranchState, FilesystemError> {
+    postcard::from_bytes(value).map_err(|_| FilesystemError::Integrity)
+}
+
+fn namespace_identifier_for_bytes(bytes: &[u8]) -> Vec<u8> {
+    prefixed_blake3_identifier(NAMESPACE_HASH_BLAKE3, bytes)
+}
+
+fn validate_namespace(identifier: &[u8], bytes: &[u8]) -> Result<(), FilesystemError> {
+    NamespaceIdentifier::from_bytes(identifier)?;
+    validate_prefixed_blake3_identifier(identifier, NAMESPACE_HASH_BLAKE3, bytes)
+}
+
+fn prefixed_blake3_identifier(prefix: u8, bytes: &[u8]) -> Vec<u8> {
+    let mut identifier = Vec::with_capacity(33);
+    identifier.push(prefix);
+    identifier.extend_from_slice(blake3::hash(bytes).as_bytes());
+    identifier
+}
+
+fn validate_prefixed_blake3_identifier(
+    identifier: &[u8],
+    prefix: u8,
+    bytes: &[u8],
+) -> Result<(), FilesystemError> {
+    validate_prefixed_blake3_identifier_shape(identifier, prefix)?;
+    if &identifier[1..] != blake3::hash(bytes).as_bytes() {
+        return Err(FilesystemError::Integrity);
+    }
+    Ok(())
+}
+
+fn validate_prefixed_blake3_identifier_shape(
+    identifier: &[u8],
+    prefix: u8,
+) -> Result<(), FilesystemError> {
+    if identifier.len() != 33 || identifier.first() != Some(&prefix) {
+        return Err(FilesystemError::Integrity);
+    }
+    Ok(())
 }
 
 fn encode_u64(value: u64) -> [u8; 8] {
@@ -5196,38 +5087,6 @@ fn decode_branch_file_position_key(key: &[u8]) -> Result<(u64, u64, u64), Filesy
         decode_u64(&key[8..16])?,
         decode_u64(&key[16..])?,
     ))
-}
-
-fn encode_branch_inode_key(branch_identifier: u64, inode_number: u64) -> [u8; 16] {
-    let mut key = [0; 16];
-    key[..8].copy_from_slice(&branch_identifier.to_be_bytes());
-    key[8..].copy_from_slice(&inode_number.to_be_bytes());
-    key
-}
-
-fn encode_branch_parent_prefix(branch_identifier: u64, parent: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(16);
-    key.extend_from_slice(&encode_u64(branch_identifier));
-    key.extend_from_slice(&encode_u64(parent));
-    key
-}
-
-fn encode_directory_entry_key(branch_identifier: u64, parent: u64, name: &[u8]) -> Vec<u8> {
-    let mut key = encode_branch_parent_prefix(branch_identifier, parent);
-    key.extend_from_slice(name);
-    key
-}
-
-fn encode_extended_attribute_key(
-    branch_identifier: u64,
-    inode_number: u64,
-    name: &[u8],
-) -> Vec<u8> {
-    let mut key = Vec::with_capacity(16 + name.len());
-    key.extend_from_slice(&encode_u64(branch_identifier));
-    key.extend_from_slice(&encode_u64(inode_number));
-    key.extend_from_slice(name);
-    key
 }
 
 fn encode_file_sequence_key(file_identifier: u64, event_sequence: u64) -> [u8; 16] {
@@ -5263,79 +5122,27 @@ fn encode_branch_file_position_key(
     key
 }
 
-fn encode_current_file_prefix(branch_identifier: u64, file_identifier: u64) -> Vec<u8> {
-    encode_branch_file_prefix(branch_identifier, file_identifier)
-}
-
-fn encode_current_file_extent_key(
-    branch_identifier: u64,
-    file_identifier: u64,
-    logical_offset: u64,
-) -> [u8; 24] {
-    encode_branch_file_position_key(branch_identifier, file_identifier, logical_offset)
-}
-
 fn encode_snapshot_file_prefix(branch_identifier: u64, file_identifier: u64) -> Vec<u8> {
     encode_branch_file_prefix(branch_identifier, file_identifier)
 }
 
-fn encode_snapshot_extent_prefix(
+fn encode_file_snapshot_manifest_key(
     branch_identifier: u64,
     file_identifier: u64,
     ordinal: u64,
-) -> Vec<u8> {
-    let mut key = Vec::with_capacity(24);
-    key.extend_from_slice(&encode_u64(branch_identifier));
-    key.extend_from_slice(&encode_u64(file_identifier));
-    key.extend_from_slice(&encode_u64(ordinal));
-    key
+) -> [u8; 24] {
+    encode_branch_file_position_key(branch_identifier, file_identifier, ordinal)
 }
 
-fn encode_snapshot_extent_key(
-    branch_identifier: u64,
-    file_identifier: u64,
-    ordinal: u64,
-    logical_offset: u64,
-) -> [u8; 32] {
-    let mut key = [0; 32];
-    key[..8].copy_from_slice(&branch_identifier.to_be_bytes());
-    key[8..16].copy_from_slice(&file_identifier.to_be_bytes());
-    key[16..24].copy_from_slice(&ordinal.to_be_bytes());
-    key[24..].copy_from_slice(&logical_offset.to_be_bytes());
-    key
+fn decode_file_snapshot_manifest_key(key: &[u8]) -> Result<(u64, u64, u64), FilesystemError> {
+    decode_branch_file_position_key(key)
 }
 
-fn encode_event_payload_extent_prefix(event_sequence: u64, part: u8) -> Vec<u8> {
-    let mut key = Vec::with_capacity(9);
-    key.extend_from_slice(&encode_u64(event_sequence));
-    key.push(part);
-    key
-}
-
-fn encode_event_payload_extent_key(event_sequence: u64, part: u8, logical_offset: u64) -> [u8; 17] {
-    let mut key = [0; 17];
+fn encode_event_payload_manifest_key(event_sequence: u64, part: u8) -> [u8; 9] {
+    let mut key = [0; 9];
     key[..8].copy_from_slice(&event_sequence.to_be_bytes());
     key[8] = part;
-    key[9..].copy_from_slice(&logical_offset.to_be_bytes());
     key
-}
-
-fn decode_extent_offset_from_current_key(key: &[u8]) -> Result<u64, FilesystemError> {
-    if key.len() != 24 {
-        return Err(FilesystemError::Integrity);
-    }
-    decode_u64(&key[16..])
-}
-
-fn decode_snapshot_ordinal_and_offset(key: &[u8]) -> Result<(u64, u64), FilesystemError> {
-    if key.len() != 32 {
-        return Err(FilesystemError::Integrity);
-    }
-    Ok((decode_u64(&key[16..24])?, decode_u64(&key[24..])?))
-}
-
-fn is_snapshot_metadata_key(key: &[u8]) -> Result<bool, FilesystemError> {
-    Ok(key.len() == 32 && decode_u64(&key[24..])? == u64::MAX)
 }
 
 fn branch_record_from_stored(stored: StoredBranch) -> Result<BranchRecord, FilesystemError> {
@@ -6057,7 +5864,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_branch_event_indexes_are_rejected_during_branch_materialization() {
+    fn corrupt_branch_roots_are_rejected_during_branch_creation() {
         let temporary = tempfile::tempdir().expect("temporary directory is created");
         let storage =
             open_database_path(&temporary.path().join("database")).expect("storage opens");
@@ -6073,22 +5880,26 @@ mod tests {
             .expect("file is created");
         let main = storage.current_branch().expect("main branch is returned");
 
+        let mut root = storage
+            .branch_root_at_position(main.head_position())
+            .expect("main branch root is readable");
+        root.sequence = EVENT_SEQUENCE_INITIAL.get();
         let mut batch = WriteBatch::default();
         batch.put_cf(
             storage
-                .branch_events()
-                .expect("branch events column family exists"),
+                .branch_roots()
+                .expect("branch roots column family exists"),
             encode_branch_position_key(
                 main.branch_identifier().get(),
                 main.head_position().ordinal(),
             ),
-            encode_u64(EVENT_SEQUENCE_INITIAL.get()),
+            encode_branch_root(&root).expect("corrupt branch root encodes"),
         );
-        write_batch(storage.database(), batch).expect("corrupt branch event index is written");
+        write_batch(storage.database(), batch).expect("corrupt branch root is written");
 
         assert!(matches!(
             storage.create_branch(
-                &BranchName::new("corrupt-materialization").expect("branch name is valid"),
+                &BranchName::new("corrupt-root").expect("branch name is valid"),
                 main.head_position(),
             ),
             Err(FilesystemError::Integrity)
@@ -6670,6 +6481,53 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(kinds.contains(&EventKind::ExtendedAttributeSet));
         assert!(kinds.contains(&EventKind::ExtendedAttributeRemoved));
+    }
+
+    #[test]
+    fn branch_creation_copies_namespace_root_without_duplicating_manifest_storage() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let inode_number = create_regular_file(&storage, "root-copy");
+        storage
+            .write_file(
+                inode_number,
+                0,
+                b"shared-by-root",
+                current_uid(),
+                current_gid(),
+            )
+            .expect("file is written");
+        let main = storage.current_branch().expect("main branch is readable");
+        let source_root = storage
+            .branch_root_at_position(main.head_position())
+            .expect("main branch root is readable");
+        let before = RootStorageCounts::capture(&storage);
+
+        let branch_name = BranchName::new("root-copy").expect("branch name is valid");
+        let branch = storage
+            .create_branch(&branch_name, main.head_position())
+            .expect("branch is created from the root");
+        let branch_root = storage
+            .branch_root_at_position(branch.head_position())
+            .expect("new branch root is readable");
+
+        assert_eq!(branch_root.sequence, source_root.sequence);
+        assert_eq!(
+            branch_root.namespace_identifier,
+            source_root.namespace_identifier
+        );
+        assert_eq!(RootStorageCounts::capture(&storage), before);
+
+        storage
+            .switch_branch(&branch_name)
+            .expect("new branch is active");
+        assert_eq!(
+            storage
+                .read_file(inode_number, 0, 32, current_uid(), current_gid())
+                .expect("file bytes are readable through copied root"),
+            b"shared-by-root"
+        );
     }
 
     #[test]
@@ -8809,11 +8667,54 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct RootStorageCounts {
+        content_chunks: usize,
+        content_manifest_nodes: usize,
+        namespace_nodes: usize,
+        file_snapshot_manifests: usize,
+    }
+
+    impl RootStorageCounts {
+        fn capture(storage: &Storage) -> Self {
+            Self {
+                content_chunks: count_column_family(
+                    storage,
+                    storage
+                        .content_chunks()
+                        .expect("content chunks column family exists"),
+                ),
+                content_manifest_nodes: count_column_family(
+                    storage,
+                    storage
+                        .content_manifest_nodes()
+                        .expect("content manifest nodes column family exists"),
+                ),
+                namespace_nodes: count_column_family(
+                    storage,
+                    storage
+                        .namespace_nodes()
+                        .expect("namespace nodes column family exists"),
+                ),
+                file_snapshot_manifests: count_column_family(
+                    storage,
+                    storage
+                        .file_snapshot_manifests()
+                        .expect("file snapshot manifests column family exists"),
+                ),
+            }
+        }
+    }
+
     fn count_content_chunks(storage: &Storage) -> usize {
         let content_chunks = storage
             .content_chunks()
             .expect("content chunks column family exists");
-        let mut iterator = storage.database().raw_iterator_cf(content_chunks);
+        count_column_family(storage, content_chunks)
+    }
+
+    fn count_column_family(storage: &Storage, column_family: &ColumnFamily) -> usize {
+        let mut iterator = storage.database().raw_iterator_cf(column_family);
         let mut count = 0;
 
         iterator.seek_to_first();
@@ -8821,7 +8722,7 @@ mod tests {
             count += 1;
             iterator.next();
         }
-        iterator.status().expect("content chunk iterator is valid");
+        iterator.status().expect("column family iterator is valid");
         count
     }
 
