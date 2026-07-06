@@ -7,6 +7,7 @@
 - eventfs MUST support local incremental backup creation, local backup import, paginated event listing, branch-aware per-file event listing, persisted file snapshots, branch switching, and the mounted FUSE operations defined in this specification.
 - eventfs MUST include a Linux-only Criterion benchmark comparing supported mounted FUSE operation speed against the current host's normal filesystem.
 - eventfs MUST NOT expose built-in file diff rendering APIs.
+- The eventfs library target source MUST compile with Rust `unsafe_code` forbidden.
 - eventfs MAY include `examples/hello_world.rs` as a non-contract example that mounts the filesystem, writes and reads one file, and lists events.
 - eventfs MAY include `examples/file_diff.rs` as a non-contract example that computes a diff outside the library from public snapshot and payload range APIs.
 - eventfs MAY include `examples/branching.rs` as a non-contract example that creates, switches, and reads independent branches.

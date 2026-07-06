@@ -20,6 +20,7 @@ fastcdc = { version = "4", default-features = false }
 libc = "0.2"
 rocksdb = "0.24"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
+rustix = { version = "1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 time = { version = "0.3", features = ["serde"] }

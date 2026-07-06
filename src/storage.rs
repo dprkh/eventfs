@@ -1,9 +1,8 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::mem::MaybeUninit;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -4325,11 +4324,11 @@ fn setgid_mode_bit() -> u16 {
 }
 
 fn current_effective_uid() -> u32 {
-    unsafe { libc::geteuid() }
+    rustix::process::geteuid().as_raw()
 }
 
 fn current_effective_gid() -> u32 {
-    unsafe { libc::getegid() }
+    rustix::process::getegid().as_raw()
 }
 
 fn special_kind_from_mode(mode: u32) -> FuseResult<StoredNodeKind> {
@@ -4400,17 +4399,11 @@ fn validate_extended_attribute_value(value: &[u8]) -> FuseResult<()> {
 }
 
 fn backing_filesystem_statistics(path: &Path) -> FuseResult<BackingFileSystemStatistics> {
-    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| FuseError::Database)?;
-    let mut statistics = MaybeUninit::<libc::statvfs>::uninit();
-    let result = unsafe { libc::statvfs(path.as_ptr(), statistics.as_mut_ptr()) };
-    if result != 0 {
-        return Err(FuseError::Database);
-    }
-    let statistics = unsafe { statistics.assume_init() };
+    let statistics = rustix::fs::statvfs(path).map_err(|_| FuseError::Database)?;
     Ok(BackingFileSystemStatistics {
-        blocks: statistics.f_blocks as u64,
-        free_blocks: statistics.f_bfree as u64,
-        available_blocks: statistics.f_bavail as u64,
+        blocks: statistics.f_blocks,
+        free_blocks: statistics.f_bfree,
+        available_blocks: statistics.f_bavail,
         fragment_size: u32::try_from(statistics.f_frsize).map_err(|_| FuseError::Database)?,
     })
 }
