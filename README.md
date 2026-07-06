@@ -32,26 +32,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+# FUSE operation support
+
+| Operation | Supported |
+| --- | --- |
+| `lookup` | [x] |
+| `getattr` | [x] |
+| `setattr` | [ ] |
+| `readlink` | [x] |
+| `mknod` | [x] |
+| `mkdir` | [x] |
+| `unlink` | [x] |
+| `rmdir` | [x] |
+| `symlink` | [x] |
+| `rename` | [x] |
+| `link` | [x] |
+| `open` | [x] |
+| `read` | [x] |
+| `write` | [x] |
+| `flush` | [x] |
+| `release` | [x] |
+| `fsync` | [x] |
+| `opendir` | [x] |
+| `readdir` | [x] |
+| `releasedir` | [x] |
+| `fsyncdir` | [x] |
+| `statfs` | [x] |
+| `setxattr` | [x] |
+| `getxattr` | [x] |
+| `listxattr` | [x] |
+| `removexattr` | [x] |
+| `access` | [x] |
+| `create` | [x] |
+| `readdirplus` | [x] |
+| `getlk` | [x] |
+| `setlk` | [x] |
+| `bmap` | [x] |
+| `ioctl` | [x] |
+| `poll` | [x] |
+| `fallocate` | [x] |
+| `lseek` | [x] |
+| `copy_file_range` | [x] |
+| `setvolname` | [x] |
+| `exchange` | [x] |
+| `getxtimes` | [x] |
+
 # Benchmarks
-
-FUSE operation benchmarks compare eventfs against a sibling directory on the
-host's normal filesystem. These results were measured on July 6, 2026 with the
-`fuse_operations` Criterion benchmark, cross-compiled locally for
-`x86_64-unknown-linux-gnu` with the bench profile, fat LTO, and one codegen
-unit, then run on the benchmark host with `./fuse_operations --bench --noplot`.
-
-Benchmark host:
 
 - DigitalOcean `c-2` CPU-Optimized droplet in `sfo2`
 - 2 Intel vCPUs, 3.8 GiB RAM, no swap, 25 GB disk
 - Intel(R) Xeon(R) Platinum 8358 CPU @ 2.60GHz
 - Ubuntu 24.04 x64, Linux 6.8.0-124-generic
-- Root and benchmark temporary directories on `/dev/vda1` ext4
 - FUSE 3.14.0
-- Benchmark binary SHA-256:
-  `332f0070c9e24f6053d6cd27c7208c8ca8a408affb8785271b47177de06b6c4c`
-
-Criterion reports mean time per operation:
 
 | Operation | eventfs mean | host mean | eventfs / host |
 | --- | ---: | ---: | ---: |
