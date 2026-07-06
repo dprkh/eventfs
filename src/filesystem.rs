@@ -6,7 +6,7 @@ use std::num::NonZeroU64;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,6 @@ pub struct Filesystem {
     database_directory: PathBuf,
     storage: Arc<Storage>,
     mount_state: Arc<Mutex<MountState>>,
-    lock_table: Arc<(Mutex<LockTable>, Condvar)>,
     handle_table: Arc<Mutex<HandleTable>>,
     next_handle: Arc<AtomicU64>,
 }
@@ -671,6 +670,8 @@ pub enum EventKind {
     FileCreated,
     /// Regular file write event.
     FileWritten,
+    /// Inode metadata change event.
+    MetadataChanged,
     /// Node unlink event.
     NodeUnlinked,
     /// Directory removal event.
@@ -685,8 +686,6 @@ pub enum EventKind {
     ExtendedAttributeSet,
     /// Extended attribute removal event.
     ExtendedAttributeRemoved,
-    /// Regular file range zeroing event.
-    FileRangeZeroed,
     /// Regular file contents exchange event.
     FileContentsExchanged,
     /// Volume rename event.
@@ -777,9 +776,7 @@ impl EventRecord {
     pub fn old_file_size(&self) -> Option<u64> {
         match &self.payload {
             EventPayload::FileWrite { old_file_size, .. } => Some(*old_file_size),
-            EventPayload::None
-            | EventPayload::FileSizeChange { .. }
-            | EventPayload::FileExchange { .. } => None,
+            EventPayload::None | EventPayload::FileExchange { .. } => None,
         }
     }
 
@@ -787,9 +784,7 @@ impl EventRecord {
     pub fn new_file_size(&self) -> Option<u64> {
         match &self.payload {
             EventPayload::FileWrite { new_file_size, .. } => Some(*new_file_size),
-            EventPayload::None
-            | EventPayload::FileSizeChange { .. }
-            | EventPayload::FileExchange { .. } => None,
+            EventPayload::None | EventPayload::FileExchange { .. } => None,
         }
     }
 
@@ -800,9 +795,7 @@ impl EventRecord {
                 overwritten_byte_length,
                 ..
             } => Some(*overwritten_byte_length),
-            EventPayload::None
-            | EventPayload::FileSizeChange { .. }
-            | EventPayload::FileExchange { .. } => None,
+            EventPayload::None | EventPayload::FileExchange { .. } => None,
         }
     }
 
@@ -813,9 +806,7 @@ impl EventRecord {
                 written_byte_length,
                 ..
             } => Some(*written_byte_length),
-            EventPayload::None
-            | EventPayload::FileSizeChange { .. }
-            | EventPayload::FileExchange { .. } => None,
+            EventPayload::None | EventPayload::FileExchange { .. } => None,
         }
     }
 }
@@ -1184,7 +1175,7 @@ impl EventRecord {
         byte_length: Option<u64>,
     ) -> Self {
         Self {
-            schema_version: 9,
+            schema_version: 10,
             sequence,
             kind,
             created_at,
@@ -1294,10 +1285,6 @@ pub(crate) enum EventPayload {
         overwritten_byte_length: u64,
         written_byte_length: u64,
     },
-    FileSizeChange {
-        old_file_size: u64,
-        new_file_size: u64,
-    },
     FileExchange {
         primary_file_size: u64,
         secondary_file_size: u64,
@@ -1349,8 +1336,7 @@ impl fuser::Filesystem for Filesystem {
         config: &mut fuser::KernelConfig,
     ) -> std::io::Result<()> {
         trace_fuse_operation("init");
-        let capabilities =
-            fuser::InitFlags::FUSE_POSIX_LOCKS | fuser::InitFlags::FUSE_DO_READDIRPLUS;
+        let capabilities = fuser::InitFlags::FUSE_DO_READDIRPLUS;
         #[cfg(target_os = "macos")]
         let capabilities = capabilities
             | fuser::InitFlags::FUSE_ALLOCATE
@@ -1399,24 +1385,40 @@ impl fuser::Filesystem for Filesystem {
 
     fn setattr(
         &self,
-        _req: &fuser::Request,
-        _ino: fuser::INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        _size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
-        _ctime: Option<SystemTime>,
+        req: &fuser::Request,
+        ino: fuser::INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        ctime: Option<SystemTime>,
         _fh: Option<fuser::FileHandle>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        _flags: Option<fuser::BsdFileFlags>,
+        crtime: Option<SystemTime>,
+        chgtime: Option<SystemTime>,
+        bkuptime: Option<SystemTime>,
+        flags: Option<fuser::BsdFileFlags>,
         reply: fuser::ReplyAttr,
     ) {
         trace_fuse_operation("setattr");
-        reply.error(self.unsupported_fuse_error("setattr"));
+        if unsupported_setattr_fields_present(
+            size, atime, mtime, ctime, crtime, chgtime, bkuptime, flags,
+        ) {
+            reply.error(self.unsupported_fuse_error("setattr"));
+            return;
+        }
+        let metadata = storage::SetattrMetadata {
+            request_uid: req.uid(),
+            request_gid: req.gid(),
+            mode,
+            uid,
+            gid,
+        };
+        match self.storage.setattr_metadata(ino.into(), metadata) {
+            Ok(entry) => reply.attr(&entry.ttl, &entry.attr),
+            Err(error) => reply.error(self.fuse_error("setattr", error)),
+        }
     }
 
     fn readlink(&self, _req: &fuser::Request, ino: fuser::INodeNo, reply: fuser::ReplyData) {
@@ -1429,21 +1431,22 @@ impl fuser::Filesystem for Filesystem {
 
     fn mknod(
         &self,
-        _req: &fuser::Request,
+        req: &fuser::Request,
         parent: fuser::INodeNo,
         name: &OsStr,
         mode: u32,
-        _umask: u32,
+        umask: u32,
         rdev: u32,
         reply: fuser::ReplyEntry,
     ) {
         trace_fuse_operation("mknod");
         let result = self
             .storage
-            .create_node(
+            .create_node_with_metadata(
                 parent.into(),
                 name,
                 storage::CreateNodeKind::Special { mode, rdev },
+                create_node_metadata(req, mode, umask),
             )
             .and_then(|entry| {
                 self.synchronize_if_needed(self.directory_synchronization_required())?;
@@ -1457,17 +1460,22 @@ impl fuser::Filesystem for Filesystem {
 
     fn mkdir(
         &self,
-        _req: &fuser::Request,
+        req: &fuser::Request,
         parent: fuser::INodeNo,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         reply: fuser::ReplyEntry,
     ) {
         trace_fuse_operation("mkdir");
         let result = self
             .storage
-            .create_node(parent.into(), name, storage::CreateNodeKind::Directory)
+            .create_node_with_metadata(
+                parent.into(),
+                name,
+                storage::CreateNodeKind::Directory,
+                create_node_metadata(req, mode, umask),
+            )
             .and_then(|entry| {
                 self.synchronize_if_needed(self.directory_synchronization_required())?;
                 Ok(entry)
@@ -1516,7 +1524,7 @@ impl fuser::Filesystem for Filesystem {
 
     fn symlink(
         &self,
-        _req: &fuser::Request,
+        req: &fuser::Request,
         parent: fuser::INodeNo,
         link_name: &OsStr,
         target: &Path,
@@ -1525,7 +1533,17 @@ impl fuser::Filesystem for Filesystem {
         trace_fuse_operation("symlink");
         let result = self
             .storage
-            .create_symlink(parent.into(), link_name, target)
+            .create_symlink_with_metadata(
+                parent.into(),
+                link_name,
+                target,
+                storage::CreateNodeMetadata {
+                    uid: req.uid(),
+                    gid: req.gid(),
+                    mode: 0o777,
+                    umask: 0,
+                },
+            )
             .and_then(|entry| {
                 self.synchronize_if_needed(self.directory_synchronization_required())?;
                 Ok(entry)
@@ -1623,7 +1641,7 @@ impl fuser::Filesystem for Filesystem {
         fh: fuser::FileHandle,
         offset: u64,
         data: &[u8],
-        _write_flags: fuser::WriteFlags,
+        write_flags: fuser::WriteFlags,
         flags: fuser::OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         reply: fuser::ReplyWrite,
@@ -1631,7 +1649,12 @@ impl fuser::Filesystem for Filesystem {
         trace_fuse_operation("write");
         let result = self
             .storage
-            .write_file(ino.into(), offset, data)
+            .write_file_with_metadata(
+                ino.into(),
+                offset,
+                data,
+                write_flags.contains(fuser::WriteFlags::FUSE_WRITE_KILL_SUIDGID),
+            )
             .and_then(|write| {
                 self.synchronize_if_needed(self.write_synchronization_required(fh, flags))?;
                 Ok(write)
@@ -1647,11 +1670,10 @@ impl fuser::Filesystem for Filesystem {
         _req: &fuser::Request,
         _ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
-        lock_owner: fuser::LockOwner,
+        _lock_owner: fuser::LockOwner,
         reply: fuser::ReplyEmpty,
     ) {
         trace_fuse_operation("flush");
-        self.clear_file_locks_for_owner(lock_owner);
         reply.ok();
     }
 
@@ -1661,14 +1683,11 @@ impl fuser::Filesystem for Filesystem {
         _ino: fuser::INodeNo,
         fh: fuser::FileHandle,
         _flags: fuser::OpenFlags,
-        lock_owner: Option<fuser::LockOwner>,
+        _lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
         trace_fuse_operation("release");
-        if let Some(lock_owner) = lock_owner {
-            self.clear_file_locks_for_owner(lock_owner);
-        }
         self.forget_open_handle(fh);
         reply.ok();
     }
@@ -1848,13 +1867,13 @@ impl fuser::Filesystem for Filesystem {
 
     fn access(
         &self,
-        _req: &fuser::Request,
+        req: &fuser::Request,
         ino: fuser::INodeNo,
-        _mask: fuser::AccessFlags,
+        mask: fuser::AccessFlags,
         reply: fuser::ReplyEmpty,
     ) {
         trace_fuse_operation("access");
-        match self.storage.access(ino.into()) {
+        match self.storage.access(ino.into(), req.uid(), req.gid(), mask) {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(self.fuse_error("access", error)),
         }
@@ -1862,18 +1881,23 @@ impl fuser::Filesystem for Filesystem {
 
     fn create(
         &self,
-        _req: &fuser::Request,
+        req: &fuser::Request,
         parent: fuser::INodeNo,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         _flags: i32,
         reply: fuser::ReplyCreate,
     ) {
         trace_fuse_operation("create");
         let result = self
             .storage
-            .create_node(parent.into(), name, storage::CreateNodeKind::RegularFile)
+            .create_node_with_metadata(
+                parent.into(),
+                name,
+                storage::CreateNodeKind::RegularFile,
+                create_node_metadata(req, mode, umask),
+            )
             .and_then(|entry| {
                 self.synchronize_if_needed(self.directory_synchronization_required())?;
                 Ok(entry)
@@ -1921,77 +1945,52 @@ impl fuser::Filesystem for Filesystem {
     fn getlk(
         &self,
         _req: &fuser::Request,
-        ino: fuser::INodeNo,
+        _ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
-        lock_owner: fuser::LockOwner,
-        start: u64,
-        end: u64,
-        typ: i32,
-        pid: u32,
+        _lock_owner: fuser::LockOwner,
+        _start: u64,
+        _end: u64,
+        _typ: i32,
+        _pid: u32,
         reply: fuser::ReplyLock,
     ) {
         trace_fuse_operation("getlk");
-        match lock_type(typ).and_then(|typ| {
-            self.storage.bmap(ino.into())?;
-            let requested = FileLock {
-                inode: ino.into(),
-                owner: lock_owner.0,
-                start,
-                end,
-                typ,
-                pid,
-            };
-            let (lock_table, _condition) = &*self.lock_table;
-            let table = lock_table
-                .lock()
-                .map_err(|_| storage::FuseError::Errno(fuser::Errno::EIO))?;
-            Ok(table.conflicting_lock(requested))
-        }) {
-            Ok(Some(lock)) => reply.locked(lock.start, lock.end, lock.typ, lock.pid),
-            Ok(None) => reply.locked(start, end, libc::F_UNLCK as i32, pid),
-            Err(error) => reply.error(self.fuse_error("getlk", error)),
-        }
+        reply.error(self.unsupported_fuse_error("getlk"));
     }
 
     fn setlk(
         &self,
         _req: &fuser::Request,
-        ino: fuser::INodeNo,
+        _ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
-        lock_owner: fuser::LockOwner,
-        start: u64,
-        end: u64,
-        typ: i32,
-        pid: u32,
-        sleep: bool,
+        _lock_owner: fuser::LockOwner,
+        _start: u64,
+        _end: u64,
+        _typ: i32,
+        _pid: u32,
+        _sleep: bool,
         reply: fuser::ReplyEmpty,
     ) {
         trace_fuse_operation("setlk");
-        match self.set_file_lock(ino.into(), lock_owner, start, end, typ, pid, sleep) {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(self.fuse_error("setlk", error)),
-        }
+        reply.error(self.unsupported_fuse_error("setlk"));
     }
 
     fn bmap(
         &self,
         _req: &fuser::Request,
-        ino: fuser::INodeNo,
+        _ino: fuser::INodeNo,
         _blocksize: u32,
-        idx: u64,
+        _idx: u64,
         reply: fuser::ReplyBmap,
     ) {
         trace_fuse_operation("bmap");
-        match self.storage.bmap(ino.into()) {
-            Ok(()) => reply.bmap(idx),
-            Err(error) => reply.error(self.fuse_error("bmap", error)),
-        }
+        reply.error(self.unsupported_fuse_error("bmap"));
     }
 
     fn ioctl(
         &self,
         _req: &fuser::Request,
-        ino: fuser::INodeNo,
+        _ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
         _flags: fuser::IoctlFlags,
         _cmd: u32,
@@ -2000,103 +1999,65 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyIoctl,
     ) {
         trace_fuse_operation("ioctl");
-        match self.storage.bmap(ino.into()) {
-            Ok(()) => reply
-                .error(self.fuse_error("ioctl", storage::FuseError::Errno(fuser::Errno::ENOTTY))),
-            Err(error) => reply.error(self.fuse_error("ioctl", error)),
-        }
+        reply.error(self.unsupported_fuse_error("ioctl"));
     }
 
     fn poll(
         &self,
         _req: &fuser::Request,
-        ino: fuser::INodeNo,
+        _ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
         _ph: fuser::PollNotifier,
-        events: fuser::PollEvents,
+        _events: fuser::PollEvents,
         _flags: fuser::PollFlags,
         reply: fuser::ReplyPoll,
     ) {
         trace_fuse_operation("poll");
-        match self.storage.poll(ino.into(), events) {
-            Ok(ready) => reply.poll(ready),
-            Err(error) => reply.error(self.fuse_error("poll", error)),
-        }
+        reply.error(self.unsupported_fuse_error("poll"));
     }
 
     fn fallocate(
         &self,
         _req: &fuser::Request,
-        ino: fuser::INodeNo,
+        _ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
-        offset: u64,
-        length: u64,
-        mode: i32,
+        _offset: u64,
+        _length: u64,
+        _mode: i32,
         reply: fuser::ReplyEmpty,
     ) {
         trace_fuse_operation("fallocate");
-        let result = self
-            .storage
-            .fallocate(ino.into(), offset, length, mode)
-            .and_then(|()| {
-                self.synchronize_if_needed(
-                    self.mount_synchronization_required()
-                        || self.handle_synchronization_required(_fh),
-                )
-            });
-        match result {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(self.fuse_error("fallocate", error)),
-        }
+        reply.error(self.unsupported_fuse_error("fallocate"));
     }
 
     fn lseek(
         &self,
         _req: &fuser::Request,
-        ino: fuser::INodeNo,
+        _ino: fuser::INodeNo,
         _fh: fuser::FileHandle,
-        offset: i64,
-        whence: i32,
+        _offset: i64,
+        _whence: i32,
         reply: fuser::ReplyLseek,
     ) {
         trace_fuse_operation("lseek");
-        match self.storage.lseek(ino.into(), offset, whence) {
-            Ok(offset) => reply.offset(offset),
-            Err(error) => reply.error(self.fuse_error("lseek", error)),
-        }
+        reply.error(self.unsupported_fuse_error("lseek"));
     }
 
     fn copy_file_range(
         &self,
         _req: &fuser::Request,
-        ino_in: fuser::INodeNo,
+        _ino_in: fuser::INodeNo,
         _fh_in: fuser::FileHandle,
-        offset_in: u64,
-        ino_out: fuser::INodeNo,
+        _offset_in: u64,
+        _ino_out: fuser::INodeNo,
         _fh_out: fuser::FileHandle,
-        offset_out: u64,
-        len: u64,
-        flags: fuser::CopyFileRangeFlags,
+        _offset_out: u64,
+        _len: u64,
+        _flags: fuser::CopyFileRangeFlags,
         reply: fuser::ReplyWrite,
     ) {
         trace_fuse_operation("copy_file_range");
-        let result = if flags.is_empty() {
-            self.storage
-                .copy_file_range(ino_in.into(), offset_in, ino_out.into(), offset_out, len)
-                .and_then(|write| {
-                    self.synchronize_if_needed(
-                        self.mount_synchronization_required()
-                            || self.handle_synchronization_required(_fh_out),
-                    )?;
-                    Ok(write)
-                })
-        } else {
-            Err(storage::FuseError::Errno(fuser::Errno::EINVAL))
-        };
-        match result {
-            Ok(write) => reply.written(write.written),
-            Err(error) => reply.error(self.fuse_error("copy_file_range", error)),
-        }
+        reply.error(self.unsupported_fuse_error("copy_file_range"));
     }
 
     #[cfg(target_os = "macos")]
@@ -2165,6 +2126,39 @@ fn rename_mode(flags: fuser::RenameFlags) -> Result<bool, storage::FuseError> {
     }
 }
 
+fn create_node_metadata(
+    request: &fuser::Request,
+    mode: u32,
+    umask: u32,
+) -> storage::CreateNodeMetadata {
+    storage::CreateNodeMetadata {
+        uid: request.uid(),
+        gid: request.gid(),
+        mode,
+        umask,
+    }
+}
+
+fn unsupported_setattr_fields_present(
+    size: Option<u64>,
+    atime: Option<fuser::TimeOrNow>,
+    mtime: Option<fuser::TimeOrNow>,
+    ctime: Option<SystemTime>,
+    crtime: Option<SystemTime>,
+    chgtime: Option<SystemTime>,
+    bkuptime: Option<SystemTime>,
+    flags: Option<fuser::BsdFileFlags>,
+) -> bool {
+    size.is_some()
+        || atime.is_some()
+        || mtime.is_some()
+        || ctime.is_some()
+        || crtime.is_some()
+        || chgtime.is_some()
+        || bkuptime.is_some()
+        || flags.is_some()
+}
+
 fn reply_xattr_bytes(
     reply: fuser::ReplyXattr,
     operation: &'static str,
@@ -2187,14 +2181,6 @@ fn reply_xattr_bytes(
         );
     } else {
         reply.data(bytes);
-    }
-}
-
-fn lock_type(typ: i32) -> Result<i32, storage::FuseError> {
-    if typ == libc::F_RDLCK as i32 || typ == libc::F_WRLCK as i32 || typ == libc::F_UNLCK as i32 {
-        Ok(typ)
-    } else {
-        Err(storage::FuseError::Errno(fuser::Errno::EINVAL))
     }
 }
 
@@ -2305,53 +2291,6 @@ impl Filesystem {
         }
     }
 
-    fn set_file_lock(
-        &self,
-        inode: u64,
-        lock_owner: fuser::LockOwner,
-        start: u64,
-        end: u64,
-        typ: i32,
-        pid: u32,
-        sleep: bool,
-    ) -> Result<(), storage::FuseError> {
-        let typ = lock_type(typ)?;
-        self.storage.bmap(inode)?;
-        let requested = FileLock {
-            inode,
-            owner: lock_owner.0,
-            start,
-            end,
-            typ,
-            pid,
-        };
-        let (lock_table, condition) = &*self.lock_table;
-        let mut table = lock_table
-            .lock()
-            .map_err(|_| storage::FuseError::Errno(fuser::Errno::EIO))?;
-        loop {
-            if typ == libc::F_UNLCK as i32 || table.conflicting_lock(requested).is_none() {
-                table.set_lock(requested);
-                condition.notify_all();
-                return Ok(());
-            }
-            if !sleep {
-                return Err(storage::FuseError::Errno(fuser::Errno::EAGAIN));
-            }
-            table = condition
-                .wait(table)
-                .map_err(|_| storage::FuseError::Errno(fuser::Errno::EIO))?;
-        }
-    }
-
-    fn clear_file_locks_for_owner(&self, owner: fuser::LockOwner) {
-        let (lock_table, condition) = &*self.lock_table;
-        if let Ok(mut table) = lock_table.lock() {
-            table.clear_owner(owner.0);
-            condition.notify_all();
-        }
-    }
-
     fn notify_fuse_error(&self, operation: &'static str, errno: fuser::Errno, unsupported: bool) {
         if let Some(callback) = self.configuration.fuse_error_callback() {
             let error = new_fuse_operation_error(operation, errno, unsupported);
@@ -2410,88 +2349,6 @@ struct OpenHandle {
     flags: fuser::OpenFlags,
 }
 
-#[derive(Debug, Default)]
-struct LockTable {
-    locks: Vec<FileLock>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileLock {
-    inode: u64,
-    owner: u64,
-    start: u64,
-    end: u64,
-    typ: i32,
-    pid: u32,
-}
-
-impl LockTable {
-    fn conflicting_lock(&self, requested: FileLock) -> Option<FileLock> {
-        self.locks.iter().copied().find(|existing| {
-            existing.inode == requested.inode
-                && existing.owner != requested.owner
-                && lock_ranges_overlap(*existing, requested)
-                && (existing.typ == libc::F_WRLCK as i32 || requested.typ == libc::F_WRLCK as i32)
-        })
-    }
-
-    fn set_lock(&mut self, requested: FileLock) {
-        self.remove_owner_range(
-            requested.inode,
-            requested.owner,
-            requested.start,
-            requested.end,
-        );
-        if requested.typ != libc::F_UNLCK as i32 {
-            self.locks.push(requested);
-        }
-    }
-
-    fn clear_owner(&mut self, owner: u64) {
-        self.locks.retain(|lock| lock.owner != owner);
-    }
-
-    fn remove_owner_range(&mut self, inode: u64, owner: u64, start: u64, end: u64) {
-        let mut retained = Vec::with_capacity(self.locks.len());
-        for lock in self.locks.drain(..) {
-            if lock.inode != inode
-                || lock.owner != owner
-                || !lock_ranges_overlap(
-                    lock,
-                    FileLock {
-                        inode,
-                        owner,
-                        start,
-                        end,
-                        typ: lock.typ,
-                        pid: lock.pid,
-                    },
-                )
-            {
-                retained.push(lock);
-                continue;
-            }
-            if lock.start < start {
-                retained.push(FileLock {
-                    end: start.saturating_sub(1),
-                    ..lock
-                });
-            }
-            if lock.end > end {
-                retained.push(FileLock {
-                    start: end.saturating_add(1),
-                    ..lock
-                });
-            }
-        }
-        self.locks = retained;
-    }
-}
-
-fn lock_ranges_overlap(left: FileLock, right: FileLock) -> bool {
-    left.start <= right.end && right.start <= left.end
-}
-
 fn open_filesystem(configuration: FilesystemConfiguration) -> Result<Filesystem, FilesystemError> {
     let storage = Arc::new(storage::open_database(&configuration)?);
     let database_directory = fs::canonicalize(configuration.database_directory())
@@ -2501,7 +2358,6 @@ fn open_filesystem(configuration: FilesystemConfiguration) -> Result<Filesystem,
         database_directory,
         storage,
         mount_state: Arc::new(Mutex::new(MountState::default())),
-        lock_table: Arc::new((Mutex::new(LockTable::default()), Condvar::new())),
         handle_table: Arc::new(Mutex::new(HandleTable::default())),
         next_handle: Arc::new(AtomicU64::new(1)),
     })
@@ -2568,207 +2424,9 @@ mod tests {
     use super::*;
 
     use std::sync::mpsc;
-    use std::thread;
     use std::time::Duration;
 
     use tempfile::TempDir;
-
-    #[test]
-    fn lock_table_conflicts_follow_advisory_range_rules() {
-        let mut write_table = LockTable::default();
-        let write_lock = file_lock(1, 10, 0, 10, libc::F_WRLCK as i32);
-        write_table.set_lock(write_lock);
-
-        assert_eq!(
-            write_table.conflicting_lock(file_lock(1, 11, 5, 5, libc::F_RDLCK as i32)),
-            Some(write_lock)
-        );
-        assert_eq!(
-            write_table.conflicting_lock(file_lock(1, 11, 5, 5, libc::F_WRLCK as i32)),
-            Some(write_lock)
-        );
-        assert_eq!(
-            write_table.conflicting_lock(file_lock(1, 10, 5, 5, libc::F_WRLCK as i32)),
-            None
-        );
-        assert_eq!(
-            write_table.conflicting_lock(file_lock(2, 11, 5, 5, libc::F_WRLCK as i32)),
-            None
-        );
-        assert_eq!(
-            write_table.conflicting_lock(file_lock(1, 11, 11, 20, libc::F_WRLCK as i32)),
-            None
-        );
-
-        let mut read_table = LockTable::default();
-        let read_lock = file_lock(1, 10, 0, 10, libc::F_RDLCK as i32);
-        read_table.set_lock(read_lock);
-        assert_eq!(
-            read_table.conflicting_lock(file_lock(1, 11, 5, 5, libc::F_RDLCK as i32)),
-            None
-        );
-        assert_eq!(
-            read_table.conflicting_lock(file_lock(1, 11, 5, 5, libc::F_WRLCK as i32)),
-            Some(read_lock)
-        );
-
-        assert!(lock_ranges_overlap(
-            file_lock(1, 1, 0, 10, libc::F_RDLCK as i32),
-            file_lock(1, 2, 10, 20, libc::F_RDLCK as i32)
-        ));
-        assert!(!lock_ranges_overlap(
-            file_lock(1, 1, 0, 10, libc::F_RDLCK as i32),
-            file_lock(1, 2, 11, 20, libc::F_RDLCK as i32)
-        ));
-    }
-
-    #[test]
-    fn lock_table_replaces_splits_and_clears_owner_ranges() {
-        let mut table = LockTable::default();
-        table.set_lock(file_lock(1, 7, 0, 99, libc::F_WRLCK as i32));
-
-        table.set_lock(file_lock(1, 7, 20, 29, libc::F_UNLCK as i32));
-
-        assert_eq!(table.locks.len(), 2);
-        assert!(
-            table
-                .locks
-                .contains(&file_lock(1, 7, 0, 19, libc::F_WRLCK as i32))
-        );
-        assert!(
-            table
-                .locks
-                .contains(&file_lock(1, 7, 30, 99, libc::F_WRLCK as i32))
-        );
-
-        table.set_lock(file_lock(1, 7, 0, 19, libc::F_RDLCK as i32));
-
-        assert_eq!(table.locks.len(), 2);
-        assert!(
-            table
-                .locks
-                .contains(&file_lock(1, 7, 0, 19, libc::F_RDLCK as i32))
-        );
-        assert!(
-            table
-                .locks
-                .contains(&file_lock(1, 7, 30, 99, libc::F_WRLCK as i32))
-        );
-
-        table.set_lock(file_lock(2, 8, 0, 10, libc::F_WRLCK as i32));
-        table.clear_owner(7);
-
-        assert_eq!(
-            table.locks,
-            vec![file_lock(2, 8, 0, 10, libc::F_WRLCK as i32)]
-        );
-    }
-
-    #[test]
-    fn file_lock_adapter_validates_inodes_types_and_conflicts() {
-        let fixture = TestFilesystem::new("file-lock-adapter");
-        let filesystem = &fixture.filesystem;
-
-        filesystem
-            .set_file_lock(
-                1,
-                fuser::LockOwner(1),
-                0,
-                10,
-                libc::F_WRLCK as i32,
-                100,
-                false,
-            )
-            .expect("first lock succeeds");
-
-        let conflict = filesystem
-            .set_file_lock(
-                1,
-                fuser::LockOwner(2),
-                5,
-                5,
-                libc::F_WRLCK as i32,
-                200,
-                false,
-            )
-            .expect_err("non-blocking conflicting lock is rejected");
-        assert_eq!(conflict.errno().code(), fuser::Errno::EAGAIN.code());
-
-        filesystem.clear_file_locks_for_owner(fuser::LockOwner(1));
-        filesystem
-            .set_file_lock(
-                1,
-                fuser::LockOwner(2),
-                5,
-                5,
-                libc::F_WRLCK as i32,
-                200,
-                false,
-            )
-            .expect("lock succeeds after conflicting owner is cleared");
-
-        let invalid_type = filesystem
-            .set_file_lock(1, fuser::LockOwner(3), 0, 1, 999, 300, false)
-            .expect_err("unknown lock type is rejected");
-        assert_eq!(invalid_type.errno().code(), fuser::Errno::EINVAL.code());
-
-        let missing_inode = filesystem
-            .set_file_lock(
-                u64::MAX,
-                fuser::LockOwner(3),
-                0,
-                1,
-                libc::F_RDLCK as i32,
-                300,
-                false,
-            )
-            .expect_err("missing inode is rejected");
-        assert_eq!(missing_inode.errno().code(), fuser::Errno::ENOENT.code());
-    }
-
-    #[test]
-    fn blocking_file_lock_waits_until_conflicting_owner_is_cleared() {
-        let fixture = TestFilesystem::new("blocking-file-lock");
-        let filesystem = fixture.filesystem.clone();
-
-        filesystem
-            .set_file_lock(
-                1,
-                fuser::LockOwner(1),
-                0,
-                10,
-                libc::F_WRLCK as i32,
-                100,
-                false,
-            )
-            .expect("initial write lock succeeds");
-
-        let waiting_filesystem = filesystem.clone();
-        let (started_sender, started_receiver) = mpsc::channel();
-        let waiter = thread::spawn(move || {
-            started_sender.send(()).expect("waiter start is sent");
-            waiting_filesystem.set_file_lock(
-                1,
-                fuser::LockOwner(2),
-                0,
-                10,
-                libc::F_WRLCK as i32,
-                200,
-                true,
-            )
-        });
-
-        started_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("waiter starts");
-        thread::sleep(Duration::from_millis(50));
-        filesystem.clear_file_locks_for_owner(fuser::LockOwner(1));
-
-        waiter
-            .join()
-            .expect("waiter thread joins")
-            .expect("blocking lock succeeds after wake");
-    }
 
     #[test]
     fn fuse_database_and_integrity_errors_map_to_io_errors() {
@@ -2938,22 +2596,14 @@ mod tests {
         assert_eq!(write.overwritten_byte_length(), Some(2));
         assert_eq!(write.written_byte_length(), Some(4));
 
-        for payload in [
-            EventPayload::FileSizeChange {
-                old_file_size: 9,
-                new_file_size: 20,
-            },
-            EventPayload::FileExchange {
-                primary_file_size: 20,
-                secondary_file_size: 30,
-            },
-        ] {
-            let event = base.clone().with_payload(payload);
-            assert_eq!(event.old_file_size(), None);
-            assert_eq!(event.new_file_size(), None);
-            assert_eq!(event.overwritten_byte_length(), None);
-            assert_eq!(event.written_byte_length(), None);
-        }
+        let exchanged = base.clone().with_payload(EventPayload::FileExchange {
+            primary_file_size: 20,
+            secondary_file_size: 30,
+        });
+        assert_eq!(exchanged.old_file_size(), None);
+        assert_eq!(exchanged.new_file_size(), None);
+        assert_eq!(exchanged.overwritten_byte_length(), None);
+        assert_eq!(exchanged.written_byte_length(), None);
 
         let debug = format!("{write:?}");
         assert!(debug.contains("EventRecord"));
@@ -3064,10 +2714,29 @@ mod tests {
             .expect("callback receives unsupported fuse error");
         assert_eq!(unsupported.operation(), "poll");
         assert!(unsupported.is_unsupported());
+
+        for operation in [
+            "getlk",
+            "setlk",
+            "bmap",
+            "ioctl",
+            "poll",
+            "fallocate",
+            "lseek",
+            "copy_file_range",
+        ] {
+            fixture.filesystem.unsupported_fuse_error(operation);
+            let unsupported = receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("callback receives unsupported fuse error");
+            assert_eq!(unsupported.operation(), operation);
+            assert_eq!(unsupported.errno(), fuser::Errno::ENOSYS.code());
+            assert!(unsupported.is_unsupported());
+        }
     }
 
     #[test]
-    fn rename_and_lock_adapters_accept_supported_values_and_reject_unknown_values() {
+    fn rename_adapter_accepts_supported_values_and_rejects_unknown_values() {
         assert_eq!(
             rename_mode(fuser::RenameFlags::empty()).expect("empty rename flags are supported"),
             false
@@ -3087,26 +2756,6 @@ mod tests {
                 fuser::Errno::EINVAL.code()
             );
         }
-
-        assert_eq!(
-            lock_type(libc::F_RDLCK as i32).expect("read locks are accepted"),
-            libc::F_RDLCK as i32
-        );
-        assert_eq!(
-            lock_type(libc::F_WRLCK as i32).expect("write locks are accepted"),
-            libc::F_WRLCK as i32
-        );
-        assert_eq!(
-            lock_type(libc::F_UNLCK as i32).expect("unlock records are accepted"),
-            libc::F_UNLCK as i32
-        );
-        assert_eq!(
-            lock_type(999)
-                .expect_err("unknown lock types are rejected")
-                .errno()
-                .code(),
-            fuser::Errno::EINVAL.code()
-        );
     }
 
     #[test]
@@ -3441,17 +3090,6 @@ mod tests {
                 _root: root,
                 filesystem,
             }
-        }
-    }
-
-    fn file_lock(inode: u64, owner: u64, start: u64, end: u64, typ: i32) -> FileLock {
-        FileLock {
-            inode,
-            owner,
-            start,
-            end,
-            typ,
-            pid: owner as u32,
         }
     }
 

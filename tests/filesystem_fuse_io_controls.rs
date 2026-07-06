@@ -1,7 +1,6 @@
 mod support;
 
 use std::fs::{self, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -11,15 +10,16 @@ use std::time::{Duration, UNIX_EPOCH};
 use eventfs::EventKind;
 
 use support::{
-    TestDirectories, assert_callback_errors_include, create_empty_file, event_count, events_after,
-    expect_event_kinds, expect_no_events, filesystem_with_fuse_error_callback, mount,
-    open_test_filesystem, recorded_callback_errors, write_mounted_file,
+    TestDirectories, event_count, events_after, expect_event_kinds, expect_no_events,
+    filesystem_with_fuse_error_callback, mount, open_test_filesystem, recorded_callback_errors,
+    write_mounted_file,
 };
 
 #[test]
-fn mounted_posix_locks_succeed_and_do_not_append_events() {
+fn mounted_posix_locks_do_not_append_events_and_are_unsupported_when_routed() {
     let directories = TestDirectories::new();
-    let filesystem = open_test_filesystem(&directories);
+    let callback_errors = Arc::new(Mutex::new(Vec::new()));
+    let filesystem = filesystem_with_fuse_error_callback(&directories, &callback_errors);
     let _mounted = mount(&filesystem);
     let file_path = directories.mount_point_path().join("lock-file");
 
@@ -31,24 +31,19 @@ fn mounted_posix_locks_succeed_and_do_not_append_events() {
         .expect("lock file opens");
     let mut events = event_count(&filesystem);
 
-    set_lock(file.as_raw_fd(), libc::F_WRLCK, 0, 3).expect("write lock is set");
-    expect_no_events(&mut events, &filesystem, "setlk does not append events");
-    let queried = get_lock(file.as_raw_fd(), libc::F_WRLCK, 0, 3).expect("lock is queried");
-    assert_eq!(queried.l_type, libc::F_UNLCK as libc::c_short);
-    expect_no_events(&mut events, &filesystem, "getlk does not append events");
-    set_lock(file.as_raw_fd(), libc::F_UNLCK, 0, 3).expect("lock is released");
-    expect_no_events(&mut events, &filesystem, "unlock does not append events");
+    let set_result = set_lock(file.as_raw_fd(), libc::F_WRLCK, 0, 3);
+    let get_result = get_lock(file.as_raw_fd(), libc::F_WRLCK, 0, 3);
+    let unlock_result = set_lock(file.as_raw_fd(), libc::F_UNLCK, 0, 3);
+    let errors = recorded_callback_errors(&callback_errors);
 
-    drop(file);
-    expect_no_events(
-        &mut events,
-        &filesystem,
-        "release after locking does not append events",
-    );
+    assert_removed_operation_result("setlk", set_result, &errors);
+    assert_removed_operation_result("getlk", get_result, &errors);
+    assert_removed_operation_result("setlk", unlock_result, &errors);
+    expect_no_events(&mut events, &filesystem, "locks do not append events");
 }
 
 #[test]
-fn mounted_ioctl_rejection_reports_enotty_and_poll_reports_ready_without_events() {
+fn mounted_ioctl_and_poll_do_not_append_events_and_are_unsupported_when_routed() {
     let directories = TestDirectories::new();
     let callback_errors = Arc::new(Mutex::new(Vec::new()));
     let filesystem = filesystem_with_fuse_error_callback(&directories, &callback_errors);
@@ -63,231 +58,34 @@ fn mounted_ioctl_rejection_reports_enotty_and_poll_reports_ready_without_events(
         .expect("ioctl file opens");
     let mut events = event_count(&filesystem);
 
-    let error = ioctl_rejection(file.as_raw_fd()).expect_err("unsupported ioctl is rejected");
-    assert_eq!(error.raw_os_error(), Some(libc::ENOTTY));
+    let ioctl_result = ioctl_rejection(file.as_raw_fd());
+    let poll_result = poll_file(file.as_raw_fd());
     let errors = recorded_callback_errors(&callback_errors);
-    if cfg!(target_os = "macos") && !errors.iter().any(|error| error.operation() == "ioctl") {
-        eprintln!("skipping ioctl callback assertion because this mount did not route ioctl");
-    } else {
-        assert_callback_errors_include(&errors, "ioctl", libc::ENOTTY, false);
-    }
+
+    assert_removed_operation_result("ioctl", ioctl_result, &errors);
+    assert_removed_operation_result("poll", poll_result, &errors);
     expect_no_events(
         &mut events,
         &filesystem,
-        "ioctl rejection does not append events",
+        "ioctl and poll do not append events",
     );
-
-    let ready = poll_file(file.as_raw_fd()).expect("poll succeeds");
-    assert_ne!(ready & libc::POLLIN, 0);
-    assert_ne!(ready & libc::POLLOUT, 0);
-    expect_no_events(&mut events, &filesystem, "poll does not append events");
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn mounted_bmap_returns_the_requested_logical_block_without_events_when_driveable() {
+fn mounted_linux_removed_data_operations_do_not_append_events() {
     let directories = TestDirectories::new();
-    let filesystem = open_test_filesystem(&directories);
-    let _mounted = mount(&filesystem);
-    let file_path = directories.mount_point_path().join("bmap-file");
-
-    write_mounted_file(&file_path, b"bmap").expect("bmap file is written");
-    let file = OpenOptions::new()
-        .read(true)
-        .open(&file_path)
-        .expect("bmap file opens");
-    let mut events = event_count(&filesystem);
-
-    match bmap(file.as_raw_fd(), 2) {
-        Ok(block) => assert_eq!(block, 2),
-        Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
-            eprintln!("skipping bmap assertion because the host denied FIBMAP");
-            return;
-        }
-        Err(error) => panic!("bmap failed: {error}"),
-    }
-    expect_no_events(&mut events, &filesystem, "bmap does not append events");
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn mounted_linux_fallocate_modes_append_events_only_for_logical_changes() {
-    let directories = TestDirectories::new();
-    let filesystem = open_test_filesystem(&directories);
-    let _mounted = mount(&filesystem);
-    let root = directories.mount_point_path();
-
-    let extend_path = root.join("extend");
-    create_empty_file(&extend_path);
-    let extend_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&extend_path)
-        .expect("extend file opens");
-    let mut events = event_count(&filesystem);
-    fallocate(extend_file.as_raw_fd(), 0, 0, 4096).expect("fallocate extends file");
-    assert_eq!(
-        fs::metadata(&extend_path)
-            .expect("extended file metadata is readable")
-            .len(),
-        4096
-    );
-    expect_event_kinds(
-        &mut events,
-        &filesystem,
-        &[EventKind::FileRangeZeroed],
-        "size-growing fallocate appends one file-range-zeroed event",
-    );
-
-    let keep_size_path = root.join("keep-size");
-    write_mounted_file(&keep_size_path, b"keep").expect("keep-size file is written");
-    let keep_size_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&keep_size_path)
-        .expect("keep-size file opens");
-    events = event_count(&filesystem);
-    fallocate(
-        keep_size_file.as_raw_fd(),
-        libc::FALLOC_FL_KEEP_SIZE,
-        0,
-        4096,
-    )
-    .expect("keep-size fallocate succeeds");
-    assert_eq!(
-        fs::metadata(&keep_size_path)
-            .expect("keep-size file metadata is readable")
-            .len(),
-        4
-    );
-    expect_no_events(
-        &mut events,
-        &filesystem,
-        "keep-size allocation does not append events",
-    );
-
-    let punch_path = root.join("punch");
-    write_mounted_file(&punch_path, b"abcdefghi").expect("punch file is written");
-    let punch_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&punch_path)
-        .expect("punch file opens");
-    events = event_count(&filesystem);
-    fallocate(
-        punch_file.as_raw_fd(),
-        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-        2,
-        3,
-    )
-    .expect("punch-hole fallocate succeeds");
-    expect_event_kinds(
-        &mut events,
-        &filesystem,
-        &[EventKind::FileRangeZeroed],
-        "punch-hole allocation appends one zero-range event",
-    );
-    assert_eq!(
-        fs::read(&punch_path).expect("punched file is readable"),
-        b"ab\0\0\0fghi"
-    );
-
-    let zero_path = root.join("zero");
-    write_mounted_file(&zero_path, b"abcdefghi").expect("zero-range file is written");
-    let zero_file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&zero_path)
-        .expect("zero-range file opens");
-    events = event_count(&filesystem);
-    fallocate(zero_file.as_raw_fd(), libc::FALLOC_FL_ZERO_RANGE, 4, 3)
-        .expect("zero-range fallocate succeeds");
-    expect_event_kinds(
-        &mut events,
-        &filesystem,
-        &[EventKind::FileRangeZeroed],
-        "zero-range allocation appends one zero-range event",
-    );
-    assert_eq!(
-        fs::read(&zero_path).expect("zero-range file is readable"),
-        b"abcd\0\0\0hi"
-    );
-
-    for mode in [
-        libc::FALLOC_FL_COLLAPSE_RANGE,
-        libc::FALLOC_FL_INSERT_RANGE,
-        libc::FALLOC_FL_UNSHARE_RANGE,
-        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE,
-        0x4000_0000,
-    ] {
-        events = event_count(&filesystem);
-        let error = fallocate(zero_file.as_raw_fd(), mode, 0, 1)
-            .expect_err("unsupported fallocate mode is rejected");
-        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
-        expect_no_events(
-            &mut events,
-            &filesystem,
-            "unsupported fallocate mode does not append events",
-        );
-    }
-}
-
-#[test]
-fn mounted_sparse_seek_finds_data_and_holes_without_events() {
-    let directories = TestDirectories::new();
-    let filesystem = open_test_filesystem(&directories);
-    let _mounted = mount(&filesystem);
-    let file_path = directories.mount_point_path().join("sparse");
-
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(&file_path)
-        .expect("sparse file is created");
-    file.seek(SeekFrom::Start(4096)).expect("sparse file seeks");
-    file.write_all(b"data").expect("sparse data is written");
-    file.seek(SeekFrom::Start(8191))
-        .expect("sparse file seeks to final byte");
-    file.write_all(&[0])
-        .expect("sparse file length is extended");
-    let mut events = event_count(&filesystem);
-
-    let data_from_start = match seek(file.as_raw_fd(), 0, libc::SEEK_DATA) {
-        Ok(offset) => offset,
-        Err(error) if seek_may_be_unrouted(error.raw_os_error()) => {
-            eprintln!("skipping sparse seek assertion because the mount did not route lseek");
-            return;
-        }
-        Err(error) => panic!("SEEK_DATA failed: {error}"),
-    };
-    assert_eq!(data_from_start, 4096);
-    assert_eq!(
-        seek(file.as_raw_fd(), 0, libc::SEEK_HOLE).expect("SEEK_HOLE from start succeeds"),
-        0
-    );
-    assert_eq!(
-        seek(file.as_raw_fd(), 4096, libc::SEEK_HOLE).expect("SEEK_HOLE after data succeeds"),
-        4100
-    );
-    let error =
-        seek(file.as_raw_fd(), 8192, libc::SEEK_DATA).expect_err("SEEK_DATA at EOF is rejected");
-    assert_eq!(error.raw_os_error(), Some(libc::ENXIO));
-    expect_no_events(&mut events, &filesystem, "lseek does not append events");
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn mounted_copy_file_range_writes_destination_once_and_rejects_flags_without_events() {
-    let directories = TestDirectories::new();
-    let filesystem = open_test_filesystem(&directories);
+    let callback_errors = Arc::new(Mutex::new(Vec::new()));
+    let filesystem = filesystem_with_fuse_error_callback(&directories, &callback_errors);
     let _mounted = mount(&filesystem);
     let root = directories.mount_point_path();
     let source_path = root.join("source");
     let destination_path = root.join("destination");
+    let sparse_path = root.join("sparse");
 
     write_mounted_file(&source_path, b"copy source").expect("copy source file is written");
     write_mounted_file(&destination_path, b"destination").expect("destination file is written");
+    write_mounted_file(&sparse_path, b"sparse").expect("sparse file is written");
     let source = OpenOptions::new()
         .read(true)
         .open(&source_path)
@@ -296,88 +94,27 @@ fn mounted_copy_file_range_writes_destination_once_and_rejects_flags_without_eve
         .write(true)
         .open(&destination_path)
         .expect("destination opens");
+    let sparse = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&sparse_path)
+        .expect("sparse file opens");
     let mut events = event_count(&filesystem);
 
-    let copied = copy_file_range(source.as_raw_fd(), destination.as_raw_fd(), 0, 0, 4, 0)
-        .expect("copy_file_range succeeds");
+    let fallocate_result = fallocate(sparse.as_raw_fd(), 0, 0, 4096);
+    let lseek_data_result = seek(sparse.as_raw_fd(), 0, libc::SEEK_DATA);
+    let lseek_hole_result = seek(sparse.as_raw_fd(), 0, libc::SEEK_HOLE);
+    let copy_result = copy_file_range(source.as_raw_fd(), destination.as_raw_fd(), 0, 0, 4, 0);
+    let errors = recorded_callback_errors(&callback_errors);
 
-    assert_eq!(copied, 4);
-    expect_event_kinds(
-        &mut events,
-        &filesystem,
-        &[EventKind::FileWritten],
-        "copy_file_range appends one destination file-written event",
-    );
-    assert_eq!(
-        fs::read(&destination_path).expect("destination is readable"),
-        b"copyination"
-    );
-
-    let error = copy_file_range(source.as_raw_fd(), destination.as_raw_fd(), 0, 0, 1, 1)
-        .expect_err("copy_file_range rejects non-empty flags");
-    assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+    assert_removed_operation_result("fallocate", fallocate_result, &errors);
+    assert_removed_operation_result("lseek", lseek_data_result, &errors);
+    assert_removed_operation_result("lseek", lseek_hole_result, &errors);
+    assert_removed_operation_result("copy_file_range", copy_result, &errors);
     expect_no_events(
         &mut events,
         &filesystem,
-        "copy_file_range flag rejection does not append events",
-    );
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn mounted_macos_preallocate_and_punch_hole_have_expected_events_when_supported() {
-    let directories = TestDirectories::new();
-    let filesystem = open_test_filesystem(&directories);
-    let _mounted = mount(&filesystem);
-    let root = directories.mount_point_path();
-    let preallocate_path = root.join("preallocate");
-    let punch_path = root.join("punch");
-
-    create_empty_file(&preallocate_path);
-    let mut events = event_count(&filesystem);
-    if let Err(error) = preallocate(&preallocate_path) {
-        eprintln!("skipping preallocate assertion because this macFUSE mount returned {error}");
-    } else if fs::metadata(&preallocate_path)
-        .expect("preallocated file metadata is readable")
-        .len()
-        > 0
-    {
-        expect_event_kinds(
-            &mut events,
-            &filesystem,
-            &[EventKind::FileRangeZeroed],
-            "preallocate size extension appends one file-range-zeroed event",
-        );
-    } else {
-        expect_no_events(
-            &mut events,
-            &filesystem,
-            "preallocate no-op does not append events",
-        );
-    }
-
-    write_mounted_file(&punch_path, b"contents").expect("punch file is written");
-    events = event_count(&filesystem);
-    if let Err(error) = punch_hole(&punch_path) {
-        eprintln!("skipping punch-hole assertion because this macFUSE mount returned {error}");
-        return;
-    }
-
-    expect_event_kinds(
-        &mut events,
-        &filesystem,
-        &[EventKind::FileRangeZeroed],
-        "punch-hole appends one file-range-zeroed event",
-    );
-    assert_eq!(
-        fs::read(&punch_path).expect("file contents remain readable after punch hole"),
-        b"co\0\0\0ts"
-    );
-    assert_eq!(
-        fs::metadata(&punch_path)
-            .expect("file metadata remains readable after punch hole")
-            .len(),
-        8
+        "removed Linux data operations do not append events",
     );
 }
 
@@ -530,6 +267,7 @@ fn poll_file(fd: libc::c_int) -> std::io::Result<libc::c_short> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn seek(fd: libc::c_int, offset: libc::off_t, whence: libc::c_int) -> std::io::Result<libc::off_t> {
     let result = unsafe { libc::lseek(fd, offset, whence) };
     if result >= 0 {
@@ -537,15 +275,6 @@ fn seek(fd: libc::c_int, offset: libc::off_t, whence: libc::c_int) -> std::io::R
     } else {
         Err(last_os_error())
     }
-}
-
-#[cfg(target_os = "linux")]
-fn bmap(fd: libc::c_int, block: libc::c_int) -> std::io::Result<libc::c_int> {
-    let mut block = block;
-    syscall_zero(unsafe {
-        libc::ioctl(fd, linux_raw_sys::ioctl::FIBMAP as libc::Ioctl, &mut block)
-    })?;
-    Ok(block)
 }
 
 #[cfg(target_os = "linux")]
@@ -584,37 +313,6 @@ fn copy_file_range(
     } else {
         Err(last_os_error())
     }
-}
-
-#[cfg(target_os = "macos")]
-fn preallocate(path: &Path) -> std::io::Result<()> {
-    let file = OpenOptions::new()
-        .write(true)
-        .open(path)
-        .expect("preallocate file opens");
-    let mut allocation = libc::fstore_t {
-        fst_flags: libc::F_ALLOCATEALL,
-        fst_posmode: libc::F_PEOFPOSMODE,
-        fst_offset: 0,
-        fst_length: 4096,
-        fst_bytesalloc: 0,
-    };
-    syscall_zero(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut allocation) })
-}
-
-#[cfg(target_os = "macos")]
-fn punch_hole(path: &Path) -> std::io::Result<()> {
-    let file = OpenOptions::new()
-        .write(true)
-        .open(path)
-        .expect("punch-hole file opens");
-    let mut hole = libc::fpunchhole_t {
-        fp_flags: 0,
-        reserved: 0,
-        fp_offset: 2,
-        fp_length: 3,
-    };
-    syscall_zero(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &mut hole) })
 }
 
 #[cfg(target_os = "macos")]
@@ -794,6 +492,51 @@ fn zero_timespec() -> libc::timespec {
     }
 }
 
+fn assert_removed_operation_result<T>(
+    operation: &'static str,
+    result: std::io::Result<T>,
+    errors: &[eventfs::FuseOperationError],
+) {
+    match result {
+        Ok(_) => assert_callback_error_is_unsupported_when_present(operation, errors),
+        Err(error) => {
+            assert!(
+                removed_operation_errno(error.raw_os_error()),
+                "{operation} returned unexpected error: {error}"
+            );
+            assert_callback_error_is_unsupported_when_present(operation, errors);
+        }
+    }
+}
+
+fn assert_callback_error_is_unsupported_when_present(
+    operation: &'static str,
+    errors: &[eventfs::FuseOperationError],
+) {
+    if let Some(error) = errors.iter().find(|error| error.operation() == operation) {
+        assert!(
+            error.is_unsupported(),
+            "{operation} callback error is marked unsupported"
+        );
+    }
+}
+
+fn removed_operation_errno(errno: Option<i32>) -> bool {
+    matches!(
+        errno,
+        Some(
+            libc::EACCES
+                | libc::EINVAL
+                | libc::ENOSYS
+                | libc::ENOTSUP
+                | libc::ENOTTY
+                | libc::ENXIO
+                | libc::EPERM
+                | libc::EXDEV
+        )
+    )
+}
+
 fn syscall_zero(result: libc::c_int) -> std::io::Result<()> {
     if result == 0 {
         Ok(())
@@ -810,13 +553,6 @@ fn unsupported_ioctl_command() -> libc::Ioctl {
 #[cfg(target_os = "macos")]
 fn unsupported_ioctl_command() -> libc::c_ulong {
     0
-}
-
-fn seek_may_be_unrouted(errno: Option<i32>) -> bool {
-    matches!(
-        errno,
-        Some(libc::ENOSYS | libc::EINVAL | libc::ENOTSUP | libc::ENOTTY)
-    )
 }
 
 #[cfg(target_os = "macos")]

@@ -116,6 +116,9 @@ fn validate_mount_point(path: &Path) -> Result<(), FilesystemError> {
 fn mount_configuration(filesystem: &Filesystem) -> Result<fuser::Config, FilesystemError> {
     let mut configuration = fuser::Config::default();
     configuration.acl = fuser::SessionACL::All;
+    configuration
+        .mount_options
+        .push(fuser::MountOption::DefaultPermissions);
     let caller_mount_options = filesystem.configuration().mount_options();
     if !caller_mount_options
         .iter()
@@ -235,9 +238,13 @@ mod tests {
             mount_configuration(&fixture.filesystem).expect("mount configuration is built");
 
         assert_eq!(configuration.acl, fuser::SessionACL::All);
+        assert_eq!(
+            configuration.mount_options.first(),
+            Some(&fuser::MountOption::DefaultPermissions)
+        );
         assert!(
             matches!(
-                configuration.mount_options.first(),
+                configuration.mount_options.get(1),
                 Some(fuser::MountOption::FSName(_))
             ),
             "default filesystem name is supplied"
@@ -260,6 +267,7 @@ mod tests {
             MountOption::Async,
         ];
         let expected_mount_options = vec![
+            fuser::MountOption::DefaultPermissions,
             fuser::MountOption::FSName("configured-name".to_owned()),
             fuser::MountOption::Subtype("eventfs".to_owned()),
             fuser::MountOption::CUSTOM("debug".to_owned()),

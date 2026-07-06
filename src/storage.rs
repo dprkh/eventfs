@@ -81,6 +81,23 @@ pub(crate) struct ExtendedAttributeList {
     pub(crate) bytes: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CreateNodeMetadata {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) mode: u32,
+    pub(crate) umask: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SetattrMetadata {
+    pub(crate) request_uid: u32,
+    pub(crate) request_gid: u32,
+    pub(crate) mode: Option<u32>,
+    pub(crate) uid: Option<u32>,
+    pub(crate) gid: Option<u32>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ExtendedTimes {
     pub(crate) bkuptime: SystemTime,
@@ -99,6 +116,24 @@ impl FuseError {
         match self {
             Self::Errno(errno) => *errno,
             Self::Database | Self::Integrity => fuser::Errno::EIO,
+        }
+    }
+}
+
+#[cfg(test)]
+impl CreateNodeMetadata {
+    fn default_for_kind(kind: CreateNodeKind) -> Self {
+        let mode = match kind {
+            CreateNodeKind::Directory => u32::from(INODE_MODE_DEFAULT_DIRECTORY),
+            CreateNodeKind::RegularFile | CreateNodeKind::Special { .. } => {
+                u32::from(INODE_MODE_DEFAULT_FILE)
+            }
+        };
+        Self {
+            uid: 0,
+            gid: 0,
+            mode,
+            umask: 0,
         }
     }
 }
@@ -144,8 +179,8 @@ fn storage(database: DB, write_state: WriteState) -> Storage {
 
 type FuseResult<T> = Result<T, FuseError>;
 
-const STORAGE_SCHEMA_VERSION_BASELINE: u64 = 9;
-const STORAGE_SCHEMA_VERSION_CURRENT: u64 = 9;
+const STORAGE_SCHEMA_VERSION_BASELINE: u64 = 10;
+const STORAGE_SCHEMA_VERSION_CURRENT: u64 = 10;
 
 const EVENT_SEQUENCE_INITIAL: EventSequence = EventSequence::new(0);
 const BRANCH_IDENTIFIER_INITIAL: BranchIdentifier = BranchIdentifier::new(1);
@@ -154,6 +189,20 @@ const BRANCH_NAME_INITIAL: &str = "main";
 const INODE_ROOT: u64 = 1;
 const INODE_FIRST_ALLOCATED: u64 = 2;
 const INODE_LOGICAL_CAPACITY: u64 = u64::MAX - 1;
+
+const INODE_MODE_PERMISSION_MASK: u32 = 0o7777;
+#[cfg(test)]
+const INODE_MODE_DEFAULT_FILE: u16 = 0o666;
+#[cfg(test)]
+const INODE_MODE_DEFAULT_DIRECTORY: u16 = 0o777;
+#[cfg(test)]
+const INODE_MODE_DEFAULT_SYMLINK: u16 = 0o777;
+const INODE_MODE_ROOT: u16 = 0o755;
+
+const XATTR_NAME_MAX_BYTES: usize = 255;
+const XATTR_VALUE_MAX_BYTES: usize = 65_536;
+const XATTR_LIST_MAX_BYTES: usize = 65_536;
+const XATTR_USER_PREFIX: &[u8] = b"user.";
 
 const CONTENT_CHUNK_MIN_SIZE: usize = 16 * 1024;
 const CONTENT_CHUNK_TARGET_SIZE: usize = 64 * 1024;
@@ -289,6 +338,9 @@ struct StoredInode {
     kind: StoredNodeKind,
     size: u64,
     nlink: u32,
+    uid: u32,
+    gid: u32,
+    mode: u16,
     rdev: u32,
     atime: StoredTime,
     mtime: StoredTime,
@@ -1034,6 +1086,68 @@ impl Storage {
         self.entry_snapshot(inode)
     }
 
+    pub(crate) fn setattr_metadata(
+        &self,
+        inode_number: u64,
+        metadata: SetattrMetadata,
+    ) -> FuseResult<EntrySnapshot> {
+        let mut write_state = self.lock_write_state()?;
+        let mut inode = self
+            .inode(inode_number)
+            .map_err(to_fuse_integrity)?
+            .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
+        validate_metadata_change(&inode, metadata)?;
+
+        let original_inode = inode.clone();
+        if let Some(mode) = metadata.mode {
+            inode.mode = permission_mode(mode, 0);
+        }
+        if let Some(uid) = metadata.uid {
+            inode.uid = uid;
+        }
+        if let Some(gid) = metadata.gid {
+            inode.gid = gid;
+        }
+        if metadata.uid.is_some() || metadata.gid.is_some() {
+            inode.mode &= !(setuid_mode_bit() | setgid_mode_bit());
+        }
+        if inode == original_inode {
+            return Ok(EntrySnapshot {
+                ttl: FUSE_ATTRIBUTE_TTL,
+                attr: inode_attr(inode_number, &inode),
+            });
+        }
+
+        let event_sequence = write_state.next_event_sequence()?;
+        let now = StoredTime::now();
+        inode.ctime = now;
+        let mut batch = WriteBatch::default();
+        let mut mutation = StoredMutation::default();
+        mutation.put_inode(inode_number, &inode);
+        let event = EventRecord::new(
+            event_sequence,
+            EventKind::MetadataChanged,
+            UtcDateTime::now(),
+            file_identifier_for_kind(inode_number, inode.kind),
+            inode_event_path(
+                self.active_branch_identifier(),
+                inode_number,
+                &inode,
+                &self.database,
+            )
+            .ok(),
+            None,
+            None,
+        );
+        self.commit_event(&mut batch, event_sequence, &event, mutation)?;
+        self.commit_mutation(&mut write_state, batch, event_sequence, None)?;
+
+        Ok(EntrySnapshot {
+            ttl: FUSE_ATTRIBUTE_TTL,
+            attr: inode_attr(inode_number, &inode),
+        })
+    }
+
     pub(crate) fn readlink(&self, inode: u64) -> FuseResult<Vec<u8>> {
         let inode = self
             .inode(inode)
@@ -1045,11 +1159,27 @@ impl Storage {
         Ok(inode.symlink_target.unwrap_or_default())
     }
 
+    #[cfg(test)]
     pub(crate) fn create_node(
         &self,
         parent: u64,
         name: &OsStr,
         kind: CreateNodeKind,
+    ) -> FuseResult<EntrySnapshot> {
+        self.create_node_with_metadata(
+            parent,
+            name,
+            kind,
+            CreateNodeMetadata::default_for_kind(kind),
+        )
+    }
+
+    pub(crate) fn create_node_with_metadata(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        kind: CreateNodeKind,
+        metadata: CreateNodeMetadata,
     ) -> FuseResult<EntrySnapshot> {
         let mut write_state = self.lock_write_state()?;
         let mut parent_inode = self.require_directory(parent)?;
@@ -1102,6 +1232,7 @@ impl Storage {
                 EventKind::NodeCreated,
             ),
         };
+        let (uid, gid, mode) = created_inode_metadata(&parent_inode, stored_kind, metadata);
         let inode = StoredInode {
             kind: stored_kind,
             size,
@@ -1109,6 +1240,9 @@ impl Storage {
                 StoredNodeKind::Directory => 2,
                 _ => 1,
             },
+            uid,
+            gid,
+            mode,
             rdev,
             atime: now,
             mtime: now,
@@ -1166,11 +1300,32 @@ impl Storage {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn create_symlink(
         &self,
         parent: u64,
         link_name: &OsStr,
         target: &Path,
+    ) -> FuseResult<EntrySnapshot> {
+        self.create_symlink_with_metadata(
+            parent,
+            link_name,
+            target,
+            CreateNodeMetadata {
+                uid: 0,
+                gid: 0,
+                mode: u32::from(INODE_MODE_DEFAULT_SYMLINK),
+                umask: 0,
+            },
+        )
+    }
+
+    pub(crate) fn create_symlink_with_metadata(
+        &self,
+        parent: u64,
+        link_name: &OsStr,
+        target: &Path,
+        metadata: CreateNodeMetadata,
     ) -> FuseResult<EntrySnapshot> {
         let mut write_state = self.lock_write_state()?;
         let mut parent_inode = self.require_directory(parent)?;
@@ -1201,10 +1356,15 @@ impl Storage {
             &self.database,
         )?;
         let target_bytes = target.as_os_str().as_bytes().to_vec();
+        let (uid, gid, mode) =
+            created_inode_metadata(&parent_inode, StoredNodeKind::Symlink, metadata);
         let inode = StoredInode {
             kind: StoredNodeKind::Symlink,
             size: target_bytes.len() as u64,
             nlink: 1,
+            uid,
+            gid,
+            mode,
             rdev: 0,
             atime: now,
             mtime: now,
@@ -1489,11 +1649,22 @@ impl Storage {
         .map_err(to_fuse_integrity)
     }
 
+    #[cfg(test)]
     pub(crate) fn write_file(
         &self,
         inode_number: u64,
         offset: u64,
         data: &[u8],
+    ) -> FuseResult<FuseWrite> {
+        self.write_file_with_metadata(inode_number, offset, data, false)
+    }
+
+    pub(crate) fn write_file_with_metadata(
+        &self,
+        inode_number: u64,
+        offset: u64,
+        data: &[u8],
+        clear_suid_sgid: bool,
     ) -> FuseResult<FuseWrite> {
         let mut write_state = self.lock_write_state()?;
         let mut inode = self
@@ -1550,6 +1721,9 @@ impl Storage {
         inode.content_manifest_identifier = Some(content_manifest_identifier);
         inode.mtime = now;
         inode.ctime = now;
+        if clear_suid_sgid {
+            inode.mode &= !(setuid_mode_bit() | setgid_mode_bit());
+        }
         let mut mutation = StoredMutation::default();
         mutation.put_inode(inode_number, &inode);
 
@@ -1753,11 +1927,22 @@ impl Storage {
         Ok(())
     }
 
-    pub(crate) fn access(&self, inode_number: u64) -> FuseResult<()> {
-        self.inode(inode_number)
+    pub(crate) fn access(
+        &self,
+        inode_number: u64,
+        request_uid: u32,
+        request_gid: u32,
+        mask: fuser::AccessFlags,
+    ) -> FuseResult<()> {
+        let inode = self
+            .inode(inode_number)
             .map_err(to_fuse_integrity)?
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        Ok(())
+        if access_allowed(&inode, request_uid, request_gid, mask) {
+            Ok(())
+        } else {
+            Err(FuseError::Errno(fuser::Errno::EACCES))
+        }
     }
 
     pub(crate) fn statfs(&self, database_directory: &Path) -> FuseResult<FileSystemStatistics> {
@@ -1786,7 +1971,9 @@ impl Storage {
             .inode(inode_number)
             .map_err(to_fuse_integrity)?
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
+        validate_extended_attribute_inode(&inode)?;
         let name_bytes = validate_extended_attribute_name(name)?;
+        validate_extended_attribute_value(value)?;
         let create = flags & libc::XATTR_CREATE != 0;
         let replace = flags & libc::XATTR_REPLACE != 0;
         let supported = libc::XATTR_CREATE | libc::XATTR_REPLACE;
@@ -1831,9 +2018,11 @@ impl Storage {
     }
 
     pub(crate) fn getxattr(&self, inode_number: u64, name: &OsStr) -> FuseResult<Vec<u8>> {
-        self.inode(inode_number)
+        let inode = self
+            .inode(inode_number)
             .map_err(to_fuse_integrity)?
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
+        validate_extended_attribute_inode(&inode)?;
         let name_bytes = validate_extended_attribute_name(name)?;
         self.extended_attribute(inode_number, &name_bytes)?
             .ok_or(FuseError::Errno(fuser::Errno::NO_XATTR))
@@ -1844,7 +2033,11 @@ impl Storage {
         state
             .inodes
             .get(&inode_number)
-            .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
+            .ok_or(FuseError::Errno(fuser::Errno::ENOENT))
+            .and_then(|inode| {
+                validate_extended_attribute_inode(inode)?;
+                Ok(inode)
+            })?;
         let mut bytes = Vec::new();
         for ((attribute_inode, name), _value) in state
             .extended_attributes
@@ -1855,6 +2048,9 @@ impl Storage {
             }
             bytes.extend_from_slice(name);
             bytes.push(0);
+            if bytes.len() > XATTR_LIST_MAX_BYTES {
+                return Err(FuseError::Errno(fuser::Errno::E2BIG));
+            }
         }
         Ok(ExtendedAttributeList { bytes })
     }
@@ -1865,6 +2061,7 @@ impl Storage {
             .inode(inode_number)
             .map_err(to_fuse_integrity)?
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
+        validate_extended_attribute_inode(&inode)?;
         let name_bytes = validate_extended_attribute_name(name)?;
         if self
             .extended_attribute(inode_number, &name_bytes)?
@@ -1901,150 +2098,6 @@ impl Storage {
 
     pub(crate) fn volume_name(&self) -> Result<String, FilesystemError> {
         read_metadata_string(&self.database, METADATA_KEY_VOLUME_NAME)
-    }
-
-    pub(crate) fn bmap(&self, inode_number: u64) -> FuseResult<()> {
-        self.inode(inode_number)
-            .map_err(to_fuse_integrity)?
-            .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        Ok(())
-    }
-
-    pub(crate) fn poll(
-        &self,
-        inode_number: u64,
-        requested: fuser::PollEvents,
-    ) -> FuseResult<fuser::PollEvents> {
-        self.inode(inode_number)
-            .map_err(to_fuse_integrity)?
-            .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        let mut ready = fuser::PollEvents::empty();
-        if requested.intersects(read_poll_events()) {
-            ready |= requested & read_poll_events();
-        }
-        if requested.intersects(write_poll_events()) {
-            ready |= requested & write_poll_events();
-        }
-        Ok(ready)
-    }
-
-    pub(crate) fn fallocate(
-        &self,
-        inode_number: u64,
-        offset: u64,
-        length: u64,
-        mode: i32,
-    ) -> FuseResult<()> {
-        if length == 0 {
-            self.open_file(inode_number)?;
-            return Ok(());
-        }
-        let supported = fallocate_keep_size() | fallocate_punch_hole() | fallocate_zero_range();
-        if mode & !supported != 0
-            || mode & fallocate_collapse_range() != 0
-            || mode & fallocate_insert_range() != 0
-            || mode & fallocate_unshare_range() != 0
-        {
-            return Err(FuseError::Errno(fuser::Errno::EINVAL));
-        }
-        if mode & fallocate_punch_hole() != 0 {
-            if mode & fallocate_zero_range() != 0 {
-                return Err(FuseError::Errno(fuser::Errno::EINVAL));
-            }
-            return self.zero_file_range(inode_number, offset, length, true);
-        }
-        if mode & fallocate_zero_range() != 0 {
-            return self.zero_file_range(
-                inode_number,
-                offset,
-                length,
-                mode & fallocate_keep_size() != 0,
-            );
-        }
-        let inode = self
-            .inode(inode_number)
-            .map_err(to_fuse_integrity)?
-            .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        if inode.kind != StoredNodeKind::RegularFile {
-            return Err(FuseError::Errno(fuser::Errno::EISDIR));
-        }
-        let end = offset
-            .checked_add(length)
-            .ok_or(FuseError::Errno(fuser::Errno::EFBIG))?;
-        if mode & fallocate_keep_size() != 0 || end <= inode.size {
-            return Ok(());
-        }
-        self.zero_file_range(inode_number, offset, length, false)
-    }
-
-    pub(crate) fn lseek(&self, inode_number: u64, offset: i64, whence: i32) -> FuseResult<i64> {
-        if offset < 0 {
-            return Err(FuseError::Errno(fuser::Errno::EINVAL));
-        }
-        let offset = offset as u64;
-        let inode = self
-            .inode(inode_number)
-            .map_err(to_fuse_integrity)?
-            .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        if inode.kind != StoredNodeKind::RegularFile {
-            return Err(FuseError::Errno(fuser::Errno::EINVAL));
-        }
-        if offset >= inode.size {
-            return Err(FuseError::Errno(fuser::Errno::ENXIO));
-        }
-        let extents = self
-            .file_content_manifest_extents(
-                self.active_branch_identifier(),
-                FileIdentifier::new(inode_number),
-            )
-            .map_err(to_fuse_integrity)?;
-        self.validate_stored_extents(&extents)?;
-        let target = match whence {
-            value if value == libc::SEEK_DATA => seek_data(&extents, offset, inode.size)?,
-            value if value == libc::SEEK_HOLE => seek_hole(&extents, offset, inode.size)?,
-            _ => return Err(FuseError::Errno(fuser::Errno::EINVAL)),
-        };
-        i64::try_from(target).map_err(|_| FuseError::Errno(fuser::Errno::EOVERFLOW))
-    }
-
-    pub(crate) fn copy_file_range(
-        &self,
-        source_inode_number: u64,
-        source_offset: u64,
-        destination_inode_number: u64,
-        destination_offset: u64,
-        length: u64,
-    ) -> FuseResult<FuseWrite> {
-        if length == 0 {
-            return Ok(FuseWrite { written: 0 });
-        }
-        let source_inode = self
-            .inode(source_inode_number)
-            .map_err(to_fuse_integrity)?
-            .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        if source_inode.kind != StoredNodeKind::RegularFile {
-            return Err(FuseError::Errno(fuser::Errno::EINVAL));
-        }
-        if source_offset >= source_inode.size {
-            return Ok(FuseWrite { written: 0 });
-        }
-        let copy_length = length
-            .min(source_inode.size - source_offset)
-            .min(u64::from(u32::MAX));
-        let bytes = self
-            .read_extent_range(
-                ExtentSet::Current {
-                    branch: self.active_branch_identifier(),
-                    file_identifier: FileIdentifier::new(source_inode_number),
-                },
-                source_offset,
-                copy_length,
-            )
-            .map_err(to_fuse_integrity)?;
-        if bytes.is_empty() {
-            return Ok(FuseWrite { written: 0 });
-        }
-        self.write_file(destination_inode_number, destination_offset, &bytes)
     }
 
     pub(crate) fn set_volume_name(&self, name: &OsStr) -> FuseResult<()> {
@@ -2199,89 +2252,6 @@ impl Storage {
 
     fn lock_write_state(&self) -> FuseResult<MutexGuard<'_, WriteState>> {
         self.write_state.lock().map_err(|_| FuseError::Database)
-    }
-
-    fn zero_file_range(
-        &self,
-        inode_number: u64,
-        offset: u64,
-        length: u64,
-        keep_size: bool,
-    ) -> FuseResult<()> {
-        let mut write_state = self.lock_write_state()?;
-        let mut inode = self
-            .inode(inode_number)
-            .map_err(to_fuse_integrity)?
-            .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        if inode.kind != StoredNodeKind::RegularFile {
-            return Err(FuseError::Errno(fuser::Errno::EISDIR));
-        }
-        let requested_end = offset
-            .checked_add(length)
-            .ok_or(FuseError::Errno(fuser::Errno::EFBIG))?;
-        let old_size = inode.size;
-        let zero_end = if keep_size {
-            requested_end.min(old_size)
-        } else {
-            requested_end
-        };
-        let new_size = if keep_size {
-            old_size
-        } else {
-            old_size.max(requested_end)
-        };
-        let existing_extents = self
-            .file_content_manifest_extents(
-                self.active_branch_identifier(),
-                FileIdentifier::new(inode_number),
-            )
-            .map_err(to_fuse_integrity)?;
-        self.validate_stored_extents(&existing_extents)?;
-        let final_extents =
-            current_extents_after_zero(&existing_extents, old_size, offset, zero_end)?;
-        if new_size == old_size && final_extents == existing_extents {
-            return Ok(());
-        }
-
-        let event_sequence = write_state.next_event_sequence()?;
-        let now = StoredTime::now();
-        let mut batch = WriteBatch::default();
-        let content_manifest_identifier = self.put_content_manifest(&mut batch, &final_extents)?;
-        inode.size = new_size;
-        inode.content_manifest_identifier = Some(content_manifest_identifier);
-        inode.mtime = now;
-        inode.ctime = now;
-        let mut mutation = StoredMutation::default();
-        mutation.put_inode(inode_number, &inode);
-        let event = EventRecord::new(
-            event_sequence,
-            EventKind::FileRangeZeroed,
-            UtcDateTime::now(),
-            Some(FileIdentifier::new(inode_number)),
-            inode_event_path(
-                self.active_branch_identifier(),
-                inode_number,
-                &inode,
-                &self.database,
-            )
-            .ok(),
-            Some(offset),
-            Some(length),
-        )
-        .with_payload(EventPayload::FileSizeChange {
-            old_file_size: old_size,
-            new_file_size: new_size,
-        });
-        self.commit_event_with_payloads(
-            &mut batch,
-            event_sequence,
-            &event,
-            EventPayloadExtents::None,
-            Some(&final_extents),
-            None,
-            mutation,
-        )?;
-        self.commit_mutation(&mut write_state, batch, event_sequence, None)
     }
 
     fn commit_mutation(
@@ -3295,7 +3265,6 @@ impl Storage {
             EventKind::NodeCreated
                 | EventKind::FileCreated
                 | EventKind::FileWritten
-                | EventKind::FileRangeZeroed
                 | EventKind::FileContentsExchanged
         ) {
             return Ok(());
@@ -3597,6 +3566,9 @@ fn initialize_new_database(database: &DB) -> Result<(), FilesystemError> {
         kind: StoredNodeKind::Directory,
         size: 0,
         nlink: 2,
+        uid: current_effective_uid(),
+        gid: current_effective_gid(),
+        mode: INODE_MODE_ROOT,
         rdev: 0,
         atime: now,
         mtime: now,
@@ -4059,25 +4031,6 @@ fn current_extents_after_write(
     Ok(extents)
 }
 
-fn current_extents_after_zero(
-    existing: &[StoredExtent],
-    old_size: u64,
-    offset: u64,
-    zero_end: u64,
-) -> FuseResult<Vec<StoredExtent>> {
-    if offset >= zero_end {
-        return Ok(existing.to_vec());
-    }
-    let mut extents =
-        slice_extents(existing, 0, offset.min(old_size), 0).map_err(to_fuse_integrity)?;
-    if zero_end < old_size {
-        extents.extend(
-            slice_extents(existing, zero_end, old_size, zero_end).map_err(to_fuse_integrity)?,
-        );
-    }
-    Ok(extents)
-}
-
 fn validate_extent_bounds(extents: &[StoredExtent], byte_length: u64) -> FuseResult<()> {
     for extent in extents {
         let end = extent
@@ -4089,36 +4042,6 @@ fn validate_extent_bounds(extents: &[StoredExtent], byte_length: u64) -> FuseRes
         }
     }
     Ok(())
-}
-
-fn seek_data(extents: &[StoredExtent], offset: u64, file_size: u64) -> FuseResult<u64> {
-    for extent in extents {
-        let extent_end = extent
-            .logical_offset
-            .checked_add(extent.length)
-            .ok_or(FuseError::Integrity)?;
-        if offset < extent_end && extent.logical_offset < file_size {
-            return Ok(offset.max(extent.logical_offset));
-        }
-    }
-    Err(FuseError::Errno(fuser::Errno::ENXIO))
-}
-
-fn seek_hole(extents: &[StoredExtent], offset: u64, file_size: u64) -> FuseResult<u64> {
-    let mut current = offset;
-    for extent in extents {
-        if current < extent.logical_offset {
-            return Ok(current);
-        }
-        let extent_end = extent
-            .logical_offset
-            .checked_add(extent.length)
-            .ok_or(FuseError::Integrity)?;
-        if current < extent_end {
-            current = extent_end.min(file_size);
-        }
-    }
-    Ok(current.min(file_size))
 }
 
 fn pending_extent(bytes: &[u8], start: usize, end: usize) -> FuseResult<PendingExtent> {
@@ -4286,80 +4209,6 @@ fn inode_path_bytes(
     Err(FuseError::Integrity)
 }
 
-fn read_poll_events() -> fuser::PollEvents {
-    fuser::PollEvents::POLLIN | fuser::PollEvents::POLLRDNORM | fuser::PollEvents::POLLRDBAND
-}
-
-fn write_poll_events() -> fuser::PollEvents {
-    fuser::PollEvents::POLLOUT | fuser::PollEvents::POLLWRNORM | fuser::PollEvents::POLLWRBAND
-}
-
-fn fallocate_keep_size() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        libc::FALLOC_FL_KEEP_SIZE
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0x01
-    }
-}
-
-fn fallocate_punch_hole() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        libc::FALLOC_FL_PUNCH_HOLE
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0x02
-    }
-}
-
-fn fallocate_zero_range() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        libc::FALLOC_FL_ZERO_RANGE
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0x10
-    }
-}
-
-fn fallocate_collapse_range() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        libc::FALLOC_FL_COLLAPSE_RANGE
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0x08
-    }
-}
-
-fn fallocate_insert_range() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        libc::FALLOC_FL_INSERT_RANGE
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0x20
-    }
-}
-
-fn fallocate_unshare_range() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        libc::FALLOC_FL_UNSHARE_RANGE
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        0x40
-    }
-}
-
 fn inode_attr(inode_number: u64, inode: &StoredInode) -> fuser::FileAttr {
     fuser::FileAttr {
         ino: fuser::INodeNo(inode_number),
@@ -4370,10 +4219,10 @@ fn inode_attr(inode_number: u64, inode: &StoredInode) -> fuser::FileAttr {
         ctime: inode.ctime.to_system_time(),
         crtime: inode.crtime.to_system_time(),
         kind: fuser_file_type(inode.kind),
-        perm: 0o777,
+        perm: inode.mode,
         nlink: inode.nlink,
-        uid: 0,
-        gid: 0,
+        uid: inode.uid,
+        gid: inode.gid,
         rdev: inode.rdev,
         blksize: FUSE_STATFS_BLOCK_SIZE,
         flags: 0,
@@ -4390,6 +4239,97 @@ fn fuser_file_type(kind: StoredNodeKind) -> fuser::FileType {
         StoredNodeKind::Symlink => fuser::FileType::Symlink,
         StoredNodeKind::Socket => fuser::FileType::Socket,
     }
+}
+
+fn created_inode_metadata(
+    parent: &StoredInode,
+    kind: StoredNodeKind,
+    metadata: CreateNodeMetadata,
+) -> (u32, u32, u16) {
+    let parent_setgid = parent.mode & setgid_mode_bit() != 0;
+    let gid = if parent_setgid {
+        parent.gid
+    } else {
+        metadata.gid
+    };
+    let mut mode = permission_mode(metadata.mode, metadata.umask);
+    if kind == StoredNodeKind::Directory && parent_setgid {
+        mode |= setgid_mode_bit();
+    }
+    (metadata.uid, gid, mode)
+}
+
+fn validate_metadata_change(inode: &StoredInode, metadata: SetattrMetadata) -> FuseResult<()> {
+    let owner_or_root = metadata.request_uid == 0 || metadata.request_uid == inode.uid;
+    let uid_change = metadata.uid.is_some_and(|uid| uid != inode.uid);
+    let gid_change = metadata.gid.is_some_and(|gid| gid != inode.gid);
+    let mode_change = metadata
+        .mode
+        .map(|mode| permission_mode(mode, 0) != inode.mode)
+        .unwrap_or(false);
+
+    if uid_change && metadata.request_uid != 0 {
+        return Err(FuseError::Errno(fuser::Errno::EPERM));
+    }
+    if gid_change
+        && metadata.request_uid != 0
+        && !(metadata.request_uid == inode.uid && metadata.gid == Some(metadata.request_gid))
+    {
+        return Err(FuseError::Errno(fuser::Errno::EPERM));
+    }
+    if mode_change && !owner_or_root {
+        return Err(FuseError::Errno(fuser::Errno::EPERM));
+    }
+    Ok(())
+}
+
+fn access_allowed(
+    inode: &StoredInode,
+    request_uid: u32,
+    request_gid: u32,
+    mask: fuser::AccessFlags,
+) -> bool {
+    if mask.is_empty() || request_uid == 0 {
+        return true;
+    }
+    let shift = if request_uid == inode.uid {
+        6
+    } else if request_gid == inode.gid {
+        3
+    } else {
+        0
+    };
+    let permissions = ((inode.mode >> shift) & 0o7) as i32;
+    if mask.contains(fuser::AccessFlags::R_OK) && permissions & libc::R_OK == 0 {
+        return false;
+    }
+    if mask.contains(fuser::AccessFlags::W_OK) && permissions & libc::W_OK == 0 {
+        return false;
+    }
+    if mask.contains(fuser::AccessFlags::X_OK) && permissions & libc::X_OK == 0 {
+        return false;
+    }
+    true
+}
+
+fn permission_mode(mode: u32, umask: u32) -> u16 {
+    ((mode & !umask) & INODE_MODE_PERMISSION_MASK) as u16
+}
+
+fn setuid_mode_bit() -> u16 {
+    libc::S_ISUID as u16
+}
+
+fn setgid_mode_bit() -> u16 {
+    libc::S_ISGID as u16
+}
+
+fn current_effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+fn current_effective_gid() -> u32 {
+    unsafe { libc::getegid() }
 }
 
 fn special_kind_from_mode(mode: u32) -> FuseResult<StoredNodeKind> {
@@ -4433,13 +4373,30 @@ fn validate_extended_attribute_name(name: &OsStr) -> FuseResult<Vec<u8>> {
     if bytes.is_empty() {
         return Err(FuseError::Errno(fuser::Errno::EINVAL));
     }
-    if bytes.len() > FUSE_MAX_NAME_LENGTH {
+    if bytes.len() > XATTR_NAME_MAX_BYTES {
         return Err(FuseError::Errno(fuser::Errno::ERANGE));
     }
     if bytes.contains(&0) {
         return Err(FuseError::Errno(fuser::Errno::EINVAL));
     }
+    if std::str::from_utf8(bytes).is_err() || !bytes.starts_with(XATTR_USER_PREFIX) {
+        return Err(FuseError::Errno(fuser::Errno::ENOTSUP));
+    }
     Ok(bytes.to_vec())
+}
+
+fn validate_extended_attribute_inode(inode: &StoredInode) -> FuseResult<()> {
+    match inode.kind {
+        StoredNodeKind::Directory | StoredNodeKind::RegularFile => Ok(()),
+        _ => Err(FuseError::Errno(fuser::Errno::ENOTSUP)),
+    }
+}
+
+fn validate_extended_attribute_value(value: &[u8]) -> FuseResult<()> {
+    if value.len() > XATTR_VALUE_MAX_BYTES {
+        return Err(FuseError::Errno(fuser::Errno::ERANGE));
+    }
+    Ok(())
 }
 
 fn backing_filesystem_statistics(path: &Path) -> FuseResult<BackingFileSystemStatistics> {
@@ -4883,7 +4840,6 @@ fn event_file_identifiers(event: &EventRecord) -> Vec<FileIdentifier> {
 fn event_snapshot_file_size(event: &EventRecord, file_identifier: FileIdentifier) -> Option<u64> {
     match event.payload() {
         EventPayload::FileWrite { new_file_size, .. }
-        | EventPayload::FileSizeChange { new_file_size, .. }
             if event.file_identifier() == Some(file_identifier) =>
         {
             Some(*new_file_size)
@@ -4900,9 +4856,7 @@ fn event_snapshot_file_size(event: &EventRecord, file_identifier: FileIdentifier
                 None
             }
         }
-        EventPayload::None
-        | EventPayload::FileWrite { .. }
-        | EventPayload::FileSizeChange { .. } => None,
+        EventPayload::None | EventPayload::FileWrite { .. } => None,
     }
 }
 
@@ -6046,8 +6000,31 @@ mod tests {
         );
         assert_fuse_errno(
             storage
+                .setxattr(
+                    inode_number,
+                    OsStr::new("trusted.eventfs.edge"),
+                    b"value",
+                    0,
+                )
+                .expect_err("non-user xattr namespaces are rejected"),
+            fuser::Errno::ENOTSUP,
+        );
+        assert_fuse_errno(
+            storage
+                .getxattr(inode_number, OsStr::from_bytes(b"user.\xff"))
+                .expect_err("non-utf8 xattr names are rejected"),
+            fuser::Errno::ENOTSUP,
+        );
+        assert_fuse_errno(
+            storage
                 .getxattr(inode_number, OsStr::from_bytes(&[b'a'; 256]))
                 .expect_err("overlong xattr names are rejected"),
+            fuser::Errno::ERANGE,
+        );
+        assert_fuse_errno(
+            storage
+                .setxattr(inode_number, name, &vec![0; XATTR_VALUE_MAX_BYTES + 1], 0)
+                .expect_err("overlong xattr values are rejected"),
             fuser::Errno::ERANGE,
         );
         assert_fuse_errno(
@@ -6055,6 +6032,22 @@ mod tests {
                 .removexattr(inode_number, OsStr::from_bytes(b"user\0bad"))
                 .expect_err("nul-containing xattr names are rejected"),
             fuser::Errno::EINVAL,
+        );
+        let symlink = storage
+            .create_symlink(
+                INODE_ROOT,
+                OsStr::new("xattr-link"),
+                Path::new("xattr-edges"),
+            )
+            .expect("symlink is created")
+            .attr
+            .ino
+            .into();
+        assert_fuse_errno(
+            storage
+                .setxattr(symlink, name, b"value", 0)
+                .expect_err("symlink xattrs are rejected"),
+            fuser::Errno::ENOTSUP,
         );
     }
 
@@ -6213,230 +6206,6 @@ mod tests {
                 .readdir(file, 0, |_entry| true)
                 .expect_err("readdir rejects regular files"),
             fuser::Errno::ENOTDIR,
-        );
-    }
-
-    #[test]
-    fn sparse_zero_range_and_lseek_use_extent_holes() {
-        let temporary = tempfile::tempdir().expect("temporary directory is created");
-        let storage =
-            open_database_path(&temporary.path().join("database")).expect("storage opens");
-        let inode_number = create_regular_file(&storage, "sparse-zero");
-        storage
-            .write_file(inode_number, 0, b"abcdef")
-            .expect("file is written");
-
-        storage
-            .fallocate(
-                inode_number,
-                2,
-                2,
-                fallocate_zero_range() | fallocate_keep_size(),
-            )
-            .expect("range is zeroed");
-
-        assert_eq!(
-            storage
-                .read_file(inode_number, 0, 6)
-                .expect("zeroed file is readable"),
-            b"ab\0\0ef"
-        );
-        assert_eq!(
-            storage
-                .lseek(inode_number, 0, libc::SEEK_DATA)
-                .expect("first data is found"),
-            0
-        );
-        assert_eq!(
-            storage
-                .lseek(inode_number, 0, libc::SEEK_HOLE)
-                .expect("first hole is found"),
-            2
-        );
-        assert_eq!(
-            storage
-                .lseek(inode_number, 2, libc::SEEK_DATA)
-                .expect("next data is found"),
-            4
-        );
-        assert_eq!(
-            storage
-                .get_event(
-                    storage
-                        .last_event_sequence()
-                        .expect("last event is readable")
-                )
-                .expect("event lookup succeeds")
-                .expect("event exists")
-                .kind(),
-            EventKind::FileRangeZeroed
-        );
-    }
-
-    #[test]
-    fn fallocate_poll_lseek_and_copy_range_cover_edge_modes() {
-        let temporary = tempfile::tempdir().expect("temporary directory is created");
-        let storage =
-            open_database_path(&temporary.path().join("database")).expect("storage opens");
-        let source = create_regular_file(&storage, "range-source");
-        let destination = create_regular_file(&storage, "range-destination");
-        storage
-            .write_file(source, 0, b"abcdef")
-            .expect("source is written");
-        let before_noops = storage
-            .last_event_sequence()
-            .expect("last event sequence is readable");
-
-        storage
-            .fallocate(source, 0, 0, 0)
-            .expect("zero-length allocation validates and does nothing");
-        storage
-            .fallocate(source, 12, 4, fallocate_keep_size())
-            .expect("keep-size allocation beyond EOF is a no-op");
-        assert_eq!(
-            storage
-                .last_event_sequence()
-                .expect("last event sequence is reread"),
-            before_noops
-        );
-
-        storage
-            .fallocate(source, 8, 4, 0)
-            .expect("size-growing allocation extends the file");
-        assert_eq!(
-            storage
-                .getattr(source)
-                .expect("source attributes are readable")
-                .attr
-                .size,
-            12
-        );
-
-        for mode in [
-            fallocate_punch_hole() | fallocate_zero_range(),
-            fallocate_collapse_range(),
-            fallocate_insert_range(),
-            fallocate_unshare_range(),
-            0x4000,
-        ] {
-            assert_fuse_errno(
-                storage
-                    .fallocate(source, 0, 1, mode)
-                    .expect_err("unsupported fallocate mode is rejected"),
-                fuser::Errno::EINVAL,
-            );
-        }
-        assert_fuse_errno(
-            storage
-                .fallocate(INODE_ROOT, 0, 1, 0)
-                .expect_err("fallocate rejects directories"),
-            fuser::Errno::EISDIR,
-        );
-        assert_fuse_errno(
-            storage
-                .fallocate(source, u64::MAX, 1, 0)
-                .expect_err("overflowing allocation is rejected"),
-            fuser::Errno::EFBIG,
-        );
-
-        let requested_poll = fuser::PollEvents::POLLIN
-            | fuser::PollEvents::POLLRDNORM
-            | fuser::PollEvents::POLLOUT
-            | fuser::PollEvents::POLLWRNORM
-            | fuser::PollEvents::POLLERR;
-        let ready = storage.poll(source, requested_poll).expect("poll succeeds");
-        assert!(ready.contains(fuser::PollEvents::POLLIN));
-        assert!(ready.contains(fuser::PollEvents::POLLRDNORM));
-        assert!(ready.contains(fuser::PollEvents::POLLOUT));
-        assert!(ready.contains(fuser::PollEvents::POLLWRNORM));
-        assert!(!ready.contains(fuser::PollEvents::POLLERR));
-        assert_fuse_errno(
-            storage
-                .poll(u64::MAX, requested_poll)
-                .expect_err("poll rejects missing inodes"),
-            fuser::Errno::ENOENT,
-        );
-
-        assert_fuse_errno(
-            storage
-                .lseek(source, -1, libc::SEEK_DATA)
-                .expect_err("negative lseek offsets are rejected"),
-            fuser::Errno::EINVAL,
-        );
-        assert_fuse_errno(
-            storage
-                .lseek(INODE_ROOT, 0, libc::SEEK_DATA)
-                .expect_err("lseek rejects directories"),
-            fuser::Errno::EINVAL,
-        );
-        assert_fuse_errno(
-            storage
-                .lseek(source, 12, libc::SEEK_DATA)
-                .expect_err("lseek at EOF is rejected"),
-            fuser::Errno::ENXIO,
-        );
-        assert_fuse_errno(
-            storage
-                .lseek(source, 0, libc::SEEK_SET)
-                .expect_err("unsupported lseek whence is rejected"),
-            fuser::Errno::EINVAL,
-        );
-
-        let zero_length_copy = storage
-            .copy_file_range(source, 0, destination, 0, 0)
-            .expect("zero-length copy succeeds");
-        let eof_copy = storage
-            .copy_file_range(source, 12, destination, 0, 4)
-            .expect("copy from EOF succeeds without bytes");
-        assert_eq!(zero_length_copy.written, 0);
-        assert_eq!(eof_copy.written, 0);
-        assert_fuse_errno(
-            storage
-                .copy_file_range(INODE_ROOT, 0, destination, 0, 4)
-                .expect_err("copy from a directory is rejected"),
-            fuser::Errno::EINVAL,
-        );
-    }
-
-    #[test]
-    fn copy_file_range_writes_destination_once() {
-        let temporary = tempfile::tempdir().expect("temporary directory is created");
-        let storage =
-            open_database_path(&temporary.path().join("database")).expect("storage opens");
-        let source = create_regular_file(&storage, "copy-source");
-        let destination = create_regular_file(&storage, "copy-destination");
-        storage
-            .write_file(source, 0, b"copy source")
-            .expect("source is written");
-        storage
-            .write_file(destination, 0, b"destination")
-            .expect("destination is written");
-        let before = storage
-            .last_event_sequence()
-            .expect("event sequence is readable");
-
-        let copied = storage
-            .copy_file_range(source, 0, destination, 0, 4)
-            .expect("range is copied");
-
-        assert_eq!(copied.written, 4);
-        assert_eq!(
-            storage
-                .read_file(destination, 0, 11)
-                .expect("destination is readable"),
-            b"copyination"
-        );
-        let after = storage
-            .last_event_sequence()
-            .expect("event sequence is readable");
-        assert_eq!(after.get(), before.get() + 1);
-        assert_eq!(
-            storage
-                .get_event(after)
-                .expect("event lookup succeeds")
-                .expect("event exists")
-                .kind(),
-            EventKind::FileWritten
         );
     }
 
@@ -6777,7 +6546,7 @@ mod tests {
             .getattr(file)
             .expect("file attributes are readable")
             .attr;
-        assert_eq!(attributes.perm, 0o777);
+        assert_eq!(attributes.perm, 0o666);
         assert_eq!(attributes.uid, 0);
         assert_eq!(attributes.gid, 0);
         assert_eq!(attributes.flags, 0);
@@ -6836,11 +6605,22 @@ mod tests {
             fuser::Errno::ENOTDIR,
         );
         storage
-            .access(file)
+            .access(
+                file,
+                0,
+                0,
+                fuser::AccessFlags::R_OK | fuser::AccessFlags::W_OK,
+            )
             .expect("access validates existing inode");
         assert_fuse_errno(
             storage
-                .access(u64::MAX)
+                .access(file, 1, 1, fuser::AccessFlags::X_OK)
+                .expect_err("access rejects missing permission bits"),
+            fuser::Errno::EACCES,
+        );
+        assert_fuse_errno(
+            storage
+                .access(u64::MAX, 0, 0, fuser::AccessFlags::R_OK)
                 .expect_err("access rejects missing inodes"),
             fuser::Errno::ENOENT,
         );
@@ -6866,7 +6646,136 @@ mod tests {
     }
 
     #[test]
-    fn rename_remove_link_allocation_and_exchange_edges_cover_user_errors() {
+    fn setattr_metadata_updates_permissions_and_ownership_with_events() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let file = storage
+            .create_node_with_metadata(
+                INODE_ROOT,
+                OsStr::new("metadata-file"),
+                CreateNodeKind::RegularFile,
+                CreateNodeMetadata {
+                    uid: 10,
+                    gid: 20,
+                    mode: 0o640,
+                    umask: 0,
+                },
+            )
+            .expect("file with metadata is created")
+            .attr
+            .ino
+            .into();
+        let created = storage
+            .getattr(file)
+            .expect("created metadata is readable")
+            .attr;
+        assert_eq!(created.uid, 10);
+        assert_eq!(created.gid, 20);
+        assert_eq!(created.perm, 0o640);
+
+        let before_mode_change = storage
+            .last_event_sequence()
+            .expect("last event sequence is readable");
+        let changed = storage
+            .setattr_metadata(
+                file,
+                SetattrMetadata {
+                    request_uid: 10,
+                    request_gid: 20,
+                    mode: Some(0o600),
+                    uid: None,
+                    gid: None,
+                },
+            )
+            .expect("owner updates file mode")
+            .attr;
+        assert_eq!(changed.uid, 10);
+        assert_eq!(changed.gid, 20);
+        assert_eq!(changed.perm, 0o600);
+        let mode_change_sequence = storage
+            .last_event_sequence()
+            .expect("last event sequence is reread");
+        assert!(mode_change_sequence > before_mode_change);
+        assert_eq!(
+            storage
+                .get_event(mode_change_sequence)
+                .expect("metadata event is readable")
+                .expect("metadata event exists")
+                .kind(),
+            EventKind::MetadataChanged,
+        );
+
+        storage
+            .setattr_metadata(
+                file,
+                SetattrMetadata {
+                    request_uid: 10,
+                    request_gid: 20,
+                    mode: Some(0o600),
+                    uid: None,
+                    gid: None,
+                },
+            )
+            .expect("unchanged metadata is accepted");
+        assert_eq!(
+            storage
+                .last_event_sequence()
+                .expect("last event sequence is reread"),
+            mode_change_sequence
+        );
+
+        assert_fuse_errno(
+            storage
+                .setattr_metadata(
+                    file,
+                    SetattrMetadata {
+                        request_uid: 10,
+                        request_gid: 20,
+                        mode: None,
+                        uid: Some(11),
+                        gid: None,
+                    },
+                )
+                .expect_err("non-root owner cannot change uid"),
+            fuser::Errno::EPERM,
+        );
+
+        let suid = storage
+            .setattr_metadata(
+                file,
+                SetattrMetadata {
+                    request_uid: 0,
+                    request_gid: 0,
+                    mode: Some(0o6755),
+                    uid: None,
+                    gid: None,
+                },
+            )
+            .expect("root sets setuid and setgid mode bits")
+            .attr;
+        assert_eq!(suid.perm, 0o6755);
+
+        let chowned = storage
+            .setattr_metadata(
+                file,
+                SetattrMetadata {
+                    request_uid: 0,
+                    request_gid: 0,
+                    mode: None,
+                    uid: Some(100),
+                    gid: Some(200),
+                },
+            )
+            .expect("root updates ownership")
+            .attr;
+        assert_eq!(chowned.uid, 100);
+        assert_eq!(chowned.gid, 200);
+        assert_eq!(chowned.perm, 0o755);
+    }
+
+    #[test]
+    fn rename_remove_link_and_exchange_edges_cover_user_errors() {
         let temporary = tempfile::tempdir().expect("temporary directory is created");
         let storage =
             open_database_path(&temporary.path().join("database")).expect("storage opens");
@@ -7112,48 +7021,6 @@ mod tests {
         storage
             .rmdir(INODE_ROOT, OsStr::new("removable-directory"))
             .expect("empty directory is removed");
-
-        let allocation = create_regular_file(&storage, "allocation-edges");
-        storage
-            .write_file(allocation, 0, b"abcdef")
-            .expect("allocation file is written");
-        storage
-            .fallocate(allocation, 1, 2, fallocate_punch_hole())
-            .expect("punch-hole allocation succeeds");
-        storage
-            .fallocate(allocation, 8, 2, fallocate_zero_range())
-            .expect("zero range without keep-size extends the file");
-        assert_eq!(
-            storage
-                .getattr(allocation)
-                .expect("allocation attributes are readable")
-                .attr
-                .size,
-            10
-        );
-        let before_noop = storage
-            .last_event_sequence()
-            .expect("event sequence is readable");
-        storage
-            .fallocate(
-                allocation,
-                20,
-                4,
-                fallocate_zero_range() | fallocate_keep_size(),
-            )
-            .expect("keep-size zero beyond EOF is a no-op");
-        assert_eq!(
-            storage
-                .last_event_sequence()
-                .expect("event sequence is reread"),
-            before_noop
-        );
-        assert_fuse_errno(
-            storage
-                .fallocate(INODE_ROOT, 0, 1, fallocate_zero_range())
-                .expect_err("zero-range allocation rejects directories"),
-            fuser::Errno::EISDIR,
-        );
 
         let exchange_file = create_regular_file(&storage, "exchange-file");
         storage
@@ -7783,9 +7650,8 @@ mod tests {
     }
 
     #[test]
-    fn extent_seek_zero_and_bounds_helpers_cover_edge_errors() {
+    fn extent_write_and_bounds_helpers_cover_edge_errors() {
         let first = stored_extent_for_test(0, 4, 0, b"first");
-        let second = stored_extent_for_test(8, 4, 0, b"second");
         assert_eq!(
             slice_extents(std::slice::from_ref(&first), 1, 3, 100).expect("extent slice succeeds"),
             vec![StoredExtent {
@@ -7801,51 +7667,6 @@ mod tests {
                 .is_empty()
         );
 
-        assert_eq!(
-            current_extents_after_zero(&[first.clone(), second.clone()], 12, 4, 8)
-                .expect("zeroing an existing hole keeps extents"),
-            vec![first.clone(), second.clone()]
-        );
-        assert_eq!(
-            current_extents_after_zero(&[first.clone(), second.clone()], 12, 2, 10)
-                .expect("zeroing data removes covered extent ranges"),
-            vec![
-                StoredExtent {
-                    logical_offset: 0,
-                    length: 2,
-                    chunk_identifier: b"first".to_vec(),
-                    chunk_offset: 0,
-                },
-                StoredExtent {
-                    logical_offset: 10,
-                    length: 2,
-                    chunk_identifier: b"second".to_vec(),
-                    chunk_offset: 2,
-                },
-            ]
-        );
-
-        assert_eq!(
-            seek_data(&[first.clone(), second.clone()], 4, 12).expect("next data is found"),
-            8
-        );
-        assert_fuse_errno(
-            seek_data(&[], 0, 12).expect_err("no data is rejected"),
-            fuser::Errno::ENXIO,
-        );
-        assert_eq!(
-            seek_hole(&[first.clone(), second.clone()], 0, 12).expect("first hole is found"),
-            4
-        );
-        assert_eq!(
-            seek_hole(&[first.clone(), second.clone()], 5, 12).expect("middle hole is found"),
-            5
-        );
-        assert_eq!(
-            seek_hole(&[first.clone(), second.clone()], 8, 12).expect("hole after data is found"),
-            12
-        );
-
         assert!(matches!(
             validate_extent_bounds(&[stored_extent_for_test(10, 3, 0, b"bounds")], 12),
             Err(FuseError::Integrity)
@@ -7858,14 +7679,6 @@ mod tests {
         };
         assert!(matches!(
             validate_extent_bounds(std::slice::from_ref(&overflowing), u64::MAX),
-            Err(FuseError::Integrity)
-        ));
-        assert!(matches!(
-            seek_data(std::slice::from_ref(&overflowing), 0, u64::MAX),
-            Err(FuseError::Integrity)
-        ));
-        assert!(matches!(
-            seek_hole(std::slice::from_ref(&overflowing), u64::MAX, u64::MAX),
             Err(FuseError::Integrity)
         ));
         assert_fuse_errno(

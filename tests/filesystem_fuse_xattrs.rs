@@ -107,6 +107,21 @@ fn mounted_extended_attribute_small_buffers_return_range_errors_without_events()
         &filesystem,
         "small listxattr buffer does not append events",
     );
+
+    let oversized = vec![0; 65_537];
+    let oversized_error = set_xattr(
+        &file_path,
+        "user.eventfs.oversized",
+        &oversized,
+        libc::XATTR_CREATE,
+    )
+    .expect_err("oversized xattr values are rejected");
+    assert_eq!(oversized_error.raw_os_error(), Some(libc::ERANGE));
+    expect_no_events(
+        &mut events,
+        &filesystem,
+        "oversized setxattr does not append events",
+    );
 }
 
 #[test]

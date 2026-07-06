@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - [x] `lookup`
 - [x] `getattr`
-- [ ] `setattr`
+- [x] `setattr`
 - [x] `readlink`
 - [x] `mknod`
 - [x] `mkdir`
@@ -63,14 +63,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - [x] `access`
 - [x] `create`
 - [x] `readdirplus`
-- [x] `getlk`
-- [x] `setlk`
-- [x] `bmap`
-- [x] `ioctl`
-- [x] `poll`
-- [x] `fallocate`
-- [x] `lseek`
-- [x] `copy_file_range`
+- [ ] `getlk`
+- [ ] `setlk`
+- [ ] `bmap`
+- [ ] `ioctl`
+- [ ] `poll`
+- [ ] `fallocate`
+- [ ] `lseek`
+- [ ] `copy_file_range`
 - [x] `setvolname`
 - [x] `exchange`
 - [x] `getxtimes`
@@ -105,7 +105,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `flush` | 27.127 us | 334.74 ns | 81.0x |
 | `release` | 24.526 us | 585.73 ns | 41.9x |
 | `fsync` | 60.436 us | 26.270 us | 2.3x |
-| `copy_file_range` | 147.53 us | 1.9812 us | 74.5x |
 | `opendir` | 53.816 us | 1.7222 us | 31.2x |
 | `readdir` | 123.48 us | 4.2413 us | 29.1x |
 | `readdirplus` | 258.98 us | 20.143 us | 12.9x |
@@ -115,14 +114,3 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `getxattr` | 83.247 us | 1.2457 us | 66.8x |
 | `listxattr` | 56.712 us | 1.1131 us | 50.9x |
 | `removexattr` | 176.73 us | 2.2281 us | 79.3x |
-| `getlk` | 56.062 us | 404.68 ns | 138.5x |
-| `setlk` | 56.958 us | 528.92 ns | 107.7x |
-| `bmap` | 409.19 ns | 632.62 ns | 0.6x |
-| `ioctl` | 57.325 us | 315.37 ns | 181.8x |
-| `poll` | 56.580 us | 402.35 ns | 140.6x |
-| `fallocate_extend` | 124.80 us | 6.6773 us | 18.7x |
-| `fallocate_keep_size` | 125.31 us | 6.3765 us | 19.7x |
-| `fallocate_punch_hole` | 258.66 us | 4.0346 us | 64.1x |
-| `fallocate_zero_range` | 260.33 us | 8.4055 us | 31.0x |
-| `lseek_data` | 88.582 us | 535.84 ns | 165.3x |
-| `lseek_hole` | 88.763 us | 448.63 ns | 197.9x |

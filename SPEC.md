@@ -365,7 +365,8 @@ impl Filesystem {
 - `Filesystem::mount` and `Filesystem::spawn_mount` MUST apply caller-supplied mount options.
 - Mounted sessions MUST use unrestricted FUSE session access control.
 - eventfs MUST supply `MountOption::FilesystemName` from the persisted volume name when the caller did not supply `MountOption::FilesystemName`.
-- The mounted filesystem MUST support lookup, attribute read, node creation, directory creation, file creation, file open, file read, file write, flush, file synchronization, directory open, directory read, directory read with attributes, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, filesystem statistics, extended attributes, POSIX byte-range locks, block mapping, ioctl rejection, poll readiness, space allocation, sparse seek, file-range copy, macOS volume rename, macOS file-content exchange, and macOS extended times.
+- The mounted filesystem MUST support lookup, attribute read, permission metadata changes, node creation, directory creation, file creation, file open, file read, file write, flush, file synchronization, directory open, directory read, directory read with attributes, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, filesystem statistics, extended attributes, macOS volume rename, macOS file-content exchange, and macOS extended times.
+- The mounted filesystem MUST NOT support POSIX byte-range locks, block mapping, ioctl, poll, space allocation, sparse seek, or file-range copy.
 - When the `tracing` Cargo feature is enabled, every eventfs-handled FUSE operation MUST emit one `tracing::trace!` event containing the operation name.
 - FUSE operation trace logging MUST NOT append events, change FUSE replies, change errno mapping, or affect the configured FUSE error callback.
 - Unsupported FUSE operations MUST return the platform-appropriate unsupported-operation error and MUST NOT append events.
@@ -373,7 +374,9 @@ impl Filesystem {
 - Unsupported FUSE operations MUST invoke the configured FUSE error callback once with `FuseOperationError::is_unsupported` returning `true`.
 - Successful FUSE operations MUST NOT invoke the configured FUSE error callback.
 - FUSE error callback failures MUST NOT change the FUSE error returned to the caller.
-- `setattr` MUST be unsupported, MUST NOT append events, and MUST invoke the configured FUSE error callback once with `FuseOperationError::is_unsupported` returning `true`.
+- eventfs MUST always enable kernel default permission checking when mounting and MUST NOT expose default permission checking as a public mount option.
+- `setattr` MUST support `mode`, `uid`, and `gid` changes, MUST append a metadata-changed event when those fields change, and MUST NOT append events for no-op metadata changes.
+- `setattr` MUST reject `size`, `atime`, `mtime`, `ctime`, `crtime`, `chgtime`, `bkuptime`, and file flag changes as unsupported without appending events.
 - Inode numbers MUST be stable across process restarts.
 - File handles MAY be process-local and MUST NOT be required to reconstruct persistent filesystem state.
 - Filesystem statistics MUST NOT append events or mutate storage.
@@ -382,26 +385,20 @@ impl Filesystem {
 - Filesystem statistics MUST report `bsize` as the eventfs preferred file I/O block size.
 - Filesystem statistics MUST report `namelen` as 255 bytes.
 - FUSE name components longer than 255 bytes MUST be rejected.
-- Extended attributes MUST be inode-scoped, branch-local, opaque byte values keyed by non-empty names no longer than 255 bytes.
+- Extended attributes MUST be inode-scoped, branch-local, opaque byte values keyed by `user.*` names.
+- Extended attribute names MUST be valid UTF-8, MUST NOT contain NUL bytes, MUST be no longer than 255 bytes, and MUST be supported only on regular files and directories.
+- Extended attribute values MUST be no larger than 65536 bytes, and an extended attribute list response MUST be no larger than 65536 bytes.
 - `setxattr` MUST honor create and replace flags, reject unsupported position values, and append an extended-attribute-set event on success.
 - `getxattr` and `listxattr` MUST honor size probes and MUST return `ERANGE` when a non-zero output size is too small.
 - Missing extended attributes MUST return the platform missing-attribute errno.
 - `removexattr` MUST append an extended-attribute-removed event on success.
 - `readdirplus` MUST return the same entries as `readdir` with stable attributes from one storage snapshot.
-- `getlk` and `setlk` MUST implement process-local advisory byte-range locks, including blocking waits when requested, and MUST NOT append events.
-- `flush` and `release` MUST clear byte-range locks held by the released lock owner and MUST NOT force storage synchronization.
+- `getlk`, `setlk`, `bmap`, `ioctl`, `poll`, `fallocate`, `lseek`, and `copy_file_range` MUST be unsupported, MUST NOT append events, and MUST invoke the configured FUSE error callback once with `FuseOperationError::is_unsupported` returning `true`.
+- `flush` and `release` MUST NOT force storage synchronization.
 - `fsync` and `fsyncdir` MUST synchronize all previously committed mounted filesystem mutations to persistent storage before returning success.
 - `fsync` and `fsyncdir` MAY synchronize committed mutations outside the requested inode or directory.
 - File writes opened with synchronized I/O flags and mounted operations covered by `MountOption::Sync` or `MountOption::DirSync` MUST synchronize affected committed mutations before returning success.
-- `bmap` MUST return the requested logical block index after inode validation and MUST NOT append events.
-- `ioctl` MUST expose no eventfs-specific commands, MUST return `ENOTTY` for every command after inode validation, and MUST NOT append events.
-- `access` MUST validate that the inode exists and otherwise allow all requested access masks without checking ownership or permission bits.
-- `poll` MUST report regular files and directories as immediately readable and writable according to requested events after inode validation, and MUST NOT append events.
-- `fallocate` MUST support preallocation by size extension, keep-size no-op allocation, punch-hole, and zero-range.
-- `fallocate` collapse-range, insert-range, unshare-range, and unknown mode bits MUST return `EINVAL`.
-- `fallocate` requests with no logical file state change MUST NOT append events.
-- `lseek` MUST support `SEEK_DATA` and `SEEK_HOLE` using eventfs sparse extents and MUST NOT append events.
-- `copy_file_range` MUST reject non-empty flags and MUST append one destination file write event for copied bytes.
+- `access` MUST validate that the inode exists and MUST apply stored ownership and permission mode when the kernel routes an access request to eventfs.
 - macOS `setvolname` MUST persist the volume name and append one volume-renamed event.
 - macOS `exchange` MUST atomically swap regular-file contents and append one file-contents-exchanged event with primary and secondary file identifiers and paths.
 - macOS `getxtimes` MUST return stored backup and creation times and MUST NOT append events.
@@ -420,9 +417,9 @@ impl Filesystem {
 - File write events MUST store old file size, new file size, overwritten byte length, and written byte length in the event record.
 - File write events MUST store overwritten bytes and written bytes as event payload manifests outside event metadata.
 - Zero-filled file extension MUST be represented by old and new file sizes, not repeated zero bytes.
-- `EventKind` MUST include filesystem initialization, node creation, directory creation, file creation, file write, node unlink, directory removal, node rename, hard link creation, symbolic link creation, extended attribute set, extended attribute removal, file range zeroing, file contents exchange, and volume rename.
-- Extended attribute set and removal, file range zeroing, file contents exchange, volume rename, file-range copy destination writes, and size-growing allocation MUST append events when they change logical filesystem state.
-- Read-only operations, locks, poll, bmap, ioctl failures, and allocation requests with no logical state change MUST NOT append events.
+- `EventKind` MUST include filesystem initialization, node creation, directory creation, file creation, file write, metadata change, node unlink, directory removal, node rename, hard link creation, symbolic link creation, extended attribute set, extended attribute removal, file contents exchange, and volume rename.
+- Metadata changes, extended attribute set and removal, file contents exchange, and volume rename MUST append events when they change logical filesystem state.
+- Read-only operations and unsupported operations MUST NOT append events.
 - `get_event` MUST return the event at the requested sequence when it exists.
 - `current_branch` MUST return the currently active branch.
 - `list_branches` MUST return branches ordered by branch identifier with pagination.
@@ -492,12 +489,15 @@ Storage requirements:
 - eventfs MUST use RocksDB pinned reads for durable byte content whenever the API or internal operation can borrow the value.
 - eventfs MUST NOT materialize owned byte buffers for durable byte content unless mutation, FUSE output, serialization, or caller-owned copies require it.
 - `filesystem_metadata` MUST store storage schema version, next inode number, last committed event sequence, next branch identifier, active branch identifier, and volume name.
-- Stored inodes MUST include backup time and creation time.
-- Stored inodes MUST NOT store ownership, permission mode, or file flags.
+- Stored inodes MUST include backup time, creation time, ownership, and permission mode.
+- Stored inodes MUST NOT store file flags.
+- New root inodes MUST be owned by the effective user and group that created the database and MUST use permission mode `0755`.
+- New non-root inodes MUST be owned by the FUSE request user, MUST use the FUSE request group unless parent-directory setgid inheritance applies, and MUST apply the request umask to the requested permission mode.
+- New symbolic links MUST use permission mode `0777`.
 - `Filesystem::open` MUST create a missing database and required column families for a new database directory.
-- Storage schema version `9` MUST be the first supported storage schema compatibility baseline.
+- Storage schema version `10` MUST be the first supported storage schema compatibility baseline.
 - `Filesystem::open` MUST reject existing databases missing metadata required by their stored schema version.
-- `Filesystem::open` MUST reject storage schema versions older than `9`.
+- `Filesystem::open` MUST reject storage schema versions older than `10`.
 - `Filesystem::open` MUST reject storage schema versions newer than the compiled current storage schema version before mutating storage.
 - `Filesystem::open` MUST automatically migrate compatible released storage schema versions to the compiled current storage schema version before returning.
 - Storage schema migrations MUST run in storage schema version order.
@@ -561,7 +561,7 @@ Storage requirements:
 - `fuse_operations` MUST compile only on Linux and MUST fail to compile on non-Linux targets with an explicit Linux-only error.
 - `fuse_operations` MUST mount eventfs through the public `FilesystemConfiguration`, `Filesystem::open`, and `Filesystem::spawn_mount` APIs.
 - `fuse_operations` MUST benchmark every supported Linux mounted FUSE operation with an equivalent operation on a sibling directory in the current host's normal filesystem.
-- `fuse_operations` MUST benchmark lookup, attribute read, node creation, directory creation, file creation, file open, file read, file write, flush, file synchronization, directory open, directory read, directory read with attributes, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, filesystem statistics, extended attributes, POSIX byte-range locks, block mapping, ioctl rejection, poll readiness, space allocation, sparse seek, and file-range copy.
+- `fuse_operations` MUST benchmark lookup, attribute read, permission metadata changes, node creation, directory creation, file creation, file open, file read, file write, flush, file synchronization, directory open, directory read, directory read with attributes, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, filesystem statistics, and extended attributes.
 - `fuse_operations` MUST NOT benchmark fuser lifecycle or cache callbacks that have no normal-filesystem operation baseline.
 - `fuse_operations` MUST exclude macOS-only mounted operations.
 - `fuse_operations` MUST exclude per-iteration setup and cleanup from timed measurements for mutating operations.
@@ -587,9 +587,9 @@ Implementations MUST include automated tests for:
 - Local backup creates increasing non-zero BackupEngine backup identifiers in a persistent backup directory.
 - Local import verifies a requested BackupEngine backup, replaces existing target data, and opens and migrates the imported database before success.
 - Local backup and import reject overlapping source, backup, and target directories after path normalization.
-- Opening storage schema version `9` succeeds and preserves public filesystem behavior.
+- Opening storage schema version `10` succeeds and preserves public filesystem behavior.
 - Opening every compatible released storage schema version migrates it to the current storage schema version.
-- Opening storage schema versions older than `9` fails without mutation.
+- Opening storage schema versions older than `10` fails without mutation.
 - Opening storage schema versions newer than the compiled current storage schema version fails without mutation.
 - Interrupted storage schema migrations either resume migration on reopen or leave a valid compatible released schema.
 - Opening a compatible released database with missing column families introduced after its stored schema version creates those column families during migration.
@@ -611,7 +611,8 @@ Implementations MUST include automated tests for:
 - Branch switching, divergence, file event listing, and snapshot reads preserve independent file contents across branches.
 - Event debug formatting does not expose stored file payload bytes.
 - Every supported FUSE operation works through the mounted filesystem.
-- Extended attributes, copy-range, allocation, sparse seek, locks, poll, bmap, ioctl failure, macOS volume rename, macOS file exchange, and macOS extended times work through the mounted filesystem where supported by the target operating system.
+- Extended attributes, permission metadata changes, macOS volume rename, macOS file exchange, and macOS extended times work through the mounted filesystem where supported by the target operating system.
+- POSIX byte-range locks, block mapping, ioctl, poll, space allocation, sparse seek, and file-range copy fail as unsupported mounted filesystem operations.
 - Mutating supported FUSE operations append exactly the specified event kinds, and supported read-only or no-op operations append none.
 - Configured FUSE error callbacks receive failed supported operation errors and unsupported operation errors with the returned errno.
 - Successful FUSE operations do not invoke configured FUSE error callbacks.

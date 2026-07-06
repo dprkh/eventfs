@@ -52,11 +52,12 @@ fn mounted_nodes_links_renames_and_readlink_have_expected_event_kinds() {
         .ino();
 
     fs::set_permissions(&file_path, fs::Permissions::from_mode(0o600))
-        .expect_err("chmod is unsupported");
-    expect_no_events(
+        .expect("chmod updates permission metadata");
+    expect_event_kinds(
         &mut events,
         &filesystem,
-        "unsupported chmod does not append events",
+        &[EventKind::MetadataChanged],
+        "chmod appends one metadata-changed event",
     );
 
     fs::hard_link(&file_path, &hard_link_path).expect("hard link is created");
@@ -96,7 +97,7 @@ fn mounted_nodes_links_renames_and_readlink_have_expected_event_kinds() {
     let renamed_metadata = fs::metadata(&renamed_path).expect("renamed metadata is readable");
     assert_eq!(renamed_metadata.ino(), inode_before_rename);
     assert_eq!(renamed_metadata.nlink(), 2);
-    assert_eq!(renamed_metadata.permissions().mode() & 0o777, 0o777);
+    assert_eq!(renamed_metadata.permissions().mode() & 0o777, 0o600);
 
     fs::remove_file(&renamed_path).expect("renamed file is unlinked");
     fs::remove_file(&hard_link_path).expect("hard link is unlinked");

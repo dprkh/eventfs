@@ -8,9 +8,9 @@ mod linux {
     use std::hint::black_box;
     use std::io::{self, ErrorKind};
     use std::mem::MaybeUninit;
-    use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+    use std::os::fd::{IntoRawFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{FileExt, symlink};
+    use std::os::unix::fs::{FileExt, PermissionsExt, symlink};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -24,7 +24,6 @@ mod linux {
     const BENCHMARK_MEASUREMENT_MS: u64 = 200;
     const BENCHMARK_BLOCK_SIZE: usize = 4096;
     const BENCHMARK_DIRECTORY_ENTRY_COUNT: usize = 16;
-    const BENCHMARK_UNSUPPORTED_IOCTL_COMMAND: libc::Ioctl = 0;
     const BENCHMARK_XATTR_VALUE: &[u8] = b"value";
 
     pub(crate) fn criterion_configuration() -> Criterion {
@@ -112,6 +111,16 @@ mod linux {
             "getattr",
             repeated_file_metadata(eventfs_root.join("getattr-file")),
             repeated_file_metadata(host_root.join("getattr-file")),
+        );
+
+        let (eventfs_root, host_root) = fixture.roots();
+        prepare_file_pair(&eventfs_root, &host_root, "setattr-file", b"setattr")
+            .expect("setattr files are prepared");
+        benchmark_pair(
+            group,
+            "setattr",
+            repeated_chmod(eventfs_root.join("setattr-file")),
+            repeated_chmod(host_root.join("setattr-file")),
         );
 
         let (eventfs_root, host_root) = fixture.roots();
@@ -310,14 +319,6 @@ mod linux {
             repeated_sync_file(eventfs_root.join("fsync-file")),
             repeated_sync_file(host_root.join("fsync-file")),
         );
-
-        let (eventfs_root, host_root) = fixture.roots();
-        benchmark_pair(
-            group,
-            "copy_file_range",
-            repeated_copy_file_range(eventfs_root),
-            repeated_copy_file_range(host_root),
-        );
     }
 
     fn benchmark_directory_operations(
@@ -404,119 +405,6 @@ mod linux {
             "removexattr",
             repeated_removexattr(eventfs_root.join("xattr-file")),
             repeated_removexattr(host_root.join("xattr-file")),
-        );
-
-        let (eventfs_root, host_root) = fixture.roots();
-        prepare_file_pair(&eventfs_root, &host_root, "lock-file", b"locks")
-            .expect("lock files are prepared");
-        benchmark_pair(
-            group,
-            "getlk",
-            repeated_lock(eventfs_root.join("lock-file"), libc::F_GETLK),
-            repeated_lock(host_root.join("lock-file"), libc::F_GETLK),
-        );
-
-        let (eventfs_root, host_root) = fixture.roots();
-        benchmark_pair(
-            group,
-            "setlk",
-            repeated_setlk(eventfs_root.join("lock-file")),
-            repeated_setlk(host_root.join("lock-file")),
-        );
-
-        let (eventfs_root, host_root) = fixture.roots();
-        prepare_file_pair(&eventfs_root, &host_root, "ioctl-file", b"ioctl")
-            .expect("ioctl files are prepared");
-        benchmark_pair(
-            group,
-            "bmap",
-            repeated_bmap(eventfs_root.join("ioctl-file")),
-            repeated_bmap(host_root.join("ioctl-file")),
-        );
-
-        let (eventfs_root, host_root) = fixture.roots();
-        benchmark_pair(
-            group,
-            "ioctl",
-            repeated_ioctl_rejection(eventfs_root.join("ioctl-file")),
-            repeated_ioctl_rejection(host_root.join("ioctl-file")),
-        );
-
-        let (eventfs_root, host_root) = fixture.roots();
-        benchmark_pair(
-            group,
-            "poll",
-            repeated_poll(eventfs_root.join("ioctl-file")),
-            repeated_poll(host_root.join("ioctl-file")),
-        );
-
-        let (eventfs_root, host_root) = fixture.roots();
-        benchmark_pair(
-            group,
-            "fallocate_extend",
-            repeated_fallocate(eventfs_root, "fallocate-extend", 0),
-            repeated_fallocate(host_root, "fallocate-extend", 0),
-        );
-
-        let (eventfs_root, host_root) = fixture.roots();
-        benchmark_pair(
-            group,
-            "fallocate_keep_size",
-            repeated_fallocate(
-                eventfs_root,
-                "fallocate-keep-size",
-                libc::FALLOC_FL_KEEP_SIZE,
-            ),
-            repeated_fallocate(host_root, "fallocate-keep-size", libc::FALLOC_FL_KEEP_SIZE),
-        );
-
-        let (eventfs_root, host_root) = fixture.roots();
-        benchmark_pair(
-            group,
-            "fallocate_punch_hole",
-            repeated_fallocate(
-                eventfs_root,
-                "fallocate-punch-hole",
-                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-            ),
-            repeated_fallocate(
-                host_root,
-                "fallocate-punch-hole",
-                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-            ),
-        );
-
-        let (eventfs_root, host_root) = fixture.roots();
-        benchmark_pair(
-            group,
-            "fallocate_zero_range",
-            repeated_fallocate(
-                eventfs_root,
-                "fallocate-zero-range",
-                libc::FALLOC_FL_ZERO_RANGE,
-            ),
-            repeated_fallocate(
-                host_root,
-                "fallocate-zero-range",
-                libc::FALLOC_FL_ZERO_RANGE,
-            ),
-        );
-
-        let (eventfs_root, host_root) = fixture.roots();
-        prepare_sparse_pair(&eventfs_root, &host_root).expect("sparse files are prepared");
-        benchmark_pair(
-            group,
-            "lseek_data",
-            repeated_lseek(eventfs_root.join("sparse-file"), libc::SEEK_DATA),
-            repeated_lseek(host_root.join("sparse-file"), libc::SEEK_DATA),
-        );
-
-        let (eventfs_root, host_root) = fixture.roots();
-        benchmark_pair(
-            group,
-            "lseek_hole",
-            repeated_lseek(eventfs_root.join("sparse-file"), libc::SEEK_HOLE),
-            repeated_lseek(host_root.join("sparse-file"), libc::SEEK_HOLE),
         );
     }
 
@@ -655,6 +543,21 @@ mod linux {
         move |iterations| measure_repeated(iterations, || metadata_file(&file))
     }
 
+    fn repeated_chmod(path: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
+        move |iterations| {
+            let mut elapsed = Duration::ZERO;
+            for index in 0..iterations {
+                let mode = if index.is_multiple_of(2) {
+                    0o600
+                } else {
+                    0o644
+                };
+                elapsed += timed(|| fs::set_permissions(&path, fs::Permissions::from_mode(mode)))?;
+            }
+            Ok(elapsed)
+        }
+    }
+
     fn repeated_create(root: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
         move |iterations| {
             let mut elapsed = Duration::ZERO;
@@ -767,28 +670,6 @@ mod linux {
         move |iterations| measure_repeated(iterations, || file.sync_all())
     }
 
-    fn repeated_copy_file_range(root: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
-        let source = root.join("copy-source");
-        fs::write(&source, vec![b'c'; BENCHMARK_BLOCK_SIZE]).expect("copy source is prepared");
-        let source_file = OpenOptions::new()
-            .read(true)
-            .open(&source)
-            .expect("copy source opens");
-        move |iterations| {
-            let mut elapsed = Duration::ZERO;
-            for index in 0..iterations {
-                let destination = iteration_path(&root, "copy-file-range", index, "destination");
-                fs::write(&destination, vec![0; BENCHMARK_BLOCK_SIZE])?;
-                let destination_file = OpenOptions::new().write(true).open(&destination)?;
-                elapsed += timed(|| {
-                    copy_file_range_fd(source_file.as_raw_fd(), destination_file.as_raw_fd())
-                })?;
-                cleanup_path(&destination)?;
-            }
-            Ok(elapsed)
-        }
-    }
-
     fn repeated_opendir(path: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
         move |iterations| {
             let mut elapsed = Duration::ZERO;
@@ -864,88 +745,6 @@ mod linux {
         }
     }
 
-    fn repeated_lock(
-        path: PathBuf,
-        command: libc::c_int,
-    ) -> impl FnMut(u64) -> io::Result<Duration> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .expect("lock file opens");
-        move |iterations| measure_repeated(iterations, || fcntl_lock(file.as_raw_fd(), command))
-    }
-
-    fn repeated_setlk(path: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .expect("setlk file opens");
-        move |iterations| {
-            let mut elapsed = Duration::ZERO;
-            for _ in 0..iterations {
-                elapsed += timed(|| fcntl_lock(file.as_raw_fd(), libc::F_SETLK))?;
-                unlock_file(file.as_raw_fd())?;
-            }
-            Ok(elapsed)
-        }
-    }
-
-    fn repeated_bmap(path: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
-        let file = OpenOptions::new()
-            .read(true)
-            .open(path)
-            .expect("bmap file opens");
-        move |iterations| measure_repeated(iterations, || bmap_fd(file.as_raw_fd()))
-    }
-
-    fn repeated_ioctl_rejection(path: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
-        let file = OpenOptions::new()
-            .read(true)
-            .open(path)
-            .expect("ioctl file opens");
-        move |iterations| measure_repeated(iterations, || ioctl_rejection_fd(file.as_raw_fd()))
-    }
-
-    fn repeated_poll(path: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .expect("poll file opens");
-        move |iterations| measure_repeated(iterations, || poll_fd(file.as_raw_fd()))
-    }
-
-    fn repeated_fallocate(
-        root: PathBuf,
-        operation: &'static str,
-        mode: libc::c_int,
-    ) -> impl FnMut(u64) -> io::Result<Duration> {
-        move |iterations| {
-            let mut elapsed = Duration::ZERO;
-            for index in 0..iterations {
-                let path = iteration_path(&root, operation, index, "file");
-                fs::write(&path, vec![b'f'; BENCHMARK_BLOCK_SIZE * 2])?;
-                let file = OpenOptions::new().read(true).write(true).open(&path)?;
-                elapsed += timed(|| fallocate_fd(file.as_raw_fd(), mode))?;
-                cleanup_path(&path)?;
-            }
-            Ok(elapsed)
-        }
-    }
-
-    fn repeated_lseek(
-        path: PathBuf,
-        whence: libc::c_int,
-    ) -> impl FnMut(u64) -> io::Result<Duration> {
-        let file = OpenOptions::new()
-            .read(true)
-            .open(path)
-            .expect("lseek file opens");
-        move |iterations| measure_repeated(iterations, || lseek_fd(file.as_raw_fd(), whence))
-    }
-
     fn measure_repeated(
         iterations: u64,
         mut operation: impl FnMut() -> io::Result<()>,
@@ -1015,22 +814,6 @@ mod linux {
             BENCHMARK_XATTR_VALUE,
             0,
         )
-    }
-
-    fn prepare_sparse_pair(eventfs_root: &Path, host_root: &Path) -> io::Result<()> {
-        prepare_sparse_file(&eventfs_root.join("sparse-file"))?;
-        prepare_sparse_file(&host_root.join("sparse-file"))
-    }
-
-    fn prepare_sparse_file(path: &Path) -> io::Result<()> {
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(path)?;
-        file.write_at(b"data", BENCHMARK_BLOCK_SIZE as u64)?;
-        let written = file.write_at(&[0], (BENCHMARK_BLOCK_SIZE * 2 - 1) as u64)?;
-        expect_byte_count(written, 1, "sparse extension")
     }
 
     fn metadata_path(path: &Path) -> io::Result<()> {
@@ -1111,66 +894,6 @@ mod linux {
         Ok(())
     }
 
-    fn bmap_fd(fd: RawFd) -> io::Result<()> {
-        let mut block: libc::c_int = 0;
-        syscall_zero(unsafe {
-            libc::ioctl(fd, linux_raw_sys::ioctl::FIBMAP as libc::Ioctl, &mut block)
-        })?;
-        black_box(block);
-        Ok(())
-    }
-
-    fn ioctl_rejection_fd(fd: RawFd) -> io::Result<()> {
-        let result = unsafe {
-            libc::ioctl(
-                fd,
-                BENCHMARK_UNSUPPORTED_IOCTL_COMMAND,
-                std::ptr::null_mut::<libc::c_void>(),
-            )
-        };
-        if result == -1 {
-            black_box(io::Error::last_os_error().raw_os_error());
-            Ok(())
-        } else {
-            Err(io::Error::other("unsupported ioctl unexpectedly succeeded"))
-        }
-    }
-
-    fn poll_fd(fd: RawFd) -> io::Result<()> {
-        let mut descriptor = libc::pollfd {
-            fd,
-            events: libc::POLLIN | libc::POLLOUT,
-            revents: 0,
-        };
-        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
-        if result >= 0 {
-            black_box(descriptor.revents);
-            Ok(())
-        } else {
-            Err(last_os_error())
-        }
-    }
-
-    fn copy_file_range_fd(source: RawFd, destination: RawFd) -> io::Result<()> {
-        let mut source_offset: libc::loff_t = 0;
-        let mut destination_offset: libc::loff_t = 0;
-        let copied = unsafe {
-            libc::copy_file_range(
-                source,
-                &mut source_offset,
-                destination,
-                &mut destination_offset,
-                BENCHMARK_BLOCK_SIZE,
-                0,
-            )
-        };
-        if copied >= 0 {
-            expect_byte_count(copied as usize, BENCHMARK_BLOCK_SIZE, "copy_file_range")
-        } else {
-            Err(last_os_error())
-        }
-    }
-
     fn setxattr_path(path: &Path, name: &str, value: &[u8], flags: libc::c_int) -> io::Result<()> {
         let path = c_path(path);
         let name = CString::new(name).expect("xattr name has no interior NUL bytes");
@@ -1218,44 +941,6 @@ mod linux {
         let path = c_path(path);
         let name = CString::new(name).expect("xattr name has no interior NUL bytes");
         syscall_zero(unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) })
-    }
-
-    fn fcntl_lock(fd: RawFd, command: libc::c_int) -> io::Result<()> {
-        let mut lock = libc::flock {
-            l_type: libc::F_WRLCK as libc::c_short,
-            l_whence: libc::SEEK_SET as libc::c_short,
-            l_start: 0,
-            l_len: 1,
-            l_pid: 0,
-        };
-        syscall_zero(unsafe { libc::fcntl(fd, command, &mut lock) })?;
-        black_box(lock);
-        Ok(())
-    }
-
-    fn unlock_file(fd: RawFd) -> io::Result<()> {
-        let mut lock = libc::flock {
-            l_type: libc::F_UNLCK as libc::c_short,
-            l_whence: libc::SEEK_SET as libc::c_short,
-            l_start: 0,
-            l_len: 1,
-            l_pid: 0,
-        };
-        syscall_zero(unsafe { libc::fcntl(fd, libc::F_SETLK, &mut lock) })
-    }
-
-    fn fallocate_fd(fd: RawFd, mode: libc::c_int) -> io::Result<()> {
-        syscall_zero(unsafe { libc::fallocate(fd, mode, 0, BENCHMARK_BLOCK_SIZE as libc::off_t) })
-    }
-
-    fn lseek_fd(fd: RawFd, whence: libc::c_int) -> io::Result<()> {
-        let result = unsafe { libc::lseek(fd, 0, whence) };
-        if result >= 0 {
-            black_box(result);
-            Ok(())
-        } else {
-            Err(last_os_error())
-        }
     }
 
     fn open_directory(path: &Path) -> io::Result<*mut libc::DIR> {

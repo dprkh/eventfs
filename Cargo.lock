@@ -355,7 +355,6 @@ dependencies = [
  "fastcdc",
  "fuser",
  "libc",
- "linux-raw-sys",
  "postcard",
  "rocksdb",
  "serde",
