@@ -8,7 +8,7 @@ use eventfs::{BranchIdentifier, BranchName, BranchStatus, EventKind, FilesystemE
 
 use support::{
     TestDirectories, branch_page_limit, event_page_limit, file_identifier_for_path,
-    list_all_events, open_test_filesystem,
+    list_all_events, open_test_filesystem, write_mounted_file,
 };
 
 #[test]
@@ -20,7 +20,7 @@ fn branch_switching_divergence_and_snapshot_reads_preserve_independent_file_cont
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"hello").expect("file is written on main");
+    write_mounted_file(&file_path, b"hello").expect("file is written on main");
     mounted.unmount().expect("filesystem unmounts");
 
     let main = filesystem
@@ -68,7 +68,7 @@ fn branch_switching_divergence_and_snapshot_reads_preserve_independent_file_cont
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"hi mom").expect("feature branch file is changed");
+    write_mounted_file(&file_path, b"hi mom").expect("feature branch file is changed");
     assert_eq!(
         fs::read(&file_path).expect("feature branch file is read"),
         b"hi mom"
@@ -138,7 +138,7 @@ fn branch_creation_after_directory_rename_preserves_parent_link_counts() {
     fs::create_dir(&old_parent).expect("old parent is created");
     fs::create_dir(&new_parent).expect("new parent is created");
     fs::create_dir(&moved).expect("moved directory is created");
-    fs::write(moved.join("child"), b"branch contents").expect("moved child is written");
+    write_mounted_file(moved.join("child"), b"branch contents").expect("moved child is written");
     fs::rename(&moved, &moved_target).expect("directory is renamed across parents");
 
     let moved_inode = fs::metadata(&moved_target)
@@ -202,8 +202,8 @@ fn branch_creation_from_prior_file_event_uses_snapshot_contents_at_that_position
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"hello").expect("file is written on main");
-    fs::write(&file_path, b"main later").expect("file is changed on main");
+    write_mounted_file(&file_path, b"hello").expect("file is written on main");
+    write_mounted_file(&file_path, b"main later").expect("file is changed on main");
     mounted.unmount().expect("filesystem unmounts");
 
     let events = list_all_events(&filesystem);
@@ -236,7 +236,7 @@ fn branch_creation_from_prior_file_event_uses_snapshot_contents_at_that_position
         fs::read(&file_path).expect("historical branch file is read"),
         b"hello"
     );
-    fs::write(&file_path, b"hi mom").expect("historical branch diverges");
+    write_mounted_file(&file_path, b"hi mom").expect("historical branch diverges");
     mounted.unmount().expect("filesystem unmounts");
 
     let branch_snapshot = filesystem
@@ -288,7 +288,7 @@ fn branch_creation_from_prior_position_restores_historical_namespace() {
         .spawn_mount()
         .expect("filesystem mounts in the background");
     fs::create_dir(&docs).expect("directory is created on main");
-    fs::write(&old_path, b"old").expect("historical file is written");
+    write_mounted_file(&old_path, b"old").expect("historical file is written");
     mounted.unmount().expect("filesystem unmounts");
 
     let historical_position = filesystem
@@ -300,7 +300,7 @@ fn branch_creation_from_prior_position_restores_historical_namespace() {
         .spawn_mount()
         .expect("filesystem mounts in the background");
     fs::rename(&old_path, &new_path).expect("historical file is renamed on main");
-    fs::write(&later_path, b"later").expect("later file is written on main");
+    write_mounted_file(&later_path, b"later").expect("later file is written on main");
     fs::remove_file(&new_path).expect("renamed file is removed on main");
     mounted.unmount().expect("filesystem unmounts");
 
@@ -343,7 +343,7 @@ fn branch_file_history_and_snapshots_handle_files_absent_on_branch_or_at_positio
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"late").expect("late file is written on main");
+    write_mounted_file(&file_path, b"late").expect("late file is written on main");
     mounted.unmount().expect("filesystem unmounts");
 
     let file_identifier = file_identifier_for_path(&filesystem, "/late.txt");
@@ -449,7 +449,7 @@ fn branch_event_listing_uses_branch_positions_and_rejects_cross_branch_cursors()
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"hello").expect("file is written on main");
+    write_mounted_file(&file_path, b"hello").expect("file is written on main");
     mounted.unmount().expect("filesystem unmounts");
 
     let main = filesystem
@@ -466,7 +466,8 @@ fn branch_event_listing_uses_branch_positions_and_rejects_cross_branch_cursors()
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"feature").expect("file is changed on feature");
+    write_mounted_file(&file_path, b"feature").expect("file is changed on feature");
+    write_mounted_file(&file_path, b"feature later").expect("file is changed again on feature");
     mounted.unmount().expect("filesystem unmounts");
 
     let page = filesystem
@@ -537,7 +538,7 @@ fn global_events_remain_branch_aware_and_branch_file_listing_paginates_per_branc
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"main base").expect("file is written on main");
+    write_mounted_file(&file_path, b"main base").expect("file is written on main");
     mounted.unmount().expect("filesystem unmounts");
 
     let main = filesystem
@@ -555,8 +556,8 @@ fn global_events_remain_branch_aware_and_branch_file_listing_paginates_per_branc
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"feature one").expect("first feature write succeeds");
-    fs::write(&file_path, b"feature two").expect("second feature write succeeds");
+    write_mounted_file(&file_path, b"feature one").expect("first feature write succeeds");
+    write_mounted_file(&file_path, b"feature two").expect("second feature write succeeds");
     mounted.unmount().expect("filesystem unmounts");
 
     let first_page = filesystem
@@ -727,7 +728,7 @@ fn branch_event_first_parent_sequences_follow_each_branch_head_chain() {
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"main base").expect("file is written on main");
+    write_mounted_file(&file_path, b"main base").expect("file is written on main");
     mounted.unmount().expect("filesystem unmounts");
 
     let main = filesystem
@@ -744,8 +745,8 @@ fn branch_event_first_parent_sequences_follow_each_branch_head_chain() {
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"feature one").expect("first feature write succeeds");
-    fs::write(&file_path, b"feature two").expect("second feature write succeeds");
+    write_mounted_file(&file_path, b"feature one").expect("first feature write succeeds");
+    write_mounted_file(&file_path, b"feature two").expect("second feature write succeeds");
     mounted.unmount().expect("filesystem unmounts");
 
     let feature_events = filesystem
@@ -773,7 +774,7 @@ fn branch_event_first_parent_sequences_follow_each_branch_head_chain() {
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"main later").expect("later main write succeeds");
+    write_mounted_file(&file_path, b"main later").expect("later main write succeeds");
     mounted.unmount().expect("filesystem unmounts");
 
     let main_later = list_all_events(&filesystem)
@@ -803,7 +804,7 @@ fn branch_snapshot_reads_and_deletion_reject_cross_branch_or_active_state() {
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"hello").expect("file is written on main");
+    write_mounted_file(&file_path, b"hello").expect("file is written on main");
     mounted.unmount().expect("filesystem unmounts");
 
     let main = filesystem
@@ -923,7 +924,7 @@ fn deleted_branch_refs_preserve_history_and_snapshot_reads() {
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"main base").expect("file is written on main");
+    write_mounted_file(&file_path, b"main base").expect("file is written on main");
     mounted.unmount().expect("filesystem unmounts");
 
     let main = filesystem
@@ -941,7 +942,7 @@ fn deleted_branch_refs_preserve_history_and_snapshot_reads() {
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"feature text").expect("feature branch file is written");
+    write_mounted_file(&file_path, b"feature text").expect("feature branch file is written");
     mounted.unmount().expect("filesystem unmounts");
 
     let feature_head = filesystem
@@ -1052,7 +1053,7 @@ fn concurrent_branch_deletion_switching_and_listing_preserve_branch_integrity() 
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"main base").expect("file is written on main");
+    write_mounted_file(&file_path, b"main base").expect("file is written on main");
     mounted.unmount().expect("filesystem unmounts");
 
     let main = filesystem
@@ -1153,7 +1154,7 @@ fn mounted_branch_switch_conflicts_with_concurrent_writes() {
     let root = directories.mount_point_path().to_path_buf();
     let writer = thread::spawn(move || {
         for index in 0..12 {
-            fs::write(
+            write_mounted_file(
                 root.join(format!("mounted-{index}")),
                 format!("value-{index}"),
             )

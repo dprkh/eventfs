@@ -72,28 +72,8 @@ pub(crate) enum CreateNodeKind {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SetAttributes {
-    pub(crate) mode: Option<u32>,
-    pub(crate) uid: Option<u32>,
-    pub(crate) gid: Option<u32>,
-    pub(crate) size: Option<u64>,
-    pub(crate) atime: Option<fuser::TimeOrNow>,
-    pub(crate) mtime: Option<fuser::TimeOrNow>,
-    pub(crate) ctime: Option<SystemTime>,
-    pub(crate) crtime: Option<SystemTime>,
-    pub(crate) bkuptime: Option<SystemTime>,
-    pub(crate) flags: Option<u32>,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct FuseWrite {
     pub(crate) written: u32,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct FuseCredentials {
-    pub(crate) uid: u32,
-    pub(crate) gid: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -164,8 +144,8 @@ fn storage(database: DB, write_state: WriteState) -> Storage {
 
 type FuseResult<T> = Result<T, FuseError>;
 
-const STORAGE_SCHEMA_VERSION_BASELINE: u64 = 8;
-const STORAGE_SCHEMA_VERSION_CURRENT: u64 = 8;
+const STORAGE_SCHEMA_VERSION_BASELINE: u64 = 9;
+const STORAGE_SCHEMA_VERSION_CURRENT: u64 = 9;
 
 const EVENT_SEQUENCE_INITIAL: EventSequence = EventSequence::new(0);
 const BRANCH_IDENTIFIER_INITIAL: BranchIdentifier = BranchIdentifier::new(1);
@@ -230,7 +210,6 @@ const METADATA_VOLUME_NAME_DEFAULT: &str = "eventfs";
 
 const EVENT_PAYLOAD_PART_OVERWRITTEN: u8 = b'o';
 const EVENT_PAYLOAD_PART_WRITTEN: u8 = b'w';
-const EVENT_PAYLOAD_PART_REMOVED: u8 = b'r';
 const CONTENT_CHUNK_HASH_BLAKE3: u8 = 1;
 const CONTENT_MANIFEST_HASH_BLAKE3: u8 = 2;
 const NAMESPACE_HASH_BLAKE3: u8 = 3;
@@ -308,9 +287,6 @@ struct StoredTime {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 struct StoredInode {
     kind: StoredNodeKind,
-    mode: u16,
-    uid: u32,
-    gid: u32,
     size: u64,
     nlink: u32,
     rdev: u32,
@@ -319,7 +295,6 @@ struct StoredInode {
     ctime: StoredTime,
     crtime: StoredTime,
     bkuptime: StoredTime,
-    flags: u32,
     parent: u64,
     name: Vec<u8>,
     symlink_target: Option<Vec<u8>>,
@@ -472,9 +447,6 @@ enum EventPayloadExtents {
     FileWrite {
         overwritten_extents: Vec<StoredExtent>,
         written_extents: Vec<StoredExtent>,
-    },
-    FileTruncate {
-        removed_extents: Vec<StoredExtent>,
     },
 }
 
@@ -1077,18 +1049,10 @@ impl Storage {
         &self,
         parent: u64,
         name: &OsStr,
-        requested_mode: u32,
-        umask: u32,
-        credentials: FuseCredentials,
         kind: CreateNodeKind,
     ) -> FuseResult<EntrySnapshot> {
         let mut write_state = self.lock_write_state()?;
-        let mut parent_inode = self.require_directory_with_access(
-            parent,
-            credentials.uid,
-            credentials.gid,
-            write_directory_access_mask(),
-        )?;
+        let mut parent_inode = self.require_directory(parent)?;
         let name_bytes = validate_name(name)?;
         if self
             .directory_entry(parent, &name_bytes)
@@ -1115,10 +1079,9 @@ impl Storage {
             &name_bytes,
             &self.database,
         )?;
-        let (stored_kind, mode, rdev, size, symlink_target, event_kind) = match kind {
+        let (stored_kind, rdev, size, symlink_target, event_kind) = match kind {
             CreateNodeKind::Directory => (
                 StoredNodeKind::Directory,
-                permissions_from_mode(requested_mode, umask),
                 0,
                 0,
                 None,
@@ -1126,7 +1089,6 @@ impl Storage {
             ),
             CreateNodeKind::RegularFile => (
                 StoredNodeKind::RegularFile,
-                permissions_from_mode(requested_mode, umask),
                 0,
                 0,
                 None,
@@ -1134,7 +1096,6 @@ impl Storage {
             ),
             CreateNodeKind::Special { mode, rdev } => (
                 special_kind_from_mode(mode)?,
-                permissions_from_mode(mode, umask),
                 rdev,
                 0,
                 None,
@@ -1143,9 +1104,6 @@ impl Storage {
         };
         let inode = StoredInode {
             kind: stored_kind,
-            mode,
-            uid: credentials.uid,
-            gid: credentials.gid,
             size,
             nlink: match stored_kind {
                 StoredNodeKind::Directory => 2,
@@ -1157,7 +1115,6 @@ impl Storage {
             ctime: now,
             crtime: now,
             bkuptime: now,
-            flags: 0,
             parent,
             name: name_bytes.clone(),
             symlink_target,
@@ -1214,12 +1171,9 @@ impl Storage {
         parent: u64,
         link_name: &OsStr,
         target: &Path,
-        uid: u32,
-        gid: u32,
     ) -> FuseResult<EntrySnapshot> {
         let mut write_state = self.lock_write_state()?;
-        let mut parent_inode =
-            self.require_directory_with_access(parent, uid, gid, write_directory_access_mask())?;
+        let mut parent_inode = self.require_directory(parent)?;
         let name_bytes = validate_name(link_name)?;
         if self
             .directory_entry(parent, &name_bytes)
@@ -1249,9 +1203,6 @@ impl Storage {
         let target_bytes = target.as_os_str().as_bytes().to_vec();
         let inode = StoredInode {
             kind: StoredNodeKind::Symlink,
-            mode: 0o777,
-            uid,
-            gid,
             size: target_bytes.len() as u64,
             nlink: 1,
             rdev: 0,
@@ -1260,7 +1211,6 @@ impl Storage {
             ctime: now,
             crtime: now,
             bkuptime: now,
-            flags: 0,
             parent,
             name: name_bytes.clone(),
             symlink_target: Some(target_bytes),
@@ -1305,142 +1255,12 @@ impl Storage {
         })
     }
 
-    pub(crate) fn setattr(
-        &self,
-        inode_number: u64,
-        attributes: SetAttributes,
-        uid: u32,
-        gid: u32,
-    ) -> FuseResult<EntrySnapshot> {
-        let mut write_state = self.lock_write_state()?;
-        let mut inode = self
-            .inode(inode_number)
-            .map_err(to_fuse_integrity)?
-            .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        if uid != 0 && uid != inode.uid {
-            return Err(FuseError::Errno(fuser::Errno::EACCES));
-        }
-        if attributes.size.is_some()
-            && uid != 0
-            && !access_allowed(&inode, uid, gid, fuser::AccessFlags::W_OK)
-        {
-            return Err(FuseError::Errno(fuser::Errno::EACCES));
-        }
-        let event_sequence = write_state.next_event_sequence()?;
-        let now = StoredTime::now();
-        let mut event_kind = EventKind::MetadataChanged;
-        let mut offset = None;
-        let mut byte_length = None;
-        let mut payload = EventPayload::None;
-        let mut payload_extents = EventPayloadExtents::None;
-        let mut snapshot_extents = None;
-
-        if let Some(mode) = attributes.mode {
-            inode.mode = permission_bits(mode);
-        }
-        if let Some(uid) = attributes.uid {
-            inode.uid = uid;
-        }
-        if let Some(gid) = attributes.gid {
-            inode.gid = gid;
-        }
-        if let Some(atime) = attributes.atime {
-            inode.atime = stored_time_from_time_or_now(atime);
-        }
-        if let Some(mtime) = attributes.mtime {
-            inode.mtime = stored_time_from_time_or_now(mtime);
-        }
-        if let Some(ctime) = attributes.ctime {
-            inode.ctime = StoredTime::from_system_time(ctime);
-        }
-        if let Some(crtime) = attributes.crtime {
-            inode.crtime = StoredTime::from_system_time(crtime);
-        }
-        if let Some(bkuptime) = attributes.bkuptime {
-            inode.bkuptime = StoredTime::from_system_time(bkuptime);
-        }
-        if let Some(flags) = attributes.flags {
-            inode.flags = flags;
-        }
-
-        let mut batch = WriteBatch::default();
-        if let Some(size) = attributes.size {
-            if inode.kind != StoredNodeKind::RegularFile {
-                return Err(FuseError::Errno(fuser::Errno::EINVAL));
-            }
-            let old_size = inode.size;
-            let existing_extents = self
-                .file_content_manifest_extents(
-                    self.active_branch_identifier(),
-                    FileIdentifier::new(inode_number),
-                )
-                .map_err(to_fuse_integrity)?;
-            self.validate_stored_extents(&existing_extents)?;
-            let final_extents = current_extents_after_truncate(&existing_extents, size)?;
-            let content_manifest_identifier =
-                self.put_content_manifest(&mut batch, &final_extents)?;
-            if size < old_size {
-                payload_extents = EventPayloadExtents::FileTruncate {
-                    removed_extents: slice_extents(&existing_extents, size, old_size, 0)
-                        .map_err(to_fuse_integrity)?,
-                };
-            }
-            snapshot_extents = Some(final_extents);
-            inode.size = size;
-            inode.content_manifest_identifier = Some(content_manifest_identifier);
-            inode.mtime = now;
-            event_kind = EventKind::FileTruncated;
-            offset = Some(old_size.min(size));
-            byte_length = Some(old_size.abs_diff(size));
-            payload = EventPayload::FileTruncate {
-                old_file_size: old_size,
-                new_file_size: size,
-                removed_byte_length: old_size.saturating_sub(size),
-            };
-        }
-        inode.ctime = now;
-        let mut mutation = StoredMutation::default();
-        mutation.put_inode(inode_number, &inode);
-
-        let event = EventRecord::new(
-            event_sequence,
-            event_kind,
-            UtcDateTime::now(),
-            file_identifier_for_kind(inode_number, inode.kind),
-            inode_event_path(
-                self.active_branch_identifier(),
-                inode_number,
-                &inode,
-                &self.database,
-            )
-            .ok(),
-            offset,
-            byte_length,
-        )
-        .with_payload(payload);
-        self.commit_event_with_payloads(
-            &mut batch,
-            event_sequence,
-            &event,
-            payload_extents,
-            snapshot_extents.as_deref(),
-            None,
-            mutation,
-        )?;
-        self.commit_mutation(&mut write_state, batch, event_sequence, None)?;
-
-        Ok(EntrySnapshot {
-            ttl: FUSE_ATTRIBUTE_TTL,
-            attr: inode_attr(inode_number, &inode),
-        })
+    pub(crate) fn unlink(&self, parent: u64, name: &OsStr) -> FuseResult<()> {
+        self.remove_directory_entry(parent, name, false)
     }
 
-    pub(crate) fn unlink(&self, parent: u64, name: &OsStr, uid: u32, gid: u32) -> FuseResult<()> {
-        self.remove_directory_entry(parent, name, false, uid, gid)
-    }
-
-    pub(crate) fn rmdir(&self, parent: u64, name: &OsStr, uid: u32, gid: u32) -> FuseResult<()> {
-        self.remove_directory_entry(parent, name, true, uid, gid)
+    pub(crate) fn rmdir(&self, parent: u64, name: &OsStr) -> FuseResult<()> {
+        self.remove_directory_entry(parent, name, true)
     }
 
     pub(crate) fn rename(
@@ -1450,26 +1270,15 @@ impl Storage {
         new_parent: u64,
         new_name: &OsStr,
         no_replace: bool,
-        credentials: FuseCredentials,
     ) -> FuseResult<()> {
         let mut write_state = self.lock_write_state()?;
         let name_bytes = validate_name(name)?;
         let new_name_bytes = validate_name(new_name)?;
-        let mut old_parent_inode = self.require_directory_with_access(
-            parent,
-            credentials.uid,
-            credentials.gid,
-            write_directory_access_mask(),
-        )?;
+        let mut old_parent_inode = self.require_directory(parent)?;
         let mut new_parent_inode = if new_parent == parent {
             None
         } else {
-            Some(self.require_directory_with_access(
-                new_parent,
-                credentials.uid,
-                credentials.gid,
-                write_directory_access_mask(),
-            )?)
+            Some(self.require_directory(new_parent)?)
         };
         let entry = self
             .directory_entry(parent, &name_bytes)
@@ -1582,8 +1391,6 @@ impl Storage {
         inode_number: u64,
         new_parent: u64,
         new_name: &OsStr,
-        uid: u32,
-        gid: u32,
     ) -> FuseResult<EntrySnapshot> {
         let mut write_state = self.lock_write_state()?;
         let mut inode = self
@@ -1593,12 +1400,7 @@ impl Storage {
         if inode.kind == StoredNodeKind::Directory {
             return Err(FuseError::Errno(fuser::Errno::EPERM));
         }
-        let mut parent_inode = self.require_directory_with_access(
-            new_parent,
-            uid,
-            gid,
-            write_directory_access_mask(),
-        )?;
+        let mut parent_inode = self.require_directory(new_parent)?;
         let name_bytes = validate_name(new_name)?;
         if self
             .directory_entry(new_parent, &name_bytes)
@@ -1646,13 +1448,7 @@ impl Storage {
         })
     }
 
-    pub(crate) fn open_file(
-        &self,
-        inode_number: u64,
-        uid: u32,
-        gid: u32,
-        flags: fuser::OpenFlags,
-    ) -> FuseResult<()> {
+    pub(crate) fn open_file(&self, inode_number: u64) -> FuseResult<()> {
         let inode = self
             .inode(inode_number)
             .map_err(to_fuse_integrity)?
@@ -1660,7 +1456,6 @@ impl Storage {
         if inode.kind != StoredNodeKind::RegularFile {
             return Err(FuseError::Errno(fuser::Errno::EISDIR));
         }
-        self.check_inode_access(&inode, uid, gid, access_mask_for_open_flags(flags))?;
         Ok(())
     }
 
@@ -1669,8 +1464,6 @@ impl Storage {
         inode_number: u64,
         offset: u64,
         size: u32,
-        uid: u32,
-        gid: u32,
     ) -> FuseResult<Vec<u8>> {
         let snapshot = self.database.snapshot();
         let inode = self
@@ -1680,7 +1473,6 @@ impl Storage {
         if inode.kind != StoredNodeKind::RegularFile {
             return Err(FuseError::Errno(fuser::Errno::EISDIR));
         }
-        self.check_inode_access(&inode, uid, gid, fuser::AccessFlags::R_OK)?;
         if offset >= inode.size || size == 0 {
             return Ok(Vec::new());
         }
@@ -1702,8 +1494,6 @@ impl Storage {
         inode_number: u64,
         offset: u64,
         data: &[u8],
-        uid: u32,
-        gid: u32,
     ) -> FuseResult<FuseWrite> {
         let mut write_state = self.lock_write_state()?;
         let mut inode = self
@@ -1713,7 +1503,6 @@ impl Storage {
         if inode.kind != StoredNodeKind::RegularFile {
             return Err(FuseError::Errno(fuser::Errno::EISDIR));
         }
-        self.check_inode_access(&inode, uid, gid, fuser::AccessFlags::W_OK)?;
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or(FuseError::Errno(fuser::Errno::EFBIG))?;
@@ -1964,22 +1753,11 @@ impl Storage {
         Ok(())
     }
 
-    pub(crate) fn access(
-        &self,
-        inode_number: u64,
-        uid: u32,
-        gid: u32,
-        mask: fuser::AccessFlags,
-    ) -> FuseResult<()> {
-        let inode = self
-            .inode(inode_number)
+    pub(crate) fn access(&self, inode_number: u64) -> FuseResult<()> {
+        self.inode(inode_number)
             .map_err(to_fuse_integrity)?
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        if uid == 0 || access_allowed(&inode, uid, gid, mask) {
-            Ok(())
-        } else {
-            Err(FuseError::Errno(fuser::Errno::EACCES))
-        }
+        Ok(())
     }
 
     pub(crate) fn statfs(&self, database_directory: &Path) -> FuseResult<FileSystemStatistics> {
@@ -2002,17 +1780,12 @@ impl Storage {
         name: &OsStr,
         value: &[u8],
         flags: i32,
-        uid: u32,
-        gid: u32,
     ) -> FuseResult<()> {
         let mut write_state = self.lock_write_state()?;
         let mut inode = self
             .inode(inode_number)
             .map_err(to_fuse_integrity)?
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        if uid != 0 && uid != inode.uid {
-            self.check_inode_access(&inode, uid, gid, fuser::AccessFlags::W_OK)?;
-        }
         let name_bytes = validate_extended_attribute_name(name)?;
         let create = flags & libc::XATTR_CREATE != 0;
         let replace = flags & libc::XATTR_REPLACE != 0;
@@ -2086,15 +1859,12 @@ impl Storage {
         Ok(ExtendedAttributeList { bytes })
     }
 
-    pub(crate) fn removexattr(&self, inode_number: u64, name: &OsStr, uid: u32) -> FuseResult<()> {
+    pub(crate) fn removexattr(&self, inode_number: u64, name: &OsStr) -> FuseResult<()> {
         let mut write_state = self.lock_write_state()?;
         let mut inode = self
             .inode(inode_number)
             .map_err(to_fuse_integrity)?
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        if uid != 0 && uid != inode.uid {
-            return Err(FuseError::Errno(fuser::Errno::EACCES));
-        }
         let name_bytes = validate_extended_attribute_name(name)?;
         if self
             .extended_attribute(inode_number, &name_bytes)?
@@ -2143,23 +1913,16 @@ impl Storage {
     pub(crate) fn poll(
         &self,
         inode_number: u64,
-        uid: u32,
-        gid: u32,
         requested: fuser::PollEvents,
     ) -> FuseResult<fuser::PollEvents> {
-        let inode = self
-            .inode(inode_number)
+        self.inode(inode_number)
             .map_err(to_fuse_integrity)?
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
         let mut ready = fuser::PollEvents::empty();
-        if requested.intersects(read_poll_events())
-            && (uid == 0 || access_allowed(&inode, uid, gid, fuser::AccessFlags::R_OK))
-        {
+        if requested.intersects(read_poll_events()) {
             ready |= requested & read_poll_events();
         }
-        if requested.intersects(write_poll_events())
-            && (uid == 0 || access_allowed(&inode, uid, gid, fuser::AccessFlags::W_OK))
-        {
+        if requested.intersects(write_poll_events()) {
             ready |= requested & write_poll_events();
         }
         Ok(ready)
@@ -2171,11 +1934,9 @@ impl Storage {
         offset: u64,
         length: u64,
         mode: i32,
-        uid: u32,
-        gid: u32,
     ) -> FuseResult<()> {
         if length == 0 {
-            self.open_file(inode_number, uid, gid, fuser::OpenFlags(libc::O_WRONLY))?;
+            self.open_file(inode_number)?;
             return Ok(());
         }
         let supported = fallocate_keep_size() | fallocate_punch_hole() | fallocate_zero_range();
@@ -2190,7 +1951,7 @@ impl Storage {
             if mode & fallocate_zero_range() != 0 {
                 return Err(FuseError::Errno(fuser::Errno::EINVAL));
             }
-            return self.zero_file_range(inode_number, offset, length, true, uid, gid);
+            return self.zero_file_range(inode_number, offset, length, true);
         }
         if mode & fallocate_zero_range() != 0 {
             return self.zero_file_range(
@@ -2198,8 +1959,6 @@ impl Storage {
                 offset,
                 length,
                 mode & fallocate_keep_size() != 0,
-                uid,
-                gid,
             );
         }
         let inode = self
@@ -2209,31 +1968,13 @@ impl Storage {
         if inode.kind != StoredNodeKind::RegularFile {
             return Err(FuseError::Errno(fuser::Errno::EISDIR));
         }
-        self.check_inode_access(&inode, uid, gid, fuser::AccessFlags::W_OK)?;
         let end = offset
             .checked_add(length)
             .ok_or(FuseError::Errno(fuser::Errno::EFBIG))?;
         if mode & fallocate_keep_size() != 0 || end <= inode.size {
             return Ok(());
         }
-        self.setattr(
-            inode_number,
-            SetAttributes {
-                mode: None,
-                uid: None,
-                gid: None,
-                size: Some(end),
-                atime: None,
-                mtime: None,
-                ctime: None,
-                crtime: None,
-                bkuptime: None,
-                flags: None,
-            },
-            uid,
-            gid,
-        )
-        .map(|_| ())
+        self.zero_file_range(inode_number, offset, length, false)
     }
 
     pub(crate) fn lseek(&self, inode_number: u64, offset: i64, whence: i32) -> FuseResult<i64> {
@@ -2273,8 +2014,6 @@ impl Storage {
         destination_inode_number: u64,
         destination_offset: u64,
         length: u64,
-        uid: u32,
-        gid: u32,
     ) -> FuseResult<FuseWrite> {
         if length == 0 {
             return Ok(FuseWrite { written: 0 });
@@ -2286,7 +2025,6 @@ impl Storage {
         if source_inode.kind != StoredNodeKind::RegularFile {
             return Err(FuseError::Errno(fuser::Errno::EINVAL));
         }
-        self.check_inode_access(&source_inode, uid, gid, fuser::AccessFlags::R_OK)?;
         if source_offset >= source_inode.size {
             return Ok(FuseWrite { written: 0 });
         }
@@ -2306,13 +2044,7 @@ impl Storage {
         if bytes.is_empty() {
             return Ok(FuseWrite { written: 0 });
         }
-        self.write_file(
-            destination_inode_number,
-            destination_offset,
-            &bytes,
-            uid,
-            gid,
-        )
+        self.write_file(destination_inode_number, destination_offset, &bytes)
     }
 
     pub(crate) fn set_volume_name(&self, name: &OsStr) -> FuseResult<()> {
@@ -2365,8 +2097,6 @@ impl Storage {
         name: &OsStr,
         new_parent: u64,
         new_name: &OsStr,
-        uid: u32,
-        gid: u32,
     ) -> FuseResult<()> {
         let mut write_state = self.lock_write_state()?;
         let name_bytes = validate_name(name)?;
@@ -2395,8 +2125,6 @@ impl Storage {
         {
             return Err(FuseError::Errno(fuser::Errno::EINVAL));
         }
-        self.check_inode_access(&inode, uid, gid, fuser::AccessFlags::W_OK)?;
-        self.check_inode_access(&new_inode, uid, gid, fuser::AccessFlags::W_OK)?;
         let path = child_event_path(
             self.active_branch_identifier(),
             parent,
@@ -2479,8 +2207,6 @@ impl Storage {
         offset: u64,
         length: u64,
         keep_size: bool,
-        uid: u32,
-        gid: u32,
     ) -> FuseResult<()> {
         let mut write_state = self.lock_write_state()?;
         let mut inode = self
@@ -2490,7 +2216,6 @@ impl Storage {
         if inode.kind != StoredNodeKind::RegularFile {
             return Err(FuseError::Errno(fuser::Errno::EISDIR));
         }
-        self.check_inode_access(&inode, uid, gid, fuser::AccessFlags::W_OK)?;
         let requested_end = offset
             .checked_add(length)
             .ok_or(FuseError::Errno(fuser::Errno::EFBIG))?;
@@ -2575,18 +2300,10 @@ impl Storage {
         Ok(())
     }
 
-    fn remove_directory_entry(
-        &self,
-        parent: u64,
-        name: &OsStr,
-        directory: bool,
-        uid: u32,
-        gid: u32,
-    ) -> FuseResult<()> {
+    fn remove_directory_entry(&self, parent: u64, name: &OsStr, directory: bool) -> FuseResult<()> {
         let mut write_state = self.lock_write_state()?;
         let name_bytes = validate_name(name)?;
-        let mut parent_inode =
-            self.require_directory_with_access(parent, uid, gid, write_directory_access_mask())?;
+        let mut parent_inode = self.require_directory(parent)?;
         let entry = self
             .directory_entry(parent, &name_bytes)
             .map_err(to_fuse_integrity)?
@@ -2666,32 +2383,6 @@ impl Storage {
             Ok(inode)
         } else {
             Err(FuseError::Errno(fuser::Errno::ENOTDIR))
-        }
-    }
-
-    fn require_directory_with_access(
-        &self,
-        inode_number: u64,
-        uid: u32,
-        gid: u32,
-        mask: fuser::AccessFlags,
-    ) -> FuseResult<StoredInode> {
-        let inode = self.require_directory(inode_number)?;
-        self.check_inode_access(&inode, uid, gid, mask)?;
-        Ok(inode)
-    }
-
-    fn check_inode_access(
-        &self,
-        inode: &StoredInode,
-        uid: u32,
-        gid: u32,
-        mask: fuser::AccessFlags,
-    ) -> FuseResult<()> {
-        if uid == 0 || access_allowed(inode, uid, gid, mask) {
-            Ok(())
-        } else {
-            Err(FuseError::Errno(fuser::Errno::EACCES))
         }
     }
 
@@ -3273,16 +2964,6 @@ impl Storage {
                 )?;
                 Ok(())
             }
-            EventPayloadExtents::FileTruncate { removed_extents } => {
-                self.put_event_payload_manifest(
-                    batch,
-                    event_sequence,
-                    EVENT_PAYLOAD_PART_REMOVED,
-                    event.removed_byte_length().unwrap_or(0),
-                    &removed_extents,
-                )?;
-                Ok(())
-            }
         }
     }
 
@@ -3614,7 +3295,6 @@ impl Storage {
             EventKind::NodeCreated
                 | EventKind::FileCreated
                 | EventKind::FileWritten
-                | EventKind::FileTruncated
                 | EventKind::FileRangeZeroed
                 | EventKind::FileContentsExchanged
         ) {
@@ -3915,9 +3595,6 @@ fn initialize_new_database(database: &DB) -> Result<(), FilesystemError> {
     let now = StoredTime::now();
     let root = StoredInode {
         kind: StoredNodeKind::Directory,
-        mode: 0o755,
-        uid: current_uid(),
-        gid: current_gid(),
         size: 0,
         nlink: 2,
         rdev: 0,
@@ -3926,7 +3603,6 @@ fn initialize_new_database(database: &DB) -> Result<(), FilesystemError> {
         ctime: now,
         crtime: now,
         bkuptime: now,
-        flags: 0,
         parent: INODE_ROOT,
         name: Vec::new(),
         symlink_target: None,
@@ -4383,13 +4059,6 @@ fn current_extents_after_write(
     Ok(extents)
 }
 
-fn current_extents_after_truncate(
-    existing: &[StoredExtent],
-    new_size: u64,
-) -> FuseResult<Vec<StoredExtent>> {
-    slice_extents(existing, 0, new_size, 0).map_err(to_fuse_integrity)
-}
-
 fn current_extents_after_zero(
     existing: &[StoredExtent],
     old_size: u64,
@@ -4617,35 +4286,6 @@ fn inode_path_bytes(
     Err(FuseError::Integrity)
 }
 
-fn access_allowed(inode: &StoredInode, uid: u32, gid: u32, mask: fuser::AccessFlags) -> bool {
-    if mask.is_empty() {
-        return true;
-    }
-    let shift = if uid == inode.uid {
-        6
-    } else if gid == inode.gid {
-        3
-    } else {
-        0
-    };
-    let permissions = (inode.mode >> shift) & 0o7;
-    (!mask.contains(fuser::AccessFlags::R_OK) || permissions & 0o4 != 0)
-        && (!mask.contains(fuser::AccessFlags::W_OK) || permissions & 0o2 != 0)
-        && (!mask.contains(fuser::AccessFlags::X_OK) || permissions & 0o1 != 0)
-}
-
-fn write_directory_access_mask() -> fuser::AccessFlags {
-    fuser::AccessFlags::W_OK | fuser::AccessFlags::X_OK
-}
-
-fn access_mask_for_open_flags(flags: fuser::OpenFlags) -> fuser::AccessFlags {
-    match flags.acc_mode() {
-        fuser::OpenAccMode::O_RDONLY => fuser::AccessFlags::R_OK,
-        fuser::OpenAccMode::O_WRONLY => fuser::AccessFlags::W_OK,
-        fuser::OpenAccMode::O_RDWR => fuser::AccessFlags::R_OK | fuser::AccessFlags::W_OK,
-    }
-}
-
 fn read_poll_events() -> fuser::PollEvents {
     fuser::PollEvents::POLLIN | fuser::PollEvents::POLLRDNORM | fuser::PollEvents::POLLRDBAND
 }
@@ -4730,13 +4370,13 @@ fn inode_attr(inode_number: u64, inode: &StoredInode) -> fuser::FileAttr {
         ctime: inode.ctime.to_system_time(),
         crtime: inode.crtime.to_system_time(),
         kind: fuser_file_type(inode.kind),
-        perm: inode.mode,
+        perm: 0o777,
         nlink: inode.nlink,
-        uid: inode.uid,
-        gid: inode.gid,
+        uid: 0,
+        gid: 0,
         rdev: inode.rdev,
         blksize: FUSE_STATFS_BLOCK_SIZE,
-        flags: inode.flags,
+        flags: 0,
     }
 }
 
@@ -4771,14 +4411,6 @@ fn file_identifier_for_kind(inode_number: u64, kind: StoredNodeKind) -> Option<F
     }
 }
 
-fn permissions_from_mode(mode: u32, umask: u32) -> u16 {
-    permission_bits(mode & !umask)
-}
-
-fn permission_bits(mode: u32) -> u16 {
-    (mode & 0o7777) as u16
-}
-
 fn validate_name(name: &OsStr) -> FuseResult<Vec<u8>> {
     let bytes = name.as_bytes();
     if bytes.is_empty() {
@@ -4808,21 +4440,6 @@ fn validate_extended_attribute_name(name: &OsStr) -> FuseResult<Vec<u8>> {
         return Err(FuseError::Errno(fuser::Errno::EINVAL));
     }
     Ok(bytes.to_vec())
-}
-
-fn stored_time_from_time_or_now(time: fuser::TimeOrNow) -> StoredTime {
-    match time {
-        fuser::TimeOrNow::SpecificTime(time) => StoredTime::from_system_time(time),
-        fuser::TimeOrNow::Now => StoredTime::now(),
-    }
-}
-
-fn current_uid() -> u32 {
-    unsafe { libc::getuid() }
-}
-
-fn current_gid() -> u32 {
-    unsafe { libc::getgid() }
 }
 
 fn backing_filesystem_statistics(path: &Path) -> FuseResult<BackingFileSystemStatistics> {
@@ -5240,7 +4857,6 @@ fn event_payload_part_byte(part: FileEventPayloadPart) -> u8 {
     match part {
         FileEventPayloadPart::Overwritten => EVENT_PAYLOAD_PART_OVERWRITTEN,
         FileEventPayloadPart::Written => EVENT_PAYLOAD_PART_WRITTEN,
-        FileEventPayloadPart::Removed => EVENT_PAYLOAD_PART_REMOVED,
     }
 }
 
@@ -5248,7 +4864,6 @@ fn event_payload_part_length(event: &EventRecord, part: FileEventPayloadPart) ->
     match part {
         FileEventPayloadPart::Overwritten => event.overwritten_byte_length(),
         FileEventPayloadPart::Written => event.written_byte_length(),
-        FileEventPayloadPart::Removed => event.removed_byte_length(),
     }
 }
 
@@ -5268,7 +4883,6 @@ fn event_file_identifiers(event: &EventRecord) -> Vec<FileIdentifier> {
 fn event_snapshot_file_size(event: &EventRecord, file_identifier: FileIdentifier) -> Option<u64> {
     match event.payload() {
         EventPayload::FileWrite { new_file_size, .. }
-        | EventPayload::FileTruncate { new_file_size, .. }
         | EventPayload::FileSizeChange { new_file_size, .. }
             if event.file_identifier() == Some(file_identifier) =>
         {
@@ -5288,7 +4902,6 @@ fn event_snapshot_file_size(event: &EventRecord, file_identifier: FileIdentifier
         }
         EventPayload::None
         | EventPayload::FileWrite { .. }
-        | EventPayload::FileTruncate { .. }
         | EventPayload::FileSizeChange { .. } => None,
     }
 }
@@ -5307,22 +4920,19 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("current"),
-                0o644,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             )
             .expect("file is created");
         let inode_number = created.attr.ino.into();
 
         storage
-            .write_file(inode_number, 0, b"older", current_uid(), current_gid())
+            .write_file(inode_number, 0, b"older")
             .expect("older bytes are written");
         storage
-            .write_file(inode_number, 0, b"newer", current_uid(), current_gid())
+            .write_file(inode_number, 0, b"newer")
             .expect("newer bytes are written");
         let bytes = storage
-            .read_file(inode_number, 0, 5, current_uid(), current_gid())
+            .read_file(inode_number, 0, 5)
             .expect("current bytes are readable");
         assert_eq!(bytes, b"newer");
 
@@ -5349,9 +4959,6 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("stable"),
-                0o644,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             )
             .expect("file is created");
@@ -5386,9 +4993,6 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("counter"),
-                0o644,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             )
             .expect("file is created");
@@ -5406,7 +5010,7 @@ mod tests {
         );
 
         storage
-            .write_file(inode_number, 0, b"contents", current_uid(), current_gid())
+            .write_file(inode_number, 0, b"contents")
             .expect("file is written");
         assert_eq!(
             write_state_snapshot(&storage),
@@ -5458,33 +5062,11 @@ mod tests {
         let invalid_special = storage.create_node(
             INODE_ROOT,
             OsStr::new("invalid-special"),
-            0,
-            0,
-            current_credentials(),
             CreateNodeKind::Special { mode: 0, rdev: 0 },
         );
         assert!(invalid_special.is_err());
         assert_eq!(write_state_snapshot(&storage), initial);
 
-        let invalid_truncate = storage.setattr(
-            INODE_ROOT,
-            SetAttributes {
-                mode: None,
-                uid: None,
-                gid: None,
-                size: Some(0),
-                atime: None,
-                mtime: None,
-                ctime: None,
-                crtime: None,
-                bkuptime: None,
-                flags: None,
-            },
-            current_uid(),
-            current_gid(),
-        );
-        assert!(invalid_truncate.is_err());
-        assert_eq!(write_state_snapshot(&storage), initial);
         assert_eq!(
             storage
                 .last_event_sequence()
@@ -5505,9 +5087,6 @@ mod tests {
             storage.create_node(
                 INODE_ROOT,
                 OsStr::new("before-write-fault"),
-                0o644,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             ),
             Err(FuseError::Database)
@@ -5543,9 +5122,6 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("buffered-mutation"),
-                0o644,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             )
             .expect("mounted mutation commits");
@@ -5574,9 +5150,6 @@ mod tests {
             storage.create_node(
                 INODE_ROOT,
                 OsStr::new("after-write-fault"),
-                0o644,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             ),
             Err(FuseError::Database)
@@ -5608,13 +5181,13 @@ mod tests {
         let storage = open_database_path(&database).expect("storage opens");
         let inode_number = create_regular_file(&storage, "before-write-file-fault");
         storage
-            .write_file(inode_number, 0, b"abcdef", current_uid(), current_gid())
+            .write_file(inode_number, 0, b"abcdef")
             .expect("initial bytes are written");
         let before_fault = write_state_snapshot(&storage);
 
         set_write_batch_fault(WriteBatchFault::BeforeWrite);
         assert!(matches!(
-            storage.write_file(inode_number, 2, b"XYZ", current_uid(), current_gid()),
+            storage.write_file(inode_number, 2, b"XYZ"),
             Err(FuseError::Database)
         ));
 
@@ -5627,7 +5200,7 @@ mod tests {
         );
         assert_eq!(
             storage
-                .read_file(inode_number, 0, 6, current_uid(), current_gid())
+                .read_file(inode_number, 0, 6)
                 .expect("file remains readable after pre-write fault"),
             b"abcdef"
         );
@@ -5636,7 +5209,7 @@ mod tests {
         let storage = open_database_path(&database).expect("storage reopens after fault");
         assert_eq!(
             storage
-                .read_file(inode_number, 0, 6, current_uid(), current_gid())
+                .read_file(inode_number, 0, 6)
                 .expect("file remains unchanged after reopen"),
             b"abcdef"
         );
@@ -5653,13 +5226,13 @@ mod tests {
         let storage = open_database_path(&database).expect("storage opens");
         let inode_number = create_regular_file(&storage, "after-write-file-fault");
         storage
-            .write_file(inode_number, 0, b"abcdef", current_uid(), current_gid())
+            .write_file(inode_number, 0, b"abcdef")
             .expect("initial bytes are written");
         let before_fault = write_state_snapshot(&storage);
 
         set_write_batch_fault(WriteBatchFault::AfterWrite);
         assert!(matches!(
-            storage.write_file(inode_number, 2, b"XYZ", current_uid(), current_gid()),
+            storage.write_file(inode_number, 2, b"XYZ"),
             Err(FuseError::Database)
         ));
 
@@ -5676,7 +5249,7 @@ mod tests {
         let storage = open_database_path(&database).expect("storage reopens after committed fault");
         assert_eq!(
             storage
-                .read_file(inode_number, 0, 6, current_uid(), current_gid())
+                .read_file(inode_number, 0, 6)
                 .expect("committed write is readable after reopen"),
             b"abXYZf"
         );
@@ -5712,80 +5285,6 @@ mod tests {
     }
 
     #[test]
-    fn write_batch_fault_after_truncate_recovers_removed_payload_and_snapshot_state_on_reopen() {
-        let temporary = tempfile::tempdir().expect("temporary directory is created");
-        let database = temporary.path().join("database");
-        let storage = open_database_path(&database).expect("storage opens");
-        let inode_number = create_regular_file(&storage, "after-truncate-fault");
-        storage
-            .write_file(inode_number, 0, b"abcdef", current_uid(), current_gid())
-            .expect("initial bytes are written");
-        let before_fault = write_state_snapshot(&storage);
-
-        set_write_batch_fault(WriteBatchFault::AfterWrite);
-        assert!(matches!(
-            storage.setattr(
-                inode_number,
-                SetAttributes {
-                    mode: None,
-                    uid: None,
-                    gid: None,
-                    size: Some(3),
-                    atime: None,
-                    mtime: None,
-                    ctime: None,
-                    crtime: None,
-                    bkuptime: None,
-                    flags: None,
-                },
-                current_uid(),
-                current_gid(),
-            ),
-            Err(FuseError::Database)
-        ));
-
-        assert_eq!(write_state_snapshot(&storage), before_fault);
-        let committed = EventSequence::new(before_fault.last_event_sequence + 1);
-        assert_eq!(
-            storage
-                .last_event_sequence()
-                .expect("last event sequence is readable"),
-            committed
-        );
-        drop(storage);
-
-        let storage = open_database_path(&database).expect("storage reopens after truncate fault");
-        assert_eq!(
-            storage
-                .read_file(inode_number, 0, 6, current_uid(), current_gid())
-                .expect("truncated file is readable after reopen"),
-            b"abc"
-        );
-        let event = storage
-            .get_event(committed)
-            .expect("committed truncate event is readable")
-            .expect("committed truncate event exists");
-        assert_eq!(event.kind(), EventKind::FileTruncated);
-        assert_eq!(event.removed_byte_length(), Some(3));
-        assert_eq!(
-            storage
-                .read_file_event_payload_range(committed, FileEventPayloadPart::Removed, 0, 3)
-                .expect("removed payload is readable"),
-            b"def"
-        );
-        let snapshot = storage
-            .file_snapshot_at_or_before(FileIdentifier::new(inode_number), committed)
-            .expect("snapshot lookup succeeds")
-            .expect("snapshot exists");
-        assert_eq!(
-            storage
-                .read_file_snapshot_range(&snapshot, 0, snapshot.file_size())
-                .expect("snapshot bytes are readable"),
-            b"abc"
-        );
-    }
-
-    #[test]
     fn duplicate_event_keys_are_rejected_before_commit() {
         let temporary = tempfile::tempdir().expect("temporary directory is created");
         let storage =
@@ -5794,9 +5293,6 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("existing-event"),
-                0o644,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             )
             .expect("file is created");
@@ -5804,7 +5300,7 @@ mod tests {
         let duplicate_sequence = EventSequence::new(EVENT_SEQUENCE_INITIAL.get() + 1);
         let duplicate_event = EventRecord::new(
             duplicate_sequence,
-            EventKind::MetadataChanged,
+            EventKind::NodeCreated,
             UtcDateTime::now(),
             None,
             None,
@@ -5829,7 +5325,7 @@ mod tests {
         let sequence = EventSequence::new(EVENT_SEQUENCE_INITIAL.get() + 1);
         let event = EventRecord::new(
             sequence,
-            EventKind::MetadataChanged,
+            EventKind::NodeCreated,
             UtcDateTime::now(),
             None,
             None,
@@ -5857,9 +5353,6 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("indexed"),
-                0o644,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             )
             .expect("file is created");
@@ -5942,9 +5435,6 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("materialized"),
-                0o644,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             )
             .expect("file is created");
@@ -5985,21 +5475,12 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("content"),
-                0o644,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             )
             .expect("file is created");
         let inode_number = created.attr.ino.into();
         storage
-            .write_file(
-                inode_number,
-                0,
-                b"content bytes",
-                current_uid(),
-                current_gid(),
-            )
+            .write_file(inode_number, 0, b"content bytes")
             .expect("file is written");
         let committed_sequence = storage
             .last_event_sequence()
@@ -6018,31 +5499,11 @@ mod tests {
         write_batch(storage.database(), batch).expect("corrupt content chunk is written");
 
         assert!(matches!(
-            storage.read_file(inode_number, 0, 100, current_uid(), current_gid()),
+            storage.read_file(inode_number, 0, 100),
             Err(FuseError::Integrity)
         ));
         assert!(matches!(
-            storage.write_file(inode_number, 0, b"new", current_uid(), current_gid()),
-            Err(FuseError::Integrity)
-        ));
-        assert!(matches!(
-            storage.setattr(
-                inode_number,
-                SetAttributes {
-                    mode: None,
-                    uid: None,
-                    gid: None,
-                    size: Some(3),
-                    atime: None,
-                    mtime: None,
-                    ctime: None,
-                    crtime: None,
-                    bkuptime: None,
-                    flags: None,
-                },
-                current_uid(),
-                current_gid(),
-            ),
+            storage.write_file(inode_number, 0, b"new"),
             Err(FuseError::Integrity)
         ));
         assert_eq!(
@@ -6059,65 +5520,27 @@ mod tests {
         let storage =
             open_database_path(&temporary.path().join("database")).expect("storage opens");
         let created = storage
-            .create_node(
-                INODE_ROOT,
-                OsStr::new("large"),
-                0o644,
-                0,
-                current_credentials(),
-                CreateNodeKind::RegularFile,
-            )
+            .create_node(INODE_ROOT, OsStr::new("large"), CreateNodeKind::RegularFile)
             .expect("file is created");
         let inode_number = created.attr.ino.into();
         let file_identifier = FileIdentifier::new(inode_number);
         let overwrite_offset = 96 * 1024;
-        let truncate_size = 220 * 1024;
         let original = patterned_bytes(300 * 1024, 11);
         let replacement = patterned_bytes(70 * 1024, 91);
         let mut expected_after_overwrite = original.clone();
         expected_after_overwrite[overwrite_offset..overwrite_offset + replacement.len()]
             .copy_from_slice(&replacement);
-        let expected_after_truncate = expected_after_overwrite[..truncate_size].to_vec();
-        let removed_after_truncate = expected_after_overwrite[truncate_size..].to_vec();
 
         storage
-            .write_file(inode_number, 0, &original, current_uid(), current_gid())
+            .write_file(inode_number, 0, &original)
             .expect("large file is written");
         let initial_write = storage
             .last_event_sequence()
             .expect("last event sequence is readable");
         storage
-            .write_file(
-                inode_number,
-                overwrite_offset as u64,
-                &replacement,
-                current_uid(),
-                current_gid(),
-            )
+            .write_file(inode_number, overwrite_offset as u64, &replacement)
             .expect("large file is overwritten");
         let overwrite = storage
-            .last_event_sequence()
-            .expect("last event sequence is readable");
-        storage
-            .setattr(
-                inode_number,
-                SetAttributes {
-                    mode: None,
-                    uid: None,
-                    gid: None,
-                    size: Some(truncate_size as u64),
-                    atime: None,
-                    mtime: None,
-                    ctime: None,
-                    crtime: None,
-                    bkuptime: None,
-                    flags: None,
-                },
-                current_uid(),
-                current_gid(),
-            )
-            .expect("large file truncates");
-        let truncate = storage
             .last_event_sequence()
             .expect("last event sequence is readable");
 
@@ -6154,38 +5577,27 @@ mod tests {
                 .expect("large replacement payload is read"),
             replacement
         );
-        assert_eq!(
-            storage
-                .read_file_event_payload_range(
-                    truncate,
-                    FileEventPayloadPart::Removed,
-                    0,
-                    removed_after_truncate.len() as u64,
-                )
-                .expect("large removed payload is read"),
-            removed_after_truncate
-        );
 
         let snapshot = storage
-            .file_snapshot_at_or_before(file_identifier, truncate)
+            .file_snapshot_at_or_before(file_identifier, overwrite)
             .expect("large snapshot lookup succeeds")
             .expect("large snapshot exists");
         assert_eq!(
             storage
                 .read_file_snapshot_range(&snapshot, 0, snapshot.file_size())
                 .expect("large snapshot is read"),
-            expected_after_truncate
+            expected_after_overwrite
         );
         assert_eq!(
             storage
                 .read_file_snapshot_range(&snapshot, 200 * 1024, 64 * 1024)
                 .expect("large snapshot range is read"),
-            expected_after_truncate[200 * 1024..]
+            expected_after_overwrite[200 * 1024..264 * 1024]
         );
     }
 
     #[test]
-    fn bounded_extent_write_and_truncate_model_matches_dense_bytes() {
+    fn bounded_extent_write_model_matches_dense_bytes() {
         let mut dense = Vec::new();
         let mut extent_model = BoundedExtentModel::default();
 
@@ -6341,9 +5753,6 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("allocated"),
-                0o644,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             )
             .expect("file is created");
@@ -6413,9 +5822,6 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("tracked"),
-                0o644,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             )
             .expect("file is created");
@@ -6426,7 +5832,7 @@ mod tests {
         assert_eq!(after_create.free_files, initial_statistics.free_files - 1);
 
         storage
-            .write_file(inode_number, 0, b"contents", current_uid(), current_gid())
+            .write_file(inode_number, 0, b"contents")
             .expect("file is written");
         let after_write = storage
             .statfs(&database)
@@ -6434,13 +5840,7 @@ mod tests {
         assert_eq!(after_write.free_files, after_create.free_files);
 
         storage
-            .hard_link(
-                inode_number,
-                INODE_ROOT,
-                OsStr::new("hard-link"),
-                current_uid(),
-                current_gid(),
-            )
+            .hard_link(inode_number, INODE_ROOT, OsStr::new("hard-link"))
             .expect("hard link is created");
         let after_hard_link = storage
             .statfs(&database)
@@ -6454,7 +5854,6 @@ mod tests {
                 INODE_ROOT,
                 OsStr::new("renamed"),
                 false,
-                current_credentials(),
             )
             .expect("node is renamed");
         let after_rename = storage
@@ -6472,14 +5871,7 @@ mod tests {
         let name = OsStr::new("user.eventfs.branch");
 
         storage
-            .setxattr(
-                inode_number,
-                name,
-                b"main",
-                libc::XATTR_CREATE,
-                current_uid(),
-                current_gid(),
-            )
+            .setxattr(inode_number, name, b"main", libc::XATTR_CREATE)
             .expect("xattr is set on main");
         let main = storage.current_branch().expect("main branch is readable");
         let branch_name = BranchName::new("xattrs").expect("branch name is valid");
@@ -6497,14 +5889,7 @@ mod tests {
             b"main"
         );
         storage
-            .setxattr(
-                inode_number,
-                name,
-                b"branch",
-                libc::XATTR_REPLACE,
-                current_uid(),
-                current_gid(),
-            )
+            .setxattr(inode_number, name, b"branch", libc::XATTR_REPLACE)
             .expect("branch xattr is replaced");
         assert_eq!(
             storage
@@ -6523,7 +5908,7 @@ mod tests {
             b"main"
         );
         storage
-            .removexattr(inode_number, name, current_uid())
+            .removexattr(inode_number, name)
             .expect("main xattr is removed");
         assert!(matches!(
             storage.getxattr(inode_number, name),
@@ -6560,13 +5945,7 @@ mod tests {
             open_database_path(&temporary.path().join("database")).expect("storage opens");
         let inode_number = create_regular_file(&storage, "root-copy");
         storage
-            .write_file(
-                inode_number,
-                0,
-                b"shared-by-root",
-                current_uid(),
-                current_gid(),
-            )
+            .write_file(inode_number, 0, b"shared-by-root")
             .expect("file is written");
         let main = storage.current_branch().expect("main branch is readable");
         let source_root = storage
@@ -6594,7 +5973,7 @@ mod tests {
             .expect("new branch is active");
         assert_eq!(
             storage
-                .read_file(inode_number, 0, 32, current_uid(), current_gid())
+                .read_file(inode_number, 0, 32)
                 .expect("file bytes are readable through copied root"),
             b"shared-by-root"
         );
@@ -6609,28 +5988,14 @@ mod tests {
         let name = OsStr::new("user.eventfs.edge");
 
         storage
-            .setxattr(
-                inode_number,
-                name,
-                b"value",
-                libc::XATTR_CREATE,
-                current_uid(),
-                current_gid(),
-            )
+            .setxattr(inode_number, name, b"value", libc::XATTR_CREATE)
             .expect("xattr is created");
         let before_noop = storage
             .last_event_sequence()
             .expect("last event sequence is readable");
 
         storage
-            .setxattr(
-                inode_number,
-                name,
-                b"value",
-                0,
-                current_uid(),
-                current_gid(),
-            )
+            .setxattr(inode_number, name, b"value", 0)
             .expect("setting the same xattr value is a no-op");
 
         assert_eq!(
@@ -6641,14 +6006,7 @@ mod tests {
         );
         assert_fuse_errno(
             storage
-                .setxattr(
-                    inode_number,
-                    name,
-                    b"value",
-                    libc::XATTR_CREATE,
-                    current_uid(),
-                    current_gid(),
-                )
+                .setxattr(inode_number, name, b"value", libc::XATTR_CREATE)
                 .expect_err("create rejects an existing xattr"),
             fuser::Errno::EEXIST,
         );
@@ -6659,8 +6017,6 @@ mod tests {
                     OsStr::new("user.eventfs.missing"),
                     b"value",
                     libc::XATTR_REPLACE,
-                    current_uid(),
-                    current_gid(),
                 )
                 .expect_err("replace rejects a missing xattr"),
             fuser::Errno::NO_XATTR,
@@ -6672,35 +6028,19 @@ mod tests {
                     name,
                     b"value",
                     libc::XATTR_CREATE | libc::XATTR_REPLACE,
-                    current_uid(),
-                    current_gid(),
                 )
                 .expect_err("create and replace flags conflict"),
             fuser::Errno::EINVAL,
         );
         assert_fuse_errno(
             storage
-                .setxattr(
-                    inode_number,
-                    name,
-                    b"value",
-                    0x4000,
-                    current_uid(),
-                    current_gid(),
-                )
+                .setxattr(inode_number, name, b"value", 0x4000)
                 .expect_err("unknown xattr flags are rejected"),
             fuser::Errno::EINVAL,
         );
         assert_fuse_errno(
             storage
-                .setxattr(
-                    inode_number,
-                    OsStr::new(""),
-                    b"value",
-                    0,
-                    current_uid(),
-                    current_gid(),
-                )
+                .setxattr(inode_number, OsStr::new(""), b"value", 0)
                 .expect_err("empty xattr names are rejected"),
             fuser::Errno::EINVAL,
         );
@@ -6712,7 +6052,7 @@ mod tests {
         );
         assert_fuse_errno(
             storage
-                .removexattr(inode_number, OsStr::from_bytes(b"user\0bad"), current_uid())
+                .removexattr(inode_number, OsStr::from_bytes(b"user\0bad"))
                 .expect_err("nul-containing xattr names are rejected"),
             fuser::Errno::EINVAL,
         );
@@ -6726,22 +6066,10 @@ mod tests {
         let inode_number = create_regular_file(&storage, "deleted-xattr-file");
         let name = OsStr::new("user.eventfs.deleted");
         storage
-            .setxattr(
-                inode_number,
-                name,
-                b"value",
-                libc::XATTR_CREATE,
-                current_uid(),
-                current_gid(),
-            )
+            .setxattr(inode_number, name, b"value", libc::XATTR_CREATE)
             .expect("xattr is created");
         storage
-            .unlink(
-                INODE_ROOT,
-                OsStr::new("deleted-xattr-file"),
-                current_uid(),
-                current_gid(),
-            )
+            .unlink(INODE_ROOT, OsStr::new("deleted-xattr-file"))
             .expect("file is unlinked");
         let main = storage
             .current_branch()
@@ -6819,9 +6147,6 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("directory"),
-                0o755,
-                0,
-                current_credentials(),
                 CreateNodeKind::Directory,
             )
             .expect("directory is created")
@@ -6898,7 +6223,7 @@ mod tests {
             open_database_path(&temporary.path().join("database")).expect("storage opens");
         let inode_number = create_regular_file(&storage, "sparse-zero");
         storage
-            .write_file(inode_number, 0, b"abcdef", current_uid(), current_gid())
+            .write_file(inode_number, 0, b"abcdef")
             .expect("file is written");
 
         storage
@@ -6907,14 +6232,12 @@ mod tests {
                 2,
                 2,
                 fallocate_zero_range() | fallocate_keep_size(),
-                current_uid(),
-                current_gid(),
             )
             .expect("range is zeroed");
 
         assert_eq!(
             storage
-                .read_file(inode_number, 0, 6, current_uid(), current_gid())
+                .read_file(inode_number, 0, 6)
                 .expect("zeroed file is readable"),
             b"ab\0\0ef"
         );
@@ -6958,24 +6281,17 @@ mod tests {
         let source = create_regular_file(&storage, "range-source");
         let destination = create_regular_file(&storage, "range-destination");
         storage
-            .write_file(source, 0, b"abcdef", current_uid(), current_gid())
+            .write_file(source, 0, b"abcdef")
             .expect("source is written");
         let before_noops = storage
             .last_event_sequence()
             .expect("last event sequence is readable");
 
         storage
-            .fallocate(source, 0, 0, 0, current_uid(), current_gid())
+            .fallocate(source, 0, 0, 0)
             .expect("zero-length allocation validates and does nothing");
         storage
-            .fallocate(
-                source,
-                12,
-                4,
-                fallocate_keep_size(),
-                current_uid(),
-                current_gid(),
-            )
+            .fallocate(source, 12, 4, fallocate_keep_size())
             .expect("keep-size allocation beyond EOF is a no-op");
         assert_eq!(
             storage
@@ -6985,7 +6301,7 @@ mod tests {
         );
 
         storage
-            .fallocate(source, 8, 4, 0, current_uid(), current_gid())
+            .fallocate(source, 8, 4, 0)
             .expect("size-growing allocation extends the file");
         assert_eq!(
             storage
@@ -7005,20 +6321,20 @@ mod tests {
         ] {
             assert_fuse_errno(
                 storage
-                    .fallocate(source, 0, 1, mode, current_uid(), current_gid())
+                    .fallocate(source, 0, 1, mode)
                     .expect_err("unsupported fallocate mode is rejected"),
                 fuser::Errno::EINVAL,
             );
         }
         assert_fuse_errno(
             storage
-                .fallocate(INODE_ROOT, 0, 1, 0, current_uid(), current_gid())
+                .fallocate(INODE_ROOT, 0, 1, 0)
                 .expect_err("fallocate rejects directories"),
             fuser::Errno::EISDIR,
         );
         assert_fuse_errno(
             storage
-                .fallocate(source, u64::MAX, 1, 0, current_uid(), current_gid())
+                .fallocate(source, u64::MAX, 1, 0)
                 .expect_err("overflowing allocation is rejected"),
             fuser::Errno::EFBIG,
         );
@@ -7028,9 +6344,7 @@ mod tests {
             | fuser::PollEvents::POLLOUT
             | fuser::PollEvents::POLLWRNORM
             | fuser::PollEvents::POLLERR;
-        let ready = storage
-            .poll(source, current_uid(), current_gid(), requested_poll)
-            .expect("poll succeeds");
+        let ready = storage.poll(source, requested_poll).expect("poll succeeds");
         assert!(ready.contains(fuser::PollEvents::POLLIN));
         assert!(ready.contains(fuser::PollEvents::POLLRDNORM));
         assert!(ready.contains(fuser::PollEvents::POLLOUT));
@@ -7038,7 +6352,7 @@ mod tests {
         assert!(!ready.contains(fuser::PollEvents::POLLERR));
         assert_fuse_errno(
             storage
-                .poll(u64::MAX, current_uid(), current_gid(), requested_poll)
+                .poll(u64::MAX, requested_poll)
                 .expect_err("poll rejects missing inodes"),
             fuser::Errno::ENOENT,
         );
@@ -7069,24 +6383,16 @@ mod tests {
         );
 
         let zero_length_copy = storage
-            .copy_file_range(source, 0, destination, 0, 0, current_uid(), current_gid())
+            .copy_file_range(source, 0, destination, 0, 0)
             .expect("zero-length copy succeeds");
         let eof_copy = storage
-            .copy_file_range(source, 12, destination, 0, 4, current_uid(), current_gid())
+            .copy_file_range(source, 12, destination, 0, 4)
             .expect("copy from EOF succeeds without bytes");
         assert_eq!(zero_length_copy.written, 0);
         assert_eq!(eof_copy.written, 0);
         assert_fuse_errno(
             storage
-                .copy_file_range(
-                    INODE_ROOT,
-                    0,
-                    destination,
-                    0,
-                    4,
-                    current_uid(),
-                    current_gid(),
-                )
+                .copy_file_range(INODE_ROOT, 0, destination, 0, 4)
                 .expect_err("copy from a directory is rejected"),
             fuser::Errno::EINVAL,
         );
@@ -7100,23 +6406,23 @@ mod tests {
         let source = create_regular_file(&storage, "copy-source");
         let destination = create_regular_file(&storage, "copy-destination");
         storage
-            .write_file(source, 0, b"copy source", current_uid(), current_gid())
+            .write_file(source, 0, b"copy source")
             .expect("source is written");
         storage
-            .write_file(destination, 0, b"destination", current_uid(), current_gid())
+            .write_file(destination, 0, b"destination")
             .expect("destination is written");
         let before = storage
             .last_event_sequence()
             .expect("event sequence is readable");
 
         let copied = storage
-            .copy_file_range(source, 0, destination, 0, 4, current_uid(), current_gid())
+            .copy_file_range(source, 0, destination, 0, 4)
             .expect("range is copied");
 
         assert_eq!(copied.written, 4);
         assert_eq!(
             storage
-                .read_file(destination, 0, 11, current_uid(), current_gid())
+                .read_file(destination, 0, 11)
                 .expect("destination is readable"),
             b"copyination"
         );
@@ -7142,10 +6448,10 @@ mod tests {
         let left = create_regular_file(&storage, "left");
         let right = create_regular_file(&storage, "right");
         storage
-            .write_file(left, 0, b"left", current_uid(), current_gid())
+            .write_file(left, 0, b"left")
             .expect("left is written");
         storage
-            .write_file(right, 0, b"right", current_uid(), current_gid())
+            .write_file(right, 0, b"right")
             .expect("right is written");
 
         storage
@@ -7154,21 +6460,15 @@ mod tests {
                 OsStr::new("left"),
                 INODE_ROOT,
                 OsStr::new("right"),
-                current_uid(),
-                current_gid(),
             )
             .expect("contents are exchanged");
 
         assert_eq!(
-            storage
-                .read_file(left, 0, 8, current_uid(), current_gid())
-                .expect("left is readable"),
+            storage.read_file(left, 0, 8).expect("left is readable"),
             b"right"
         );
         assert_eq!(
-            storage
-                .read_file(right, 0, 8, current_uid(), current_gid())
-                .expect("right is readable"),
+            storage.read_file(right, 0, 8).expect("right is readable"),
             b"left"
         );
         let event = storage
@@ -7298,20 +6598,13 @@ mod tests {
         let xattr_name = OsStr::new("user.eventfs.only-second");
 
         storage
-            .write_file(first, 0, b"payload", current_uid(), current_gid())
+            .write_file(first, 0, b"payload")
             .expect("file is written");
         let write_sequence = storage
             .last_event_sequence()
             .expect("write event sequence is readable");
         storage
-            .setxattr(
-                second,
-                xattr_name,
-                b"value",
-                libc::XATTR_CREATE,
-                current_uid(),
-                current_gid(),
-            )
+            .setxattr(second, xattr_name, b"value", libc::XATTR_CREATE)
             .expect("xattr is set on second file");
 
         assert_eq!(
@@ -7390,27 +6683,13 @@ mod tests {
         let storage =
             open_database_path(&temporary.path().join("database")).expect("storage opens");
         let directory = storage
-            .create_node(
-                INODE_ROOT,
-                OsStr::new("nested"),
-                0o755,
-                0,
-                current_credentials(),
-                CreateNodeKind::Directory,
-            )
+            .create_node(INODE_ROOT, OsStr::new("nested"), CreateNodeKind::Directory)
             .expect("directory is created")
             .attr
             .ino
             .into();
         storage
-            .create_node(
-                directory,
-                OsStr::new("child"),
-                0o644,
-                0,
-                current_credentials(),
-                CreateNodeKind::RegularFile,
-            )
+            .create_node(directory, OsStr::new("child"), CreateNodeKind::RegularFile)
             .expect("nested file is created");
 
         let mut names = Vec::new();
@@ -7480,7 +6759,7 @@ mod tests {
     }
 
     #[test]
-    fn node_symlink_attribute_and_access_validation_cover_user_errors() {
+    fn node_symlink_xattr_and_access_validation_cover_user_errors() {
         let temporary = tempfile::tempdir().expect("temporary directory is created");
         let storage =
             open_database_path(&temporary.path().join("database")).expect("storage opens");
@@ -7488,26 +6767,26 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("access-file"),
-                0o600,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             )
             .expect("file is created")
             .attr
             .ino
             .into();
-        let other_uid = non_current_uid();
-        let other_gid = non_current_gid();
+        let attributes = storage
+            .getattr(file)
+            .expect("file attributes are readable")
+            .attr;
+        assert_eq!(attributes.perm, 0o777);
+        assert_eq!(attributes.uid, 0);
+        assert_eq!(attributes.gid, 0);
+        assert_eq!(attributes.flags, 0);
 
         assert_fuse_errno(
             storage
                 .create_node(
                     INODE_ROOT,
                     OsStr::new("access-file"),
-                    0o644,
-                    0,
-                    current_credentials(),
                     CreateNodeKind::RegularFile,
                 )
                 .expect_err("duplicate file creation is rejected"),
@@ -7515,13 +6794,7 @@ mod tests {
         );
 
         let symlink = storage
-            .create_symlink(
-                INODE_ROOT,
-                OsStr::new("link"),
-                Path::new("access-file"),
-                current_uid(),
-                current_gid(),
-            )
+            .create_symlink(INODE_ROOT, OsStr::new("link"), Path::new("access-file"))
             .expect("symlink is created")
             .attr
             .ino
@@ -7534,13 +6807,7 @@ mod tests {
         );
         assert_fuse_errno(
             storage
-                .create_symlink(
-                    INODE_ROOT,
-                    OsStr::new("link"),
-                    Path::new("other"),
-                    current_uid(),
-                    current_gid(),
-                )
+                .create_symlink(INODE_ROOT, OsStr::new("link"), Path::new("other"))
                 .expect_err("duplicate symlink creation is rejected"),
             fuser::Errno::EEXIST,
         );
@@ -7552,18 +6819,13 @@ mod tests {
         );
         assert_fuse_errno(
             storage
-                .open_file(
-                    INODE_ROOT,
-                    current_uid(),
-                    current_gid(),
-                    fuser::OpenFlags(libc::O_RDONLY),
-                )
+                .open_file(INODE_ROOT)
                 .expect_err("open_file rejects directories"),
             fuser::Errno::EISDIR,
         );
         assert_fuse_errno(
             storage
-                .read_file(INODE_ROOT, 0, 1, current_uid(), current_gid())
+                .read_file(INODE_ROOT, 0, 1)
                 .expect_err("read_file rejects directories"),
             fuser::Errno::EISDIR,
         );
@@ -7573,135 +6835,31 @@ mod tests {
                 .expect_err("opendir rejects regular files"),
             fuser::Errno::ENOTDIR,
         );
+        storage
+            .access(file)
+            .expect("access validates existing inode");
         assert_fuse_errno(
             storage
-                .access(file, other_uid, other_gid, fuser::AccessFlags::R_OK)
-                .expect_err("access rejects non-owner without permissions"),
-            fuser::Errno::EACCES,
+                .access(u64::MAX)
+                .expect_err("access rejects missing inodes"),
+            fuser::Errno::ENOENT,
         );
-        assert_fuse_errno(
-            storage
-                .setattr(
-                    file,
-                    SetAttributes {
-                        mode: Some(0o644),
-                        uid: None,
-                        gid: None,
-                        size: None,
-                        atime: None,
-                        mtime: None,
-                        ctime: None,
-                        crtime: None,
-                        bkuptime: None,
-                        flags: None,
-                    },
-                    other_uid,
-                    other_gid,
-                )
-                .expect_err("setattr rejects non-owner metadata changes"),
-            fuser::Errno::EACCES,
-        );
-        if current_uid() != 0 {
-            let readonly_size_file = storage
-                .create_node(
-                    INODE_ROOT,
-                    OsStr::new("readonly-size-file"),
-                    0o400,
-                    0,
-                    current_credentials(),
-                    CreateNodeKind::RegularFile,
-                )
-                .expect("read-only file is created")
-                .attr
-                .ino
-                .into();
-            assert_fuse_errno(
-                storage
-                    .setattr(
-                        readonly_size_file,
-                        SetAttributes {
-                            mode: None,
-                            uid: None,
-                            gid: None,
-                            size: Some(1),
-                            atime: None,
-                            mtime: None,
-                            ctime: None,
-                            crtime: None,
-                            bkuptime: None,
-                            flags: None,
-                        },
-                        current_uid(),
-                        current_gid(),
-                    )
-                    .expect_err("owner truncate requires write access"),
-                fuser::Errno::EACCES,
-            );
-        }
-
-        let atime = UNIX_EPOCH + Duration::from_secs(10);
-        let mtime = UNIX_EPOCH + Duration::from_secs(20);
-        let ctime = UNIX_EPOCH + Duration::from_secs(30);
-        let crtime = UNIX_EPOCH + Duration::from_secs(40);
-        let bkuptime = UNIX_EPOCH + Duration::from_secs(50);
-        let updated = storage
-            .setattr(
-                file,
-                SetAttributes {
-                    mode: Some(0o640),
-                    uid: Some(current_uid()),
-                    gid: Some(current_gid()),
-                    size: None,
-                    atime: Some(fuser::TimeOrNow::SpecificTime(atime)),
-                    mtime: Some(fuser::TimeOrNow::SpecificTime(mtime)),
-                    ctime: Some(ctime),
-                    crtime: Some(crtime),
-                    bkuptime: Some(bkuptime),
-                    flags: Some(0x20),
-                },
-                current_uid(),
-                current_gid(),
-            )
-            .expect("full metadata update succeeds");
-        assert_eq!(updated.attr.perm, 0o640);
-        assert_eq!(updated.attr.uid, current_uid());
-        assert_eq!(updated.attr.gid, current_gid());
-        assert_eq!(updated.attr.atime, atime);
-        assert_eq!(updated.attr.mtime, mtime);
-        assert_eq!(updated.attr.crtime, crtime);
-        assert_eq!(updated.attr.flags, 0x20);
         let extended_times = storage
             .getxtimes(file)
             .expect("extended times are readable");
-        assert_eq!(extended_times.bkuptime, bkuptime);
-        assert_eq!(extended_times.crtime, crtime);
+        assert_eq!(extended_times.bkuptime, attributes.crtime);
+        assert_eq!(extended_times.crtime, attributes.crtime);
 
         let xattr_name = OsStr::new("user.eventfs.access");
-        assert_fuse_errno(
-            storage
-                .setxattr(file, xattr_name, b"value", 0, other_uid, other_gid)
-                .expect_err("setxattr rejects non-owner without write access"),
-            fuser::Errno::EACCES,
-        );
         storage
-            .setxattr(
-                file,
-                xattr_name,
-                b"value",
-                libc::XATTR_CREATE,
-                current_uid(),
-                current_gid(),
-            )
+            .setxattr(file, xattr_name, b"value", libc::XATTR_CREATE)
             .expect("owner sets xattr");
+        storage
+            .removexattr(file, xattr_name)
+            .expect("xattr removal succeeds");
         assert_fuse_errno(
             storage
-                .removexattr(file, xattr_name, other_uid)
-                .expect_err("removexattr rejects non-owner"),
-            fuser::Errno::EACCES,
-        );
-        assert_fuse_errno(
-            storage
-                .removexattr(file, OsStr::new("user.eventfs.missing"), current_uid())
+                .removexattr(file, OsStr::new("user.eventfs.missing"))
                 .expect_err("removexattr rejects missing attributes"),
             fuser::Errno::NO_XATTR,
         );
@@ -7713,44 +6871,12 @@ mod tests {
         let storage =
             open_database_path(&temporary.path().join("database")).expect("storage opens");
 
-        let readonly_directory = storage
-            .create_node(
-                INODE_ROOT,
-                OsStr::new("readonly-directory"),
-                0o500,
-                0,
-                current_credentials(),
-                CreateNodeKind::Directory,
-            )
-            .expect("readonly directory is created")
-            .attr
-            .ino
-            .into();
-        if current_uid() != 0 {
-            assert_fuse_errno(
-                storage
-                    .create_node(
-                        readonly_directory,
-                        OsStr::new("denied"),
-                        0o644,
-                        0,
-                        current_credentials(),
-                        CreateNodeKind::RegularFile,
-                    )
-                    .expect_err("create rejects unwritable parent directories"),
-                fuser::Errno::EACCES,
-            );
-        }
-
         let parent_file = create_regular_file(&storage, "not-a-directory-parent");
         assert_fuse_errno(
             storage
                 .create_node(
                     parent_file,
                     OsStr::new("child"),
-                    0o644,
-                    0,
-                    current_credentials(),
                     CreateNodeKind::RegularFile,
                 )
                 .expect_err("create rejects non-directory parents"),
@@ -7767,7 +6893,6 @@ mod tests {
                     INODE_ROOT,
                     OsStr::new("no-replace-destination"),
                     true,
-                    current_credentials(),
                 )
                 .expect_err("rename noreplace rejects existing destinations"),
             fuser::Errno::EEXIST,
@@ -7777,9 +6902,6 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("ancestor"),
-                0o755,
-                0,
-                current_credentials(),
                 CreateNodeKind::Directory,
             )
             .expect("ancestor directory is created")
@@ -7790,9 +6912,6 @@ mod tests {
             .create_node(
                 ancestor,
                 OsStr::new("descendant"),
-                0o755,
-                0,
-                current_credentials(),
                 CreateNodeKind::Directory,
             )
             .expect("descendant directory is created")
@@ -7807,7 +6926,6 @@ mod tests {
                     descendant,
                     OsStr::new("moved"),
                     false,
-                    current_credentials(),
                 )
                 .expect_err("rename rejects moving a directory into itself"),
             fuser::Errno::EINVAL,
@@ -7818,9 +6936,6 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("directory-target"),
-                0o755,
-                0,
-                current_credentials(),
                 CreateNodeKind::Directory,
             )
             .expect("directory target is created");
@@ -7832,7 +6947,6 @@ mod tests {
                     INODE_ROOT,
                     OsStr::new("directory-target"),
                     false,
-                    current_credentials(),
                 )
                 .expect_err("rename rejects file over directory"),
             fuser::Errno::EISDIR,
@@ -7842,9 +6956,6 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("directory-over-file"),
-                0o755,
-                0,
-                current_credentials(),
                 CreateNodeKind::Directory,
             )
             .expect("directory source is created");
@@ -7857,7 +6968,6 @@ mod tests {
                     INODE_ROOT,
                     OsStr::new("file-target"),
                     false,
-                    current_credentials(),
                 )
                 .expect_err("rename rejects directory over file"),
             fuser::Errno::ENOTDIR,
@@ -7867,9 +6977,6 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("nonempty-target"),
-                0o755,
-                0,
-                current_credentials(),
                 CreateNodeKind::Directory,
             )
             .expect("nonempty target is created")
@@ -7880,9 +6987,6 @@ mod tests {
             .create_node(
                 nonempty_target,
                 OsStr::new("child"),
-                0o644,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             )
             .expect("target child is created");
@@ -7890,9 +6994,6 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("empty-directory-source"),
-                0o755,
-                0,
-                current_credentials(),
                 CreateNodeKind::Directory,
             )
             .expect("empty source directory is created");
@@ -7904,7 +7005,6 @@ mod tests {
                     INODE_ROOT,
                     OsStr::new("nonempty-target"),
                     false,
-                    current_credentials(),
                 )
                 .expect_err("rename rejects replacing nonempty directories"),
             fuser::Errno::ENOTEMPTY,
@@ -7912,13 +7012,7 @@ mod tests {
 
         let same_inode = create_regular_file(&storage, "same-inode");
         storage
-            .hard_link(
-                same_inode,
-                INODE_ROOT,
-                OsStr::new("same-inode-link"),
-                current_uid(),
-                current_gid(),
-            )
+            .hard_link(same_inode, INODE_ROOT, OsStr::new("same-inode-link"))
             .expect("hard link to same inode is created");
         storage
             .rename(
@@ -7927,7 +7021,6 @@ mod tests {
                 INODE_ROOT,
                 OsStr::new("same-inode-link"),
                 false,
-                current_credentials(),
             )
             .expect("renaming over another link to the same inode succeeds");
 
@@ -7937,8 +7030,6 @@ mod tests {
                 linked_destination,
                 INODE_ROOT,
                 OsStr::new("linked-destination-survivor"),
-                current_uid(),
-                current_gid(),
             )
             .expect("destination hard link is created");
         create_regular_file(&storage, "linked-replacement-source");
@@ -7949,7 +7040,6 @@ mod tests {
                 INODE_ROOT,
                 OsStr::new("linked-destination"),
                 false,
-                current_credentials(),
             )
             .expect("rename over hard-linked destination succeeds");
         storage
@@ -7958,13 +7048,7 @@ mod tests {
 
         assert_fuse_errno(
             storage
-                .hard_link(
-                    INODE_ROOT,
-                    INODE_ROOT,
-                    OsStr::new("root-hard-link"),
-                    current_uid(),
-                    current_gid(),
-                )
+                .hard_link(INODE_ROOT, INODE_ROOT, OsStr::new("root-hard-link"))
                 .expect_err("hard links to directories are rejected"),
             fuser::Errno::EPERM,
         );
@@ -7976,15 +7060,13 @@ mod tests {
                     hard_link_source,
                     INODE_ROOT,
                     OsStr::new("hard-link-duplicate"),
-                    current_uid(),
-                    current_gid(),
                 )
                 .expect_err("hard links reject existing names"),
             fuser::Errno::EEXIST,
         );
         assert_fuse_errno(
             storage
-                .write_file(INODE_ROOT, 0, b"nope", current_uid(), current_gid())
+                .write_file(INODE_ROOT, 0, b"nope")
                 .expect_err("write rejects directories"),
             fuser::Errno::EISDIR,
         );
@@ -7993,9 +7075,6 @@ mod tests {
             .create_node(
                 INODE_ROOT,
                 OsStr::new("removable-directory"),
-                0o755,
-                0,
-                current_credentials(),
                 CreateNodeKind::Directory,
             )
             .expect("removable directory is created")
@@ -8006,85 +7085,43 @@ mod tests {
             .create_node(
                 removable_directory,
                 OsStr::new("child"),
-                0o644,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             )
             .expect("removable child is created");
         assert_fuse_errno(
             storage
-                .rmdir(
-                    INODE_ROOT,
-                    OsStr::new("hard-link-source"),
-                    current_uid(),
-                    current_gid(),
-                )
+                .rmdir(INODE_ROOT, OsStr::new("hard-link-source"))
                 .expect_err("rmdir rejects regular files"),
             fuser::Errno::ENOTDIR,
         );
         assert_fuse_errno(
             storage
-                .unlink(
-                    INODE_ROOT,
-                    OsStr::new("removable-directory"),
-                    current_uid(),
-                    current_gid(),
-                )
+                .unlink(INODE_ROOT, OsStr::new("removable-directory"))
                 .expect_err("unlink rejects directories"),
             fuser::Errno::EISDIR,
         );
         assert_fuse_errno(
             storage
-                .rmdir(
-                    INODE_ROOT,
-                    OsStr::new("removable-directory"),
-                    current_uid(),
-                    current_gid(),
-                )
+                .rmdir(INODE_ROOT, OsStr::new("removable-directory"))
                 .expect_err("rmdir rejects nonempty directories"),
             fuser::Errno::ENOTEMPTY,
         );
         storage
-            .unlink(
-                removable_directory,
-                OsStr::new("child"),
-                current_uid(),
-                current_gid(),
-            )
+            .unlink(removable_directory, OsStr::new("child"))
             .expect("nested child is removed");
         storage
-            .rmdir(
-                INODE_ROOT,
-                OsStr::new("removable-directory"),
-                current_uid(),
-                current_gid(),
-            )
+            .rmdir(INODE_ROOT, OsStr::new("removable-directory"))
             .expect("empty directory is removed");
 
         let allocation = create_regular_file(&storage, "allocation-edges");
         storage
-            .write_file(allocation, 0, b"abcdef", current_uid(), current_gid())
+            .write_file(allocation, 0, b"abcdef")
             .expect("allocation file is written");
         storage
-            .fallocate(
-                allocation,
-                1,
-                2,
-                fallocate_punch_hole(),
-                current_uid(),
-                current_gid(),
-            )
+            .fallocate(allocation, 1, 2, fallocate_punch_hole())
             .expect("punch-hole allocation succeeds");
         storage
-            .fallocate(
-                allocation,
-                8,
-                2,
-                fallocate_zero_range(),
-                current_uid(),
-                current_gid(),
-            )
+            .fallocate(allocation, 8, 2, fallocate_zero_range())
             .expect("zero range without keep-size extends the file");
         assert_eq!(
             storage
@@ -8103,8 +7140,6 @@ mod tests {
                 20,
                 4,
                 fallocate_zero_range() | fallocate_keep_size(),
-                current_uid(),
-                current_gid(),
             )
             .expect("keep-size zero beyond EOF is a no-op");
         assert_eq!(
@@ -8115,27 +7150,25 @@ mod tests {
         );
         assert_fuse_errno(
             storage
-                .fallocate(
-                    INODE_ROOT,
-                    0,
-                    1,
-                    fallocate_zero_range(),
-                    current_uid(),
-                    current_gid(),
-                )
+                .fallocate(INODE_ROOT, 0, 1, fallocate_zero_range())
                 .expect_err("zero-range allocation rejects directories"),
             fuser::Errno::EISDIR,
         );
 
         let exchange_file = create_regular_file(&storage, "exchange-file");
         storage
+            .create_node(
+                INODE_ROOT,
+                OsStr::new("exchange-directory"),
+                CreateNodeKind::Directory,
+            )
+            .expect("exchange directory is created");
+        storage
             .exchange(
                 INODE_ROOT,
                 OsStr::new("exchange-file"),
                 INODE_ROOT,
                 OsStr::new("exchange-file"),
-                current_uid(),
-                current_gid(),
             )
             .expect("exchanging a file with itself is a no-op");
         assert_fuse_errno(
@@ -8144,9 +7177,7 @@ mod tests {
                     INODE_ROOT,
                     OsStr::new("exchange-file"),
                     INODE_ROOT,
-                    OsStr::new("readonly-directory"),
-                    current_uid(),
-                    current_gid(),
+                    OsStr::new("exchange-directory"),
                 )
                 .expect_err("exchange rejects non-regular files"),
             fuser::Errno::EINVAL,
@@ -8192,9 +7223,6 @@ mod tests {
             storage.create_node(
                 INODE_ROOT,
                 OsStr::new("colliding-file"),
-                0o644,
-                0,
-                current_credentials(),
                 CreateNodeKind::RegularFile,
             ),
             Err(FuseError::Integrity)
@@ -8211,8 +7239,6 @@ mod tests {
                 INODE_ROOT,
                 OsStr::new("colliding-link"),
                 Path::new("target"),
-                current_uid(),
-                current_gid(),
             ),
             Err(FuseError::Integrity)
         ));
@@ -8539,10 +7565,6 @@ mod tests {
             event_payload_part_byte(FileEventPayloadPart::Written),
             EVENT_PAYLOAD_PART_WRITTEN
         );
-        assert_eq!(
-            event_payload_part_byte(FileEventPayloadPart::Removed),
-            EVENT_PAYLOAD_PART_REMOVED
-        );
     }
 
     #[test]
@@ -8593,7 +7615,7 @@ mod tests {
             open_database_path(&temporary.path().join("database")).expect("storage opens");
         let inode_number = create_regular_file(&storage, "manifest-corruption");
         storage
-            .write_file(inode_number, 0, b"abcdef", current_uid(), current_gid())
+            .write_file(inode_number, 0, b"abcdef")
             .expect("file is written");
         let sequence = storage
             .last_event_sequence()
@@ -8612,7 +7634,7 @@ mod tests {
         );
         assert_eq!(
             storage
-                .read_file_event_payload_range(sequence, FileEventPayloadPart::Removed, 0, 3)
+                .read_file_event_payload_range(sequence, FileEventPayloadPart::Overwritten, 0, 3)
                 .expect("missing payload part reads as empty"),
             Vec::<u8>::new()
         );
@@ -8657,7 +7679,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_name_xattr_statfs_and_mode_helpers_cover_edges() {
+    fn name_xattr_statfs_and_file_type_mode_helpers_cover_edges() {
         assert_eq!(
             validate_name(OsStr::new("child")).expect("name is valid"),
             b"child"
@@ -8708,8 +7730,6 @@ mod tests {
             fuser::Errno::ERANGE,
         );
 
-        assert_eq!(permissions_from_mode(0o7777, 0o027), 0o7750);
-        assert_eq!(permission_bits(0o100755), 0o755);
         assert_eq!(
             special_kind_from_mode(u32::from(libc::S_IFREG)).expect("regular mode maps"),
             StoredNodeKind::RegularFile
@@ -8743,32 +7763,6 @@ mod tests {
             file_identifier_for_kind(12, StoredNodeKind::Directory),
             None
         );
-
-        assert_eq!(
-            access_mask_for_open_flags(fuser::OpenFlags(libc::O_RDONLY)),
-            fuser::AccessFlags::R_OK
-        );
-        assert_eq!(
-            access_mask_for_open_flags(fuser::OpenFlags(libc::O_WRONLY)),
-            fuser::AccessFlags::W_OK
-        );
-        assert_eq!(
-            access_mask_for_open_flags(fuser::OpenFlags(libc::O_RDWR)),
-            fuser::AccessFlags::R_OK | fuser::AccessFlags::W_OK
-        );
-        assert_eq!(
-            write_directory_access_mask(),
-            fuser::AccessFlags::W_OK | fuser::AccessFlags::X_OK
-        );
-
-        let inode = stored_inode_for_test(StoredNodeKind::RegularFile, 0o640, 100, 200);
-        assert!(access_allowed(&inode, 100, 1, fuser::AccessFlags::R_OK));
-        assert!(access_allowed(&inode, 100, 1, fuser::AccessFlags::W_OK));
-        assert!(!access_allowed(&inode, 100, 1, fuser::AccessFlags::X_OK));
-        assert!(access_allowed(&inode, 1, 200, fuser::AccessFlags::R_OK));
-        assert!(!access_allowed(&inode, 1, 200, fuser::AccessFlags::W_OK));
-        assert!(!access_allowed(&inode, 1, 1, fuser::AccessFlags::R_OK));
-        assert!(access_allowed(&inode, 1, 1, fuser::AccessFlags::empty()));
 
         assert!(matches!(
             statistics_from_backing(
@@ -8903,7 +7897,6 @@ mod tests {
     #[derive(Clone, Debug)]
     enum BoundedFileOperation {
         Write { offset: u64, bytes: Vec<u8> },
-        Truncate { size: u64 },
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -8915,7 +7908,6 @@ mod tests {
         byte_length: Option<u64>,
         overwritten: Vec<u8>,
         written: Vec<u8>,
-        removed: Vec<u8>,
     }
 
     #[derive(Default)]
@@ -8935,20 +7927,19 @@ mod tests {
                 byte_length: None,
                 overwritten: Vec::new(),
                 written: Vec::new(),
-                removed: Vec::new(),
             }
         }
 
         fn old_file_size(&self) -> Option<u64> {
             match self.kind {
-                EventKind::FileWritten | EventKind::FileTruncated => Some(self.before.len() as u64),
+                EventKind::FileWritten => Some(self.before.len() as u64),
                 _ => None,
             }
         }
 
         fn new_file_size(&self) -> Option<u64> {
             match self.kind {
-                EventKind::FileWritten | EventKind::FileTruncated => Some(self.after.len() as u64),
+                EventKind::FileWritten => Some(self.after.len() as u64),
                 _ => None,
             }
         }
@@ -8966,20 +7957,12 @@ mod tests {
                 _ => None,
             }
         }
-
-        fn removed_byte_length(&self) -> Option<u64> {
-            match self.kind {
-                EventKind::FileTruncated => Some(self.removed.len() as u64),
-                _ => None,
-            }
-        }
     }
 
     impl BoundedExtentModel {
         fn apply(&mut self, operation: &BoundedFileOperation) -> FuseResult<()> {
             match operation {
                 BoundedFileOperation::Write { offset, bytes } => self.apply_write(*offset, bytes),
-                BoundedFileOperation::Truncate { size } => self.apply_truncate(*size),
             }
         }
 
@@ -9004,12 +7987,6 @@ mod tests {
                 &written_extents,
             )?;
             self.file_size = new_size;
-            Ok(())
-        }
-
-        fn apply_truncate(&mut self, size: u64) -> FuseResult<()> {
-            self.extents = current_extents_after_truncate(&self.extents, size)?;
-            self.file_size = size;
             Ok(())
         }
 
@@ -9049,17 +8026,14 @@ mod tests {
                 offset: 170 * 1024,
                 bytes: patterned_bytes(20 * 1024, 17),
             },
-            BoundedFileOperation::Truncate { size: 80 * 1024 },
             BoundedFileOperation::Write {
                 offset: 40 * 1024,
                 bytes: patterned_bytes(120 * 1024, 29),
             },
-            BoundedFileOperation::Truncate { size: 210 * 1024 },
             BoundedFileOperation::Write {
                 offset: 192 * 1024,
                 bytes: patterned_bytes(12 * 1024, 41),
             },
-            BoundedFileOperation::Truncate { size: 32 * 1024 },
         ]
     }
 
@@ -9078,12 +8052,10 @@ mod tests {
                 offset: 24 * 1024,
                 bytes: patterned_bytes(40 * 1024, 19),
             },
-            BoundedFileOperation::Truncate { size: 50 * 1024 },
             BoundedFileOperation::Write {
                 offset: 80 * 1024,
                 bytes: patterned_bytes(20 * 1024, 37),
             },
-            BoundedFileOperation::Truncate { size: 140 * 1024 },
             BoundedFileOperation::Write {
                 offset: 128 * 1024,
                 bytes: patterned_bytes(8 * 1024, 59),
@@ -9121,30 +8093,6 @@ mod tests {
                     byte_length: Some(bytes.len() as u64),
                     overwritten,
                     written: bytes.clone(),
-                    removed: Vec::new(),
-                }
-            }
-            BoundedFileOperation::Truncate { size } => {
-                let before = dense.clone();
-                let size = usize::try_from(*size).expect("bounded truncate size fits usize");
-                let offset = before.len().min(size) as u64;
-                let byte_length = before.len().abs_diff(size) as u64;
-                let removed = if size < before.len() {
-                    before[size..].to_vec()
-                } else {
-                    Vec::new()
-                };
-                dense.resize(size, 0);
-
-                BoundedFileExpectation {
-                    kind: EventKind::FileTruncated,
-                    before,
-                    after: dense.clone(),
-                    offset: Some(offset),
-                    byte_length: Some(byte_length),
-                    overwritten: Vec::new(),
-                    written: Vec::new(),
-                    removed,
                 }
             }
         }
@@ -9158,29 +8106,8 @@ mod tests {
         match operation {
             BoundedFileOperation::Write { offset, bytes } => {
                 storage
-                    .write_file(inode_number, *offset, bytes, current_uid(), current_gid())
+                    .write_file(inode_number, *offset, bytes)
                     .expect("bounded write succeeds");
-            }
-            BoundedFileOperation::Truncate { size } => {
-                storage
-                    .setattr(
-                        inode_number,
-                        SetAttributes {
-                            mode: None,
-                            uid: None,
-                            gid: None,
-                            size: Some(*size),
-                            atime: None,
-                            mtime: None,
-                            ctime: None,
-                            crtime: None,
-                            bkuptime: None,
-                            flags: None,
-                        },
-                        current_uid(),
-                        current_gid(),
-                    )
-                    .expect("bounded truncate succeeds");
             }
         }
     }
@@ -9212,10 +8139,6 @@ mod tests {
             expectation.written_byte_length()
         );
         assert_eq!(
-            event.removed_byte_length(),
-            expectation.removed_byte_length()
-        );
-        assert_eq!(
             storage
                 .read_file_event_payload_range(
                     sequence,
@@ -9239,24 +8162,11 @@ mod tests {
         );
         assert_eq!(
             storage
-                .read_file_event_payload_range(
-                    sequence,
-                    FileEventPayloadPart::Removed,
-                    0,
-                    expectation.removed.len() as u64 + 64,
-                )
-                .expect("removed payload is readable"),
-            expectation.removed
-        );
-        assert_eq!(
-            storage
                 .read_file(
                     inode_number,
                     0,
                     u32::try_from(expectation.after.len() + 16)
                         .expect("bounded file length fits u32"),
-                    current_uid(),
-                    current_gid(),
                 )
                 .expect("current file bytes are readable"),
             expectation.after
@@ -9486,11 +8396,6 @@ mod tests {
                     0,
                 );
             }
-            EventKind::FileTruncated => bytes.resize(
-                usize::try_from(event.new_file_size().expect("new file size exists"))
-                    .expect("new file size fits usize"),
-                0,
-            ),
             _ => {}
         }
     }
@@ -9504,44 +8409,11 @@ mod tests {
 
     fn create_regular_file(storage: &Storage, name: &str) -> u64 {
         storage
-            .create_node(
-                INODE_ROOT,
-                OsStr::new(name),
-                0o644,
-                0,
-                current_credentials(),
-                CreateNodeKind::RegularFile,
-            )
+            .create_node(INODE_ROOT, OsStr::new(name), CreateNodeKind::RegularFile)
             .expect("regular file is created")
             .attr
             .ino
             .into()
-    }
-
-    fn stored_inode_for_test(kind: StoredNodeKind, mode: u16, uid: u32, gid: u32) -> StoredInode {
-        let time = StoredTime {
-            seconds: 0,
-            nanoseconds: 0,
-        };
-        StoredInode {
-            kind,
-            mode,
-            uid,
-            gid,
-            size: 0,
-            nlink: 1,
-            rdev: 0,
-            atime: time,
-            mtime: time,
-            ctime: time,
-            crtime: time,
-            bkuptime: time,
-            flags: 0,
-            parent: INODE_ROOT,
-            name: b"test".to_vec(),
-            symlink_target: None,
-            content_manifest_identifier: None,
-        }
     }
 
     fn stored_extent_for_test(
@@ -9565,21 +8437,6 @@ mod tests {
                 panic!("expected errno {}, got {error:?}", expected.code())
             }
         }
-    }
-
-    fn current_credentials() -> FuseCredentials {
-        FuseCredentials {
-            uid: current_uid(),
-            gid: current_gid(),
-        }
-    }
-
-    fn non_current_uid() -> u32 {
-        if current_uid() == 1 { 2 } else { 1 }
-    }
-
-    fn non_current_gid() -> u32 {
-        if current_gid() == 1 { 2 } else { 1 }
     }
 
     fn patterned_bytes(length: usize, salt: usize) -> Vec<u8> {

@@ -12,7 +12,7 @@ use eventfs::{
 
 use support::{
     TestDirectories, configuration_for, file_identifier_for_path, list_all_events,
-    open_test_filesystem,
+    open_test_filesystem, write_mounted_file,
 };
 
 #[test]
@@ -80,7 +80,7 @@ fn local_import_replaces_an_existing_target_database() {
     let mounted = source
         .spawn_mount()
         .expect("source filesystem mounts in the background");
-    fs::write(&source_file_path, b"source state").expect("source file is written");
+    write_mounted_file(&source_file_path, b"source state").expect("source file is written");
     mounted.unmount().expect("source filesystem unmounts");
 
     let source_events = list_all_events(&source);
@@ -95,7 +95,7 @@ fn local_import_replaces_an_existing_target_database() {
     let mounted = target
         .spawn_mount()
         .expect("target filesystem mounts in the background");
-    fs::write(target_mount_point.join("target-only"), b"target state")
+    write_mounted_file(target_mount_point.join("target-only"), b"target state")
         .expect("target file is written");
     mounted.unmount().expect("target filesystem unmounts");
 
@@ -216,7 +216,7 @@ fn imported_backups_restore_active_branch_contents_history_snapshots_and_payload
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"main base").expect("main branch file is written");
+    write_mounted_file(&file_path, b"main base").expect("main branch file is written");
     mounted.unmount().expect("filesystem unmounts");
 
     let main = filesystem
@@ -234,7 +234,7 @@ fn imported_backups_restore_active_branch_contents_history_snapshots_and_payload
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"feature payload").expect("feature branch file is written");
+    write_mounted_file(&file_path, b"feature payload").expect("feature branch file is written");
     mounted.unmount().expect("filesystem unmounts");
 
     let feature = filesystem
@@ -352,7 +352,7 @@ fn import_can_restore_an_older_requested_backup() {
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"older state").expect("initial file contents are written");
+    write_mounted_file(&file_path, b"older state").expect("initial file contents are written");
     mounted.unmount().expect("filesystem unmounts");
     let older_backup = filesystem
         .create_backup(backup_directory.clone())
@@ -361,7 +361,7 @@ fn import_can_restore_an_older_requested_backup() {
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"newer state").expect("later file contents are written");
+    write_mounted_file(&file_path, b"newer state").expect("later file contents are written");
     mounted.unmount().expect("filesystem unmounts");
     let newer_backup = filesystem
         .create_backup(backup_directory.clone())
@@ -412,11 +412,11 @@ fn mounted_backups_capture_the_state_before_later_live_writes() {
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"before backup").expect("initial file contents are written");
+    write_mounted_file(&file_path, b"before backup").expect("initial file contents are written");
     let backup = filesystem
         .create_backup(backup_directory.clone())
         .expect("mounted backup succeeds");
-    fs::write(&file_path, b"after backup").expect("later file contents are written");
+    write_mounted_file(&file_path, b"after backup!").expect("later file contents are written");
     mounted.unmount().expect("filesystem unmounts");
 
     assert!(
@@ -685,7 +685,7 @@ fn unknown_backup_import_failures_preserve_existing_target_data() {
     let mounted = target
         .spawn_mount()
         .expect("target filesystem mounts in the background");
-    fs::write(target_mount_point.join("keep"), b"keep").expect("target file is written");
+    write_mounted_file(target_mount_point.join("keep"), b"keep").expect("target file is written");
     mounted.unmount().expect("target filesystem unmounts");
     let target_events = list_all_events(&target);
     drop(target);

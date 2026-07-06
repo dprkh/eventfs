@@ -3,7 +3,7 @@ mod support;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -11,7 +11,7 @@ use std::thread;
 use support::{
     TestDirectories, access_path, assert_event_sequences_increase, event_page_limit,
     file_identifier_for_path, fsync_directory, list_all_events, mkfifo, mount,
-    open_test_filesystem, statvfs,
+    open_test_filesystem, statvfs, write_mounted_file,
 };
 
 #[test]
@@ -22,7 +22,7 @@ fn concurrent_mounted_writes_and_event_listing_preserve_final_contents() {
         .spawn_mount()
         .expect("filesystem mounts in the background");
     let watched_path = directories.mount_point_path().join("listed-file");
-    fs::write(&watched_path, b"seed").expect("listed file is created");
+    write_mounted_file(&watched_path, b"seed").expect("listed file is created");
     let watched_file_identifier = file_identifier_for_path(&filesystem, "/listed-file");
     let barrier = Arc::new(Barrier::new(5));
     let mut writers = Vec::new();
@@ -36,7 +36,7 @@ fn concurrent_mounted_writes_and_event_listing_preserve_final_contents() {
             for file_index in 0..6 {
                 let path = root.join(format!("thread-{thread_index}-file-{file_index}"));
                 let initial = initial_bytes(thread_index, file_index);
-                fs::write(&path, &initial).expect("concurrent file is written");
+                write_mounted_file(&path, &initial).expect("concurrent file is written");
                 let replacement = replacement_bytes(thread_index, file_index);
                 let mut file = OpenOptions::new()
                     .read(true)
@@ -47,10 +47,9 @@ fn concurrent_mounted_writes_and_event_listing_preserve_final_contents() {
                     .expect("concurrent file seeks");
                 file.write_all(&replacement)
                     .expect("concurrent file is overwritten");
-                file.set_len(12).expect("concurrent file is truncated");
                 file.flush().expect("concurrent file flushes");
                 if thread_index == 0 {
-                    fs::write(&watched_path, format!("watched-{file_index}"))
+                    write_mounted_file(&watched_path, format!("watched-{file_index}"))
                         .expect("listed file is updated under load");
                 }
             }
@@ -134,10 +133,8 @@ fn mounted_fuse_stress_repeats_supported_operation_combinations() {
         let renamed = archive.join(format!("renamed-{index}"));
         let mut bytes = format!("stress-file-{index}-initial").into_bytes();
 
-        fs::write(&source, &bytes).expect("stress file is written");
+        write_mounted_file(&source, &bytes).expect("stress file is written");
         mutate_file(&source, index, &mut bytes);
-        fs::set_permissions(&source, fs::Permissions::from_mode(0o600))
-            .expect("stress file metadata is updated");
         assert_eq!(access_path(&source, libc::R_OK), 0);
         assert_eq!(statvfs(root).f_namemax, 255);
         fs::hard_link(&source, &hard_link).expect("hard link is created");
@@ -197,7 +194,6 @@ fn expected_bytes(thread_index: usize, file_index: usize) -> Vec<u8> {
     let mut bytes = initial_bytes(thread_index, file_index);
     let replacement = replacement_bytes(thread_index, file_index);
     bytes[..replacement.len()].copy_from_slice(&replacement);
-    bytes.truncate(12);
     bytes
 }
 
@@ -212,13 +208,11 @@ fn mutate_file(path: &Path, index: usize, bytes: &mut Vec<u8>) {
     file.write_all(&patch).expect("stress file is overwritten");
     bytes[3..3 + patch.len()].copy_from_slice(&patch);
     if index.is_multiple_of(2) {
-        file.set_len((bytes.len() + 5) as u64)
-            .expect("stress file grows");
-        bytes.resize(bytes.len() + 5, 0);
-    } else {
-        file.set_len((bytes.len() - 2) as u64)
-            .expect("stress file shrinks");
-        bytes.truncate(bytes.len() - 2);
+        let new_len = bytes.len() + 5;
+        file.seek(SeekFrom::Start((new_len - 1) as u64))
+            .expect("stress file seeks to extension point");
+        file.write_all(&[0]).expect("stress file grows");
+        bytes.resize(new_len, 0);
     }
     file.flush().expect("stress file flushes");
     file.sync_all().expect("stress file syncs");

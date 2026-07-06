@@ -1,6 +1,5 @@
 mod support;
 
-use std::fs;
 use std::sync::{Arc, Mutex};
 
 use eventfs::EventKind;
@@ -9,7 +8,7 @@ use support::{
     TestDirectories, assert_callback_errors_include, event_count, expect_event_kinds,
     expect_no_events, filesystem_with_fuse_error_callback, get_xattr, get_xattr_into_buffer,
     list_xattr, list_xattr_into_buffer, mount, open_test_filesystem, recorded_callback_errors,
-    remove_xattr, set_xattr,
+    remove_xattr, set_xattr, write_mounted_file,
 };
 
 #[test]
@@ -20,7 +19,7 @@ fn mounted_extended_attributes_round_trip_and_append_exact_events() {
     let file_path = directories.mount_point_path().join("file");
     let name = "user.eventfs.supported";
 
-    fs::write(&file_path, b"contents").expect("file is written");
+    write_mounted_file(&file_path, b"contents").expect("file is written");
     let mut events = event_count(&filesystem);
 
     set_xattr(&file_path, name, b"value", libc::XATTR_CREATE).expect("xattr is created");
@@ -87,7 +86,7 @@ fn mounted_extended_attribute_small_buffers_return_range_errors_without_events()
     let file_path = directories.mount_point_path().join("file");
     let name = "user.eventfs.small-buffer";
 
-    fs::write(&file_path, b"contents").expect("file is written");
+    write_mounted_file(&file_path, b"contents").expect("file is written");
     set_xattr(&file_path, name, b"value", libc::XATTR_CREATE).expect("xattr is created");
     let mut events = event_count(&filesystem);
 
@@ -119,7 +118,7 @@ fn fuse_error_callback_receives_supported_xattr_failures_without_events() {
     let file_path = directories.mount_point_path().join("file");
     let name = "user.eventfs.missing";
 
-    fs::write(&file_path, b"contents").expect("file is written");
+    write_mounted_file(&file_path, b"contents").expect("file is written");
     let mut events = event_count(&filesystem);
     let error = set_xattr(&file_path, name, b"value", libc::XATTR_REPLACE)
         .expect_err("replacing a missing xattr fails");

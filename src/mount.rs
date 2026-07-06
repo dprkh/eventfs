@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::filesystem::{Filesystem, FilesystemError, MountOption, SessionAccessControlList};
+use crate::filesystem::{Filesystem, FilesystemError, MountOption};
 
 /// Background mounted filesystem session.
 #[derive(Debug)]
@@ -115,8 +115,7 @@ fn validate_mount_point(path: &Path) -> Result<(), FilesystemError> {
 
 fn mount_configuration(filesystem: &Filesystem) -> Result<fuser::Config, FilesystemError> {
     let mut configuration = fuser::Config::default();
-    configuration.acl =
-        fuser_session_access_control_list(filesystem.configuration().session_access_control_list());
+    configuration.acl = fuser::SessionACL::All;
     let caller_mount_options = filesystem.configuration().mount_options();
     if !caller_mount_options
         .iter()
@@ -145,31 +144,14 @@ fn mount_configuration(filesystem: &Filesystem) -> Result<fuser::Config, Filesys
     Ok(configuration)
 }
 
-fn fuser_session_access_control_list(
-    session_access_control_list: SessionAccessControlList,
-) -> fuser::SessionACL {
-    match session_access_control_list {
-        SessionAccessControlList::All => fuser::SessionACL::All,
-        SessionAccessControlList::RootAndOwner => fuser::SessionACL::RootAndOwner,
-        SessionAccessControlList::Owner => fuser::SessionACL::Owner,
-    }
-}
-
 fn fuser_mount_option(option: &MountOption) -> fuser::MountOption {
     match option {
         MountOption::FilesystemName(value) => fuser::MountOption::FSName(value.clone()),
         MountOption::Subtype(value) => fuser::MountOption::Subtype(value.clone()),
         MountOption::Custom(value) => fuser::MountOption::CUSTOM(value.clone()),
         MountOption::AutoUnmount => fuser::MountOption::AutoUnmount,
-        MountOption::DefaultPermissions => fuser::MountOption::DefaultPermissions,
-        MountOption::Dev => fuser::MountOption::Dev,
-        MountOption::NoDev => fuser::MountOption::NoDev,
-        MountOption::Suid => fuser::MountOption::Suid,
-        MountOption::NoSuid => fuser::MountOption::NoSuid,
         MountOption::ReadOnly => fuser::MountOption::RO,
         MountOption::ReadWrite => fuser::MountOption::RW,
-        MountOption::Exec => fuser::MountOption::Exec,
-        MountOption::NoExec => fuser::MountOption::NoExec,
         MountOption::Atime => fuser::MountOption::Atime,
         MountOption::NoAtime => fuser::MountOption::NoAtime,
         MountOption::DirSync => fuser::MountOption::DirSync,
@@ -247,12 +229,12 @@ mod tests {
     }
 
     #[test]
-    fn mount_configuration_uses_default_filesystem_name_and_owner_access() {
+    fn mount_configuration_uses_default_filesystem_name_and_unrestricted_access() {
         let fixture = TestFilesystem::new("default-mount-configuration");
         let configuration =
             mount_configuration(&fixture.filesystem).expect("mount configuration is built");
 
-        assert_eq!(configuration.acl, fuser::SessionACL::Owner);
+        assert_eq!(configuration.acl, fuser::SessionACL::All);
         assert!(
             matches!(
                 configuration.mount_options.first(),
@@ -263,21 +245,14 @@ mod tests {
     }
 
     #[test]
-    fn mount_configuration_maps_session_access_control_list_and_mount_options() {
+    fn mount_configuration_maps_mount_options() {
         let mount_options = vec![
             MountOption::FilesystemName("configured-name".to_owned()),
             MountOption::Subtype("eventfs".to_owned()),
             MountOption::Custom("debug".to_owned()),
             MountOption::AutoUnmount,
-            MountOption::DefaultPermissions,
-            MountOption::Dev,
-            MountOption::NoDev,
-            MountOption::Suid,
-            MountOption::NoSuid,
             MountOption::ReadOnly,
             MountOption::ReadWrite,
-            MountOption::Exec,
-            MountOption::NoExec,
             MountOption::Atime,
             MountOption::NoAtime,
             MountOption::DirSync,
@@ -289,15 +264,8 @@ mod tests {
             fuser::MountOption::Subtype("eventfs".to_owned()),
             fuser::MountOption::CUSTOM("debug".to_owned()),
             fuser::MountOption::AutoUnmount,
-            fuser::MountOption::DefaultPermissions,
-            fuser::MountOption::Dev,
-            fuser::MountOption::NoDev,
-            fuser::MountOption::Suid,
-            fuser::MountOption::NoSuid,
             fuser::MountOption::RO,
             fuser::MountOption::RW,
-            fuser::MountOption::Exec,
-            fuser::MountOption::NoExec,
             fuser::MountOption::Atime,
             fuser::MountOption::NoAtime,
             fuser::MountOption::DirSync,
@@ -306,9 +274,7 @@ mod tests {
         ];
         let fixture =
             TestFilesystem::new_with_configuration("configured-mount-options", |configuration| {
-                configuration
-                    .with_session_access_control_list(SessionAccessControlList::All)
-                    .with_mount_options(mount_options)
+                configuration.with_mount_options(mount_options)
             });
         let configuration =
             mount_configuration(&fixture.filesystem).expect("mount configuration is built");
@@ -327,19 +293,6 @@ mod tests {
             1,
             "caller filesystem name replaces the default filesystem name"
         );
-    }
-
-    #[test]
-    fn mount_configuration_maps_root_and_owner_access() {
-        let fixture =
-            TestFilesystem::new_with_configuration("root-and-owner-access", |configuration| {
-                configuration
-                    .with_session_access_control_list(SessionAccessControlList::RootAndOwner)
-            });
-        let configuration =
-            mount_configuration(&fixture.filesystem).expect("mount configuration is built");
-
-        assert_eq!(configuration.acl, fuser::SessionACL::RootAndOwner);
     }
 
     #[test]

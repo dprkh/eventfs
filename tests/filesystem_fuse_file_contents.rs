@@ -3,7 +3,6 @@ mod support;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,11 +10,12 @@ use eventfs::EventKind;
 
 use support::{
     TestDirectories, create_empty_file, event_count, expect_event_kinds, expect_no_events, mount,
-    open_test_filesystem,
+    open_test_filesystem, write_mounted_file,
 };
 
 #[test]
-fn mounted_file_create_open_read_write_truncate_flush_sync_and_release_have_expected_events() {
+fn mounted_file_create_open_read_write_flush_sync_release_and_unsupported_set_len_have_expected_events()
+ {
     let directories = TestDirectories::new();
     let filesystem = open_test_filesystem(&directories);
     let _mounted = mount(&filesystem);
@@ -50,13 +50,8 @@ fn mounted_file_create_open_read_write_truncate_flush_sync_and_release_have_expe
     file.sync_all().expect("file is synchronized");
     expect_no_events(&mut events, &filesystem, "fsync does not append events");
 
-    file.set_len(3).expect("file is truncated");
-    expect_event_kinds(
-        &mut events,
-        &filesystem,
-        &[EventKind::FileTruncated],
-        "truncate appends one file-truncated event",
-    );
+    file.set_len(3).expect_err("set_len is unsupported");
+    expect_no_events(&mut events, &filesystem, "set_len does not append events");
     drop(file);
     expect_no_events(&mut events, &filesystem, "release does not append events");
 
@@ -65,7 +60,7 @@ fn mounted_file_create_open_read_write_truncate_flush_sync_and_release_have_expe
         .expect("file reopens")
         .read_to_end(&mut bytes)
         .expect("file is read");
-    assert_eq!(bytes, b"abc");
+    assert_eq!(bytes, b"abcdef");
     expect_no_events(&mut events, &filesystem, "read does not append events");
 
     fs::remove_file(&file_path).expect("file is unlinked");
@@ -78,7 +73,7 @@ fn mounted_file_create_open_read_write_truncate_flush_sync_and_release_have_expe
 }
 
 #[test]
-fn mounted_file_read_write_and_truncate_edges_project_contents() {
+fn mounted_file_read_write_and_eof_edges_project_contents() {
     let directories = TestDirectories::new();
     let filesystem = open_test_filesystem(&directories);
     let _mounted = mount(&filesystem);
@@ -123,68 +118,25 @@ fn mounted_file_read_write_and_truncate_edges_project_contents() {
         .write(true)
         .open(&file_path)
         .expect("file reopens");
-    file.set_len(3).expect("file is shrunk");
-    expect_event_kinds(
-        &mut events,
-        &filesystem,
-        &[EventKind::FileTruncated],
-        "shrink truncate appends one event",
-    );
-    assert_eq!(
-        fs::read(&file_path).expect("shrunk file is read"),
-        b"\0\0\0"
-    );
-    expect_no_events(
-        &mut events,
-        &filesystem,
-        "shrunk read does not append events",
-    );
-
-    file.set_len(6).expect("file is grown");
-    expect_event_kinds(
-        &mut events,
-        &filesystem,
-        &[EventKind::FileTruncated],
-        "grow truncate appends one event",
-    );
-    assert_eq!(
-        fs::read(&file_path).expect("grown file is read"),
-        b"\0\0\0\0\0\0"
-    );
-    expect_no_events(
-        &mut events,
-        &filesystem,
-        "grown read does not append events",
-    );
-
     file.seek(SeekFrom::Start(20))
         .expect("seek past EOF succeeds");
     let mut bytes = [0; 4];
     assert_eq!(file.read(&mut bytes).expect("EOF read succeeds"), 0);
     expect_no_events(&mut events, &filesystem, "EOF read does not append events");
-
-    file.set_len(0).expect("file is truncated to zero");
-    expect_event_kinds(
-        &mut events,
-        &filesystem,
-        &[EventKind::FileTruncated],
-        "zero truncate appends one event",
-    );
     drop(file);
-    assert!(
-        fs::read(&file_path)
-            .expect("zero-length file is read")
-            .is_empty()
+    assert_eq!(
+        fs::read(&file_path).expect("file is read after EOF checks"),
+        b"\0\0\0\0xy"
     );
     expect_no_events(
         &mut events,
         &filesystem,
-        "zero-length read does not append events",
+        "post-EOF read does not append events",
     );
 }
 
 #[test]
-fn mounted_file_timestamps_update_metadata_once() {
+fn mounted_file_timestamp_updates_are_unsupported_without_events() {
     let directories = TestDirectories::new();
     let filesystem = open_test_filesystem(&directories);
     let _mounted = mount(&filesystem);
@@ -192,52 +144,29 @@ fn mounted_file_timestamps_update_metadata_once() {
     let atime = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     let mtime = UNIX_EPOCH + Duration::from_secs(1_700_000_123);
 
-    fs::write(&file_path, b"contents").expect("timestamp file is written");
-    let ctime_before = fs::metadata(&file_path)
-        .expect("timestamp file metadata is readable")
-        .ctime();
+    write_mounted_file(&file_path, b"contents").expect("timestamp file is written");
     let mut events = event_count(&filesystem);
 
-    set_file_times(&file_path, atime, mtime);
-    expect_event_kinds(
+    set_file_times(&file_path, atime, mtime).expect_err("timestamp update is unsupported");
+    expect_no_events(
         &mut events,
         &filesystem,
-        &[EventKind::MetadataChanged],
-        "setting atime and mtime appends one metadata event",
+        "unsupported timestamp update does not append events",
     );
-
-    let metadata = fs::metadata(&file_path).expect("timestamp file metadata is reread");
-    assert_eq!(metadata_atime(&metadata), system_time_parts(atime));
-    assert_eq!(metadata_mtime(&metadata), system_time_parts(mtime));
-    assert!(metadata.ctime() >= ctime_before);
 }
 
-fn set_file_times(path: &Path, atime: SystemTime, mtime: SystemTime) {
+fn set_file_times(path: &Path, atime: SystemTime, mtime: SystemTime) -> std::io::Result<()> {
     let path = c_path(path);
     let times = [
         timespec_from_system_time(atime),
         timespec_from_system_time(mtime),
     ];
     let result = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) };
-    assert_eq!(result, 0, "utimensat succeeds: {}", last_os_error());
-}
-
-fn metadata_atime(metadata: &fs::Metadata) -> (i64, i64) {
-    (metadata.atime(), metadata.atime_nsec())
-}
-
-fn metadata_mtime(metadata: &fs::Metadata) -> (i64, i64) {
-    (metadata.mtime(), metadata.mtime_nsec())
-}
-
-fn system_time_parts(time: SystemTime) -> (i64, i64) {
-    let duration = time
-        .duration_since(UNIX_EPOCH)
-        .expect("timestamp is after the unix epoch");
-    (
-        duration.as_secs() as i64,
-        i64::from(duration.subsec_nanos()),
-    )
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(last_os_error())
+    }
 }
 
 fn timespec_from_system_time(time: SystemTime) -> libc::timespec {

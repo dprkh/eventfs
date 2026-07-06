@@ -10,7 +10,7 @@ mod linux {
     use std::mem::MaybeUninit;
     use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{FileExt, PermissionsExt, symlink};
+    use std::os::unix::fs::{FileExt, symlink};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -112,18 +112,6 @@ mod linux {
             "getattr",
             repeated_file_metadata(eventfs_root.join("getattr-file")),
             repeated_file_metadata(host_root.join("getattr-file")),
-        );
-
-        let (eventfs_root, host_root) = fixture.roots();
-        benchmark_pair(
-            group,
-            "setattr",
-            repeated_mutating_file(eventfs_root, "setattr", |path, _index| {
-                timed(|| fs::set_permissions(path, fs::Permissions::from_mode(0o600)))
-            }),
-            repeated_mutating_file(host_root, "setattr", |path, _index| {
-                timed(|| fs::set_permissions(path, fs::Permissions::from_mode(0o600)))
-            }),
         );
 
         let (eventfs_root, host_root) = fixture.roots();
@@ -293,21 +281,6 @@ mod linux {
             "write",
             repeated_write_at(eventfs_root.join("write-file")),
             repeated_write_at(host_root.join("write-file")),
-        );
-
-        let (eventfs_root, host_root) = fixture.roots();
-        prepare_file_pair(
-            &eventfs_root,
-            &host_root,
-            "truncate-file",
-            &vec![b'a'; BENCHMARK_BLOCK_SIZE * 2],
-        )
-        .expect("truncate files are prepared");
-        benchmark_pair(
-            group,
-            "truncate",
-            repeated_truncate(eventfs_root.join("truncate-file")),
-            repeated_truncate(host_root.join("truncate-file")),
         );
 
         let (eventfs_root, host_root) = fixture.roots();
@@ -754,26 +727,6 @@ mod linux {
         }
     }
 
-    fn repeated_truncate(path: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .expect("truncate file opens");
-        move |iterations| {
-            let mut elapsed = Duration::ZERO;
-            for index in 0..iterations {
-                let length = if index.is_multiple_of(2) {
-                    BENCHMARK_BLOCK_SIZE as u64
-                } else {
-                    (BENCHMARK_BLOCK_SIZE * 2) as u64
-                };
-                elapsed += timed(|| file.set_len(length))?;
-            }
-            Ok(elapsed)
-        }
-    }
-
     fn repeated_flush(path: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
         let file = OpenOptions::new()
             .read(true)
@@ -1076,7 +1029,8 @@ mod linux {
             .write(true)
             .open(path)?;
         file.write_at(b"data", BENCHMARK_BLOCK_SIZE as u64)?;
-        file.set_len((BENCHMARK_BLOCK_SIZE * 2) as u64)
+        let written = file.write_at(&[0], (BENCHMARK_BLOCK_SIZE * 2 - 1) as u64)?;
+        expect_byte_count(written, 1, "sparse extension")
     }
 
     fn metadata_path(path: &Path) -> io::Result<()> {

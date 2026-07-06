@@ -9,7 +9,7 @@ use eventfs::EventKind;
 
 use support::{
     TestDirectories, create_empty_file, event_count, expect_event_kinds, expect_no_events,
-    fsync_directory, mount, open_test_filesystem,
+    fsync_directory, mount, open_test_filesystem, write_mounted_file,
 };
 
 #[test]
@@ -65,7 +65,7 @@ fn mounted_readdir_and_readdirplus_return_large_entry_sets_without_events() {
     for index in 0..128 {
         let name = format!("entry-{index:03}");
         let bytes = format!("value-{index}");
-        fs::write(directory_path.join(&name), &bytes).expect("directory entry is created");
+        write_mounted_file(directory_path.join(&name), &bytes).expect("directory entry is created");
         expected_names.insert(name.clone());
         expected_lengths.insert(name, bytes.len() as u64);
     }
@@ -113,7 +113,7 @@ fn mounted_directory_rename_updates_parent_link_counts_and_appends_one_event() {
     fs::create_dir(&old_parent).expect("old parent is created");
     fs::create_dir(&new_parent).expect("new parent is created");
     fs::create_dir(&moved).expect("moved directory is created");
-    fs::write(moved.join("child"), b"contents").expect("moved child is written");
+    write_mounted_file(moved.join("child"), b"contents").expect("moved child is written");
 
     let moved_inode = fs::metadata(&moved)
         .expect("moved directory metadata is readable")
@@ -166,7 +166,7 @@ fn mounted_directory_rename_updates_parent_link_counts_and_appends_one_event() {
     fs::create_dir(&replacement_source_parent).expect("replacement source parent is created");
     fs::create_dir(&replacement_target_parent).expect("replacement target parent is created");
     fs::create_dir(&replacement_source).expect("replacement source directory is created");
-    fs::write(replacement_source.join("child"), b"replacement")
+    write_mounted_file(replacement_source.join("child"), b"replacement")
         .expect("replacement source child is written");
     fs::create_dir(&replacement_target).expect("replacement target directory is created");
 
@@ -230,10 +230,10 @@ fn mounted_filesystem_accepts_realistic_name_edges_and_rejects_invalid_names_wit
     let too_long_utf8_name = "é".repeat(128);
     let mut events = event_count(&filesystem);
 
-    fs::write(root.join(".hidden"), b"ok").expect("leading dot name is accepted");
-    fs::write(root.join("name with spaces"), b"ok").expect("space name is accepted");
-    fs::write(root.join(&maximum_name), b"ok").expect("maximum length name is accepted");
-    fs::write(root.join(&maximum_utf8_name), b"ok")
+    write_mounted_file(root.join(".hidden"), b"ok").expect("leading dot name is accepted");
+    write_mounted_file(root.join("name with spaces"), b"ok").expect("space name is accepted");
+    write_mounted_file(root.join(&maximum_name), b"ok").expect("maximum length name is accepted");
+    write_mounted_file(root.join(&maximum_utf8_name), b"ok")
         .expect("maximum utf-8 byte length below 255 is accepted");
     expect_event_kinds(
         &mut events,
@@ -252,7 +252,7 @@ fn mounted_filesystem_accepts_realistic_name_edges_and_rejects_invalid_names_wit
     );
 
     assert!(
-        fs::write(root.join(&too_long_name), b"rejected").is_err(),
+        write_mounted_file(root.join(&too_long_name), b"rejected").is_err(),
         "overlong name is rejected"
     );
     expect_no_events(
@@ -262,7 +262,7 @@ fn mounted_filesystem_accepts_realistic_name_edges_and_rejects_invalid_names_wit
     );
 
     assert!(
-        fs::write(root.join(&too_long_utf8_name), b"rejected").is_err(),
+        write_mounted_file(root.join(&too_long_utf8_name), b"rejected").is_err(),
         "overlong utf-8 byte length is rejected"
     );
     expect_no_events(
@@ -273,7 +273,7 @@ fn mounted_filesystem_accepts_realistic_name_edges_and_rejects_invalid_names_wit
 
     let invalid_utf8 = root.join(std::ffi::OsString::from_vec(vec![0xff]));
     assert!(
-        fs::write(invalid_utf8, b"rejected").is_err(),
+        write_mounted_file(invalid_utf8, b"rejected").is_err(),
         "non-utf8 name is rejected"
     );
     expect_no_events(

@@ -7,7 +7,7 @@ use eventfs::EventKind;
 
 use support::{
     TestDirectories, access_path, create_empty_file, event_count, expect_event_kinds,
-    expect_no_events, mkfifo, mount, open_test_filesystem,
+    expect_no_events, mkfifo, mount, open_test_filesystem, write_mounted_file,
 };
 
 #[test]
@@ -40,7 +40,7 @@ fn mounted_nodes_links_renames_and_readlink_have_expected_event_kinds() {
         "unlinking a special node appends one node-unlinked event",
     );
 
-    fs::write(&file_path, b"contents").expect("file is written");
+    write_mounted_file(&file_path, b"contents").expect("file is written");
     expect_event_kinds(
         &mut events,
         &filesystem,
@@ -52,12 +52,11 @@ fn mounted_nodes_links_renames_and_readlink_have_expected_event_kinds() {
         .ino();
 
     fs::set_permissions(&file_path, fs::Permissions::from_mode(0o600))
-        .expect("file metadata is changed");
-    expect_event_kinds(
+        .expect_err("chmod is unsupported");
+    expect_no_events(
         &mut events,
         &filesystem,
-        &[EventKind::MetadataChanged],
-        "chmod appends one metadata event",
+        "unsupported chmod does not append events",
     );
 
     fs::hard_link(&file_path, &hard_link_path).expect("hard link is created");
@@ -97,7 +96,7 @@ fn mounted_nodes_links_renames_and_readlink_have_expected_event_kinds() {
     let renamed_metadata = fs::metadata(&renamed_path).expect("renamed metadata is readable");
     assert_eq!(renamed_metadata.ino(), inode_before_rename);
     assert_eq!(renamed_metadata.nlink(), 2);
-    assert_eq!(renamed_metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(renamed_metadata.permissions().mode() & 0o777, 0o777);
 
     fs::remove_file(&renamed_path).expect("renamed file is unlinked");
     fs::remove_file(&hard_link_path).expect("hard link is unlinked");
@@ -183,65 +182,6 @@ fn mounted_namespace_edge_case_failures_do_not_append_events() {
     );
 }
 
-#[test]
-fn mounted_permission_failures_do_not_append_events_when_not_running_as_root() {
-    if running_as_root() {
-        eprintln!(
-            "skipping permission-denial assertions because uid 0 bypasses the mounted access checks"
-        );
-        return;
-    }
-
-    let directories = TestDirectories::new();
-    let filesystem = open_test_filesystem(&directories);
-    let _mounted = mount(&filesystem);
-    let root = directories.mount_point_path();
-    let file_path = root.join("locked-file");
-    let locked_directory = root.join("locked-directory");
-
-    fs::write(&file_path, b"contents").expect("locked file is written");
-    fs::set_permissions(&file_path, fs::Permissions::from_mode(0o000))
-        .expect("locked file permissions are restricted");
-    fs::create_dir(&locked_directory).expect("locked directory is created");
-    fs::set_permissions(&locked_directory, fs::Permissions::from_mode(0o555))
-        .expect("locked directory permissions are restricted");
-    let mut events = event_count(&filesystem);
-
-    assert!(
-        OpenOptions::new().write(true).open(&file_path).is_err(),
-        "write open on a mode-restricted file is rejected"
-    );
-    expect_no_events(
-        &mut events,
-        &filesystem,
-        "file-mode write denial does not append events",
-    );
-    assert!(
-        fs::read(&file_path).is_err(),
-        "read on a mode-restricted file is rejected"
-    );
-    expect_no_events(
-        &mut events,
-        &filesystem,
-        "file-mode read denial does not append events",
-    );
-    assert_eq!(access_path(&file_path, libc::R_OK), -1);
-    expect_no_events(
-        &mut events,
-        &filesystem,
-        "file-mode access denial does not append events",
-    );
-    assert!(
-        fs::write(locked_directory.join("child"), b"denied").is_err(),
-        "create under a non-writable parent directory is rejected"
-    );
-    expect_no_events(
-        &mut events,
-        &filesystem,
-        "parent-directory write denial does not append events",
-    );
-}
-
 #[cfg(target_os = "linux")]
 #[test]
 fn mounted_linux_rename_noreplace_succeeds_or_fails_without_extra_events() {
@@ -254,7 +194,7 @@ fn mounted_linux_rename_noreplace_succeeds_or_fails_without_extra_events() {
     let collision_source = root.join("collision-source");
     let collision_target = root.join("collision-target");
 
-    fs::write(&source_path, b"source").expect("source file is written");
+    write_mounted_file(&source_path, b"source").expect("source file is written");
     let mut events = event_count(&filesystem);
 
     rename_noreplace(&source_path, &renamed_path).expect("rename_noreplace succeeds");
@@ -269,8 +209,10 @@ fn mounted_linux_rename_noreplace_succeeds_or_fails_without_extra_events() {
         b"source"
     );
 
-    fs::write(&collision_source, b"collision source").expect("collision source is written");
-    fs::write(&collision_target, b"collision target").expect("collision target is written");
+    write_mounted_file(&collision_source, b"collision source")
+        .expect("collision source is written");
+    write_mounted_file(&collision_target, b"collision target")
+        .expect("collision target is written");
     events = event_count(&filesystem);
 
     let error = rename_noreplace(&collision_source, &collision_target)
@@ -290,10 +232,6 @@ fn mounted_linux_rename_noreplace_succeeds_or_fails_without_extra_events() {
         fs::read(&collision_target).expect("target remains readable after collision"),
         b"collision target"
     );
-}
-
-fn running_as_root() -> bool {
-    (unsafe { libc::geteuid() }) == 0
 }
 
 #[cfg(target_os = "linux")]

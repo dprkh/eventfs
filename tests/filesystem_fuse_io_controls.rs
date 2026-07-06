@@ -13,7 +13,7 @@ use eventfs::EventKind;
 use support::{
     TestDirectories, assert_callback_errors_include, create_empty_file, event_count, events_after,
     expect_event_kinds, expect_no_events, filesystem_with_fuse_error_callback, mount,
-    open_test_filesystem, recorded_callback_errors,
+    open_test_filesystem, recorded_callback_errors, write_mounted_file,
 };
 
 #[test]
@@ -23,7 +23,7 @@ fn mounted_posix_locks_succeed_and_do_not_append_events() {
     let _mounted = mount(&filesystem);
     let file_path = directories.mount_point_path().join("lock-file");
 
-    fs::write(&file_path, b"locks").expect("lock file is written");
+    write_mounted_file(&file_path, b"locks").expect("lock file is written");
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -55,7 +55,7 @@ fn mounted_ioctl_rejection_reports_enotty_and_poll_reports_ready_without_events(
     let _mounted = mount(&filesystem);
     let file_path = directories.mount_point_path().join("ioctl-file");
 
-    fs::write(&file_path, b"ioctl").expect("ioctl file is written");
+    write_mounted_file(&file_path, b"ioctl").expect("ioctl file is written");
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -91,7 +91,7 @@ fn mounted_bmap_returns_the_requested_logical_block_without_events_when_driveabl
     let _mounted = mount(&filesystem);
     let file_path = directories.mount_point_path().join("bmap-file");
 
-    fs::write(&file_path, b"bmap").expect("bmap file is written");
+    write_mounted_file(&file_path, b"bmap").expect("bmap file is written");
     let file = OpenOptions::new()
         .read(true)
         .open(&file_path)
@@ -135,12 +135,12 @@ fn mounted_linux_fallocate_modes_append_events_only_for_logical_changes() {
     expect_event_kinds(
         &mut events,
         &filesystem,
-        &[EventKind::FileTruncated],
-        "size-growing fallocate appends one truncate event",
+        &[EventKind::FileRangeZeroed],
+        "size-growing fallocate appends one file-range-zeroed event",
     );
 
     let keep_size_path = root.join("keep-size");
-    fs::write(&keep_size_path, b"keep").expect("keep-size file is written");
+    write_mounted_file(&keep_size_path, b"keep").expect("keep-size file is written");
     let keep_size_file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -167,7 +167,7 @@ fn mounted_linux_fallocate_modes_append_events_only_for_logical_changes() {
     );
 
     let punch_path = root.join("punch");
-    fs::write(&punch_path, b"abcdefghi").expect("punch file is written");
+    write_mounted_file(&punch_path, b"abcdefghi").expect("punch file is written");
     let punch_file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -193,7 +193,7 @@ fn mounted_linux_fallocate_modes_append_events_only_for_logical_changes() {
     );
 
     let zero_path = root.join("zero");
-    fs::write(&zero_path, b"abcdefghi").expect("zero-range file is written");
+    write_mounted_file(&zero_path, b"abcdefghi").expect("zero-range file is written");
     let zero_file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -247,7 +247,10 @@ fn mounted_sparse_seek_finds_data_and_holes_without_events() {
         .expect("sparse file is created");
     file.seek(SeekFrom::Start(4096)).expect("sparse file seeks");
     file.write_all(b"data").expect("sparse data is written");
-    file.set_len(8192).expect("sparse file length is set");
+    file.seek(SeekFrom::Start(8191))
+        .expect("sparse file seeks to final byte");
+    file.write_all(&[0])
+        .expect("sparse file length is extended");
     let mut events = event_count(&filesystem);
 
     let data_from_start = match seek(file.as_raw_fd(), 0, libc::SEEK_DATA) {
@@ -283,8 +286,8 @@ fn mounted_copy_file_range_writes_destination_once_and_rejects_flags_without_eve
     let source_path = root.join("source");
     let destination_path = root.join("destination");
 
-    fs::write(&source_path, b"copy source").expect("copy source file is written");
-    fs::write(&destination_path, b"destination").expect("destination file is written");
+    write_mounted_file(&source_path, b"copy source").expect("copy source file is written");
+    write_mounted_file(&destination_path, b"destination").expect("destination file is written");
     let source = OpenOptions::new()
         .read(true)
         .open(&source_path)
@@ -342,8 +345,8 @@ fn mounted_macos_preallocate_and_punch_hole_have_expected_events_when_supported(
         expect_event_kinds(
             &mut events,
             &filesystem,
-            &[EventKind::FileTruncated],
-            "preallocate size extension appends one truncate event",
+            &[EventKind::FileRangeZeroed],
+            "preallocate size extension appends one file-range-zeroed event",
         );
     } else {
         expect_no_events(
@@ -353,7 +356,7 @@ fn mounted_macos_preallocate_and_punch_hole_have_expected_events_when_supported(
         );
     }
 
-    fs::write(&punch_path, b"contents").expect("punch file is written");
+    write_mounted_file(&punch_path, b"contents").expect("punch file is written");
     events = event_count(&filesystem);
     if let Err(error) = punch_hole(&punch_path) {
         eprintln!("skipping punch-hole assertion because this macFUSE mount returned {error}");
@@ -416,8 +419,8 @@ fn mounted_macos_volume_name_exchange_and_extended_times_are_event_aware_when_su
         Err(error) => panic!("setvolname failed: {error}"),
     }
 
-    fs::write(&left_path, b"left").expect("left file is written");
-    fs::write(&right_path, b"right").expect("right file is written");
+    write_mounted_file(&left_path, b"left").expect("left file is written");
+    write_mounted_file(&right_path, b"right").expect("right file is written");
     events = event_count(&filesystem);
     if let Err(error) = exchange_data(&left_path, &right_path) {
         if macos_optional_operation_may_be_unrouted(error.raw_os_error()) {
@@ -448,23 +451,22 @@ fn mounted_macos_volume_name_exchange_and_extended_times_are_event_aware_when_su
         b"left"
     );
 
-    fs::write(&times_path, b"times").expect("times file is written");
+    write_mounted_file(&times_path, b"times").expect("times file is written");
     let crtime = UNIX_EPOCH + Duration::from_secs(1_800_000_001);
     let bkuptime = UNIX_EPOCH + Duration::from_secs(1_800_000_101);
     events = event_count(&filesystem);
     set_file_crtime_and_bkuptime(&times_path, crtime, bkuptime)
-        .expect("creation and backup times are set");
-    expect_event_kinds(
+        .expect_err("creation and backup time updates are unsupported");
+    expect_no_events(
         &mut events,
         &filesystem,
-        &[EventKind::MetadataChanged],
-        "setting extended times appends one metadata event",
+        "unsupported extended time update does not append events",
     );
 
     let (actual_crtime, actual_bkuptime) =
         get_file_xtimes(&times_path).expect("extended times are read");
-    assert_eq!(actual_crtime, crtime);
-    assert_eq!(actual_bkuptime, bkuptime);
+    assert_ne!(actual_crtime, crtime);
+    assert_ne!(actual_bkuptime, bkuptime);
     expect_no_events(&mut events, &filesystem, "getxtimes does not append events");
 }
 

@@ -9,6 +9,7 @@ use eventfs::{Filesystem, FilesystemError};
 use support::{
     TestDirectories, assert_callback_errors_include, event_count,
     filesystem_with_fuse_error_callback, open_test_filesystem, recorded_callback_errors, statvfs,
+    write_mounted_file,
 };
 
 #[test]
@@ -46,7 +47,7 @@ fn mounted_filesystem_statistics_report_backing_blocks_and_logical_inode_capacit
     assert_eq!(before.f_ffree as u64 + 1, before.f_files as u64);
     assert_eq!(event_count(&filesystem), events_before_statistics);
 
-    fs::write(&file_path, b"contents").expect("file is written");
+    write_mounted_file(&file_path, b"contents").expect("file is written");
     let after_create = statvfs(root);
     assert_backing_statfs_matches(
         &after_create,
@@ -80,7 +81,7 @@ fn inode_numbers_are_stable_across_process_restarts() {
         .expect("filesystem mounts in the background");
     let file_path = directories.mount_point_path().join("stable-inode");
 
-    fs::write(&file_path, b"contents").expect("file is written");
+    write_mounted_file(&file_path, b"contents").expect("file is written");
     let inode_before = std::os::unix::fs::MetadataExt::ino(
         &fs::metadata(&file_path).expect("file metadata is readable"),
     );

@@ -6,7 +6,9 @@ use std::os::unix::fs::symlink;
 use eventfs::{BranchName, EventKind, EventSequence};
 use time::UtcDateTime;
 
-use support::{TestDirectories, event_page_limit, mkfifo, open_test_filesystem};
+use support::{
+    TestDirectories, event_page_limit, mkfifo, open_test_filesystem, write_mounted_file,
+};
 
 #[test]
 fn event_listing_returns_initial_event_with_branch_metadata_and_utc_creation_time() {
@@ -60,11 +62,11 @@ fn event_listing_paginates_across_multiple_pages_without_overlap() {
         .spawn_mount()
         .expect("filesystem mounts in the background");
 
-    fs::write(directories.mount_point_path().join("first"), b"first")
+    write_mounted_file(directories.mount_point_path().join("first"), b"first")
         .expect("first file is written through mounted filesystem");
-    fs::write(directories.mount_point_path().join("second"), b"second")
+    write_mounted_file(directories.mount_point_path().join("second"), b"second")
         .expect("second file is written through mounted filesystem");
-    fs::write(directories.mount_point_path().join("third"), b"third")
+    write_mounted_file(directories.mount_point_path().join("third"), b"third")
         .expect("third file is written through mounted filesystem");
 
     let first_page = filesystem
@@ -154,7 +156,7 @@ fn global_event_listing_and_get_event_preserve_branch_metadata_across_divergence
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"main base").expect("file is written on main");
+    write_mounted_file(&file_path, b"main base").expect("file is written on main");
     mounted.unmount().expect("filesystem unmounts");
 
     let main = filesystem
@@ -171,8 +173,8 @@ fn global_event_listing_and_get_event_preserve_branch_metadata_across_divergence
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"feature one").expect("first feature write succeeds");
-    fs::write(&file_path, b"feature two").expect("second feature write succeeds");
+    write_mounted_file(&file_path, b"feature one").expect("first feature write succeeds");
+    write_mounted_file(&file_path, b"feature two").expect("second feature write succeeds");
     mounted.unmount().expect("filesystem unmounts");
 
     filesystem
@@ -181,7 +183,7 @@ fn global_event_listing_and_get_event_preserve_branch_metadata_across_divergence
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"main later").expect("later main write succeeds");
+    write_mounted_file(&file_path, b"main later").expect("later main write succeeds");
     mounted.unmount().expect("filesystem unmounts");
 
     let events = filesystem
@@ -271,13 +273,7 @@ fn get_event_matches_listed_records_and_debug_redacts_payload_bytes() {
     let file_path = directories.mount_point_path().join("payload-log");
     let written_secret = b"written-secret-12345removed-secret-67890";
 
-    fs::write(&file_path, written_secret).expect("payload file is written");
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&file_path)
-        .expect("payload file opens")
-        .set_len(20)
-        .expect("payload file truncates");
+    write_mounted_file(&file_path, written_secret).expect("payload file is written");
 
     let events = filesystem
         .list_events(None, event_page_limit(100))
@@ -319,7 +315,7 @@ fn global_event_listing_and_get_event_cover_non_file_event_kinds() {
     fs::create_dir(&directory_path).expect("directory is created through mounted filesystem");
     fs::remove_dir(&directory_path).expect("directory is removed through mounted filesystem");
     mkfifo(&fifo_path);
-    fs::write(&target_path, b"target").expect("symlink target file is written");
+    write_mounted_file(&target_path, b"target").expect("symlink target file is written");
     symlink(&target_path, &symlink_path)
         .expect("symbolic link is created through mounted filesystem");
 
@@ -352,7 +348,6 @@ fn global_event_listing_and_get_event_cover_non_file_event_kinds() {
         assert_eq!(listed.new_file_size(), None);
         assert_eq!(listed.overwritten_byte_length(), None);
         assert_eq!(listed.written_byte_length(), None);
-        assert_eq!(listed.removed_byte_length(), None);
         assert!(listed.branch_identifier().is_some());
         assert!(listed.first_parent_sequence().is_some());
         assert!(listed.branch_position().is_some_and(|position| {
@@ -372,7 +367,7 @@ fn event_listing_is_page_size_invariant_and_get_event_round_trips_each_record() 
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"main base").expect("file is written on main");
+    write_mounted_file(&file_path, b"main base").expect("file is written on main");
     mounted.unmount().expect("filesystem unmounts");
 
     let main = filesystem
@@ -389,8 +384,8 @@ fn event_listing_is_page_size_invariant_and_get_event_round_trips_each_record() 
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"feature one").expect("first feature write succeeds");
-    fs::write(&file_path, b"feature two").expect("second feature write succeeds");
+    write_mounted_file(&file_path, b"feature one").expect("first feature write succeeds");
+    write_mounted_file(&file_path, b"feature two").expect("second feature write succeeds");
     mounted.unmount().expect("filesystem unmounts");
 
     filesystem
@@ -399,7 +394,7 @@ fn event_listing_is_page_size_invariant_and_get_event_round_trips_each_record() 
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"main later").expect("later main write succeeds");
+    write_mounted_file(&file_path, b"main later").expect("later main write succeeds");
     mounted.unmount().expect("filesystem unmounts");
 
     let expected_page = filesystem

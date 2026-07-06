@@ -22,7 +22,6 @@ pub struct Filesystem;
 pub struct FilesystemConfiguration;
 pub struct MountedFilesystem;
 pub struct FuseOperationError;
-pub enum SessionAccessControlList;
 pub enum MountOption;
 
 pub struct BackupDirectory;
@@ -64,11 +63,6 @@ impl FilesystemConfiguration {
         mount_point: impl Into<std::path::PathBuf>,
     ) -> Result<Self, ConfigurationError>;
 
-    pub fn with_session_access_control_list(
-        self,
-        session_access_control_list: SessionAccessControlList,
-    ) -> Self;
-
     pub fn with_mount_options(
         self,
         mount_options: impl IntoIterator<Item = MountOption>,
@@ -87,26 +81,13 @@ impl FuseOperationError {
     pub fn is_unsupported(&self) -> bool;
 }
 
-pub enum SessionAccessControlList {
-    All,
-    RootAndOwner,
-    Owner,
-}
-
 pub enum MountOption {
     FilesystemName(String),
     Subtype(String),
     Custom(String),
     AutoUnmount,
-    DefaultPermissions,
-    Dev,
-    NoDev,
-    Suid,
-    NoSuid,
     ReadOnly,
     ReadWrite,
-    Exec,
-    NoExec,
     Atime,
     NoAtime,
     DirSync,
@@ -167,7 +148,6 @@ impl EventRecord {
     pub fn new_file_size(&self) -> Option<u64>;
     pub fn overwritten_byte_length(&self) -> Option<u64>;
     pub fn written_byte_length(&self) -> Option<u64>;
-    pub fn removed_byte_length(&self) -> Option<u64>;
 }
 
 impl FileIdentifier {
@@ -357,13 +337,11 @@ impl Filesystem {
 - Public iterator APIs MUST provide the common sequential read path for paginated records.
 - README and examples MUST demonstrate the default common-path API unless the example's capability requires optional configuration.
 - `FilesystemConfiguration::new` and path-valued public constructors MUST reject empty paths.
-- `FilesystemConfiguration::new` MUST default to `SessionAccessControlList::Owner` and no caller-supplied mount options.
-- `FilesystemConfiguration::with_session_access_control_list` MUST configure the session access control list shared by filesystem clones and mounted sessions opened from the configuration.
+- `FilesystemConfiguration::new` MUST default to no caller-supplied mount options.
 - `FilesystemConfiguration::with_mount_options` MUST replace the caller-supplied mount options shared by filesystem clones and mounted sessions opened from the configuration.
 - `FilesystemConfiguration::with_fuse_error_callback` MUST configure one optional callback shared by filesystem clones and mounted sessions opened from the configuration.
 - `FuseOperationError` MUST expose the failed FUSE operation name, the positive platform errno returned to FUSE, the mapped `FilesystemError`, and whether the operation was unsupported.
-- `SessionAccessControlList` MUST expose unrestricted access, root-and-owner access, and owner-only access.
-- `MountOption` MUST expose FUSE filesystem name, subtype, custom string option, automatic unmount, default permissions, device-node enablement, set-user-ID and set-group-ID handling, read-only/read-write mode, executable-file handling, access-time handling, directory synchronization, and synchronous/asynchronous I/O mount options without exposing fuser-owned public types.
+- `MountOption` MUST expose FUSE filesystem name, subtype, custom string option, automatic unmount, read-only/read-write mode, access-time handling, directory synchronization, and synchronous/asynchronous I/O mount options without exposing fuser-owned public types.
 - `BackupIdentifier` MUST reject zero.
 - `EventPageLimit` MUST reject zero.
 - `BranchPageLimit` MUST reject zero.
@@ -371,7 +349,7 @@ impl Filesystem {
 - `EventRecord` MUST expose event sequence, event kind, UTC creation time, optional affected file identifier, and optional event path.
 - `EventRecord` MUST expose an optional secondary affected file identifier and secondary path for single-event operations that mutate two regular files.
 - `EventRecord` MUST expose branch identifier, branch position, and first-parent event sequence when the event belongs to a branch.
-- `EventRecord` MUST expose file write and truncate payload byte lengths, not payload bytes.
+- `EventRecord` MUST expose file write payload byte lengths, not payload bytes.
 - `FileSnapshot` MUST expose the file identifier, source event sequence, branch position, and file size.
 - Public API MUST NOT expose fuser-owned or RocksDB-owned public types.
 - Branch APIs MUST use `BranchPosition`, not `EventSequence`, for branch-local cursors.
@@ -384,9 +362,10 @@ impl Filesystem {
 - `Filesystem` MUST implement `fuser::Filesystem`.
 - `Filesystem` MUST implement `Clone`, `Send`, and `Sync`.
 - `Filesystem::mount` and `Filesystem::spawn_mount` MUST mount the filesystem at `FilesystemConfiguration.mount_point`.
-- `Filesystem::mount` and `Filesystem::spawn_mount` MUST apply `FilesystemConfiguration` session access control list and caller-supplied mount options.
+- `Filesystem::mount` and `Filesystem::spawn_mount` MUST apply caller-supplied mount options.
+- Mounted sessions MUST use unrestricted FUSE session access control.
 - eventfs MUST supply `MountOption::FilesystemName` from the persisted volume name when the caller did not supply `MountOption::FilesystemName`.
-- The mounted filesystem MUST support lookup, attribute read, attribute update, node creation, directory creation, file creation, file open, file read, file write, file truncate, flush, file synchronization, directory open, directory read, directory read with attributes, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, filesystem statistics, extended attributes, POSIX byte-range locks, block mapping, ioctl rejection, poll readiness, space allocation, sparse seek, file-range copy, macOS volume rename, macOS file-content exchange, and macOS extended times.
+- The mounted filesystem MUST support lookup, attribute read, node creation, directory creation, file creation, file open, file read, file write, flush, file synchronization, directory open, directory read, directory read with attributes, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, filesystem statistics, extended attributes, POSIX byte-range locks, block mapping, ioctl rejection, poll readiness, space allocation, sparse seek, file-range copy, macOS volume rename, macOS file-content exchange, and macOS extended times.
 - When the `tracing` Cargo feature is enabled, every eventfs-handled FUSE operation MUST emit one `tracing::trace!` event containing the operation name.
 - FUSE operation trace logging MUST NOT append events, change FUSE replies, change errno mapping, or affect the configured FUSE error callback.
 - Unsupported FUSE operations MUST return the platform-appropriate unsupported-operation error and MUST NOT append events.
@@ -394,6 +373,7 @@ impl Filesystem {
 - Unsupported FUSE operations MUST invoke the configured FUSE error callback once with `FuseOperationError::is_unsupported` returning `true`.
 - Successful FUSE operations MUST NOT invoke the configured FUSE error callback.
 - FUSE error callback failures MUST NOT change the FUSE error returned to the caller.
+- `setattr` MUST be unsupported, MUST NOT append events, and MUST invoke the configured FUSE error callback once with `FuseOperationError::is_unsupported` returning `true`.
 - Inode numbers MUST be stable across process restarts.
 - File handles MAY be process-local and MUST NOT be required to reconstruct persistent filesystem state.
 - Filesystem statistics MUST NOT append events or mutate storage.
@@ -415,7 +395,8 @@ impl Filesystem {
 - File writes opened with synchronized I/O flags and mounted operations covered by `MountOption::Sync` or `MountOption::DirSync` MUST synchronize affected committed mutations before returning success.
 - `bmap` MUST return the requested logical block index after inode validation and MUST NOT append events.
 - `ioctl` MUST expose no eventfs-specific commands, MUST return `ENOTTY` for every command after inode validation, and MUST NOT append events.
-- `poll` MUST report regular files and directories as immediately readable and writable according to requested events and access checks, and MUST NOT append events.
+- `access` MUST validate that the inode exists and otherwise allow all requested access masks without checking ownership or permission bits.
+- `poll` MUST report regular files and directories as immediately readable and writable according to requested events after inode validation, and MUST NOT append events.
 - `fallocate` MUST support preallocation by size extension, keep-size no-op allocation, punch-hole, and zero-range.
 - `fallocate` collapse-range, insert-range, unshare-range, and unknown mode bits MUST return `EINVAL`.
 - `fallocate` requests with no logical file state change MUST NOT append events.
@@ -438,10 +419,8 @@ impl Filesystem {
 - Branch events MUST store branch identifier, branch position, and first-parent event sequence.
 - File write events MUST store old file size, new file size, overwritten byte length, and written byte length in the event record.
 - File write events MUST store overwritten bytes and written bytes as event payload manifests outside event metadata.
-- File truncate events MUST store old file size, new file size, and removed byte length in the event record.
-- File truncate events MUST store removed bytes for shrink operations as event payload manifests outside event metadata.
 - Zero-filled file extension MUST be represented by old and new file sizes, not repeated zero bytes.
-- `EventKind` MUST include filesystem initialization, node creation, directory creation, file creation, file write, file truncate, metadata change, node unlink, directory removal, node rename, hard link creation, symbolic link creation, extended attribute set, extended attribute removal, file range zeroing, file contents exchange, and volume rename.
+- `EventKind` MUST include filesystem initialization, node creation, directory creation, file creation, file write, node unlink, directory removal, node rename, hard link creation, symbolic link creation, extended attribute set, extended attribute removal, file range zeroing, file contents exchange, and volume rename.
 - Extended attribute set and removal, file range zeroing, file contents exchange, volume rename, file-range copy destination writes, and size-growing allocation MUST append events when they change logical filesystem state.
 - Read-only operations, locks, poll, bmap, ioctl failures, and allocation requests with no logical state change MUST NOT append events.
 - `get_event` MUST return the event at the requested sequence when it exists.
@@ -514,10 +493,11 @@ Storage requirements:
 - eventfs MUST NOT materialize owned byte buffers for durable byte content unless mutation, FUSE output, serialization, or caller-owned copies require it.
 - `filesystem_metadata` MUST store storage schema version, next inode number, last committed event sequence, next branch identifier, active branch identifier, and volume name.
 - Stored inodes MUST include backup time and creation time.
+- Stored inodes MUST NOT store ownership, permission mode, or file flags.
 - `Filesystem::open` MUST create a missing database and required column families for a new database directory.
-- Storage schema version `8` MUST be the first supported storage schema compatibility baseline.
+- Storage schema version `9` MUST be the first supported storage schema compatibility baseline.
 - `Filesystem::open` MUST reject existing databases missing metadata required by their stored schema version.
-- `Filesystem::open` MUST reject storage schema versions older than `8`.
+- `Filesystem::open` MUST reject storage schema versions older than `9`.
 - `Filesystem::open` MUST reject storage schema versions newer than the compiled current storage schema version before mutating storage.
 - `Filesystem::open` MUST automatically migrate compatible released storage schema versions to the compiled current storage schema version before returning.
 - Storage schema migrations MUST run in storage schema version order.
@@ -581,7 +561,7 @@ Storage requirements:
 - `fuse_operations` MUST compile only on Linux and MUST fail to compile on non-Linux targets with an explicit Linux-only error.
 - `fuse_operations` MUST mount eventfs through the public `FilesystemConfiguration`, `Filesystem::open`, and `Filesystem::spawn_mount` APIs.
 - `fuse_operations` MUST benchmark every supported Linux mounted FUSE operation with an equivalent operation on a sibling directory in the current host's normal filesystem.
-- `fuse_operations` MUST benchmark lookup, attribute read, attribute update, node creation, directory creation, file creation, file open, file read, file write, file truncate, flush, file synchronization, directory open, directory read, directory read with attributes, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, filesystem statistics, extended attributes, POSIX byte-range locks, block mapping, ioctl rejection, poll readiness, space allocation, sparse seek, and file-range copy.
+- `fuse_operations` MUST benchmark lookup, attribute read, node creation, directory creation, file creation, file open, file read, file write, flush, file synchronization, directory open, directory read, directory read with attributes, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, filesystem statistics, extended attributes, POSIX byte-range locks, block mapping, ioctl rejection, poll readiness, space allocation, sparse seek, and file-range copy.
 - `fuse_operations` MUST NOT benchmark fuser lifecycle or cache callbacks that have no normal-filesystem operation baseline.
 - `fuse_operations` MUST exclude macOS-only mounted operations.
 - `fuse_operations` MUST exclude per-iteration setup and cleanup from timed measurements for mutating operations.
@@ -607,24 +587,24 @@ Implementations MUST include automated tests for:
 - Local backup creates increasing non-zero BackupEngine backup identifiers in a persistent backup directory.
 - Local import verifies a requested BackupEngine backup, replaces existing target data, and opens and migrates the imported database before success.
 - Local backup and import reject overlapping source, backup, and target directories after path normalization.
-- Opening storage schema version `8` succeeds and preserves public filesystem behavior.
+- Opening storage schema version `9` succeeds and preserves public filesystem behavior.
 - Opening every compatible released storage schema version migrates it to the current storage schema version.
-- Opening storage schema versions older than `8` fails without mutation.
+- Opening storage schema versions older than `9` fails without mutation.
 - Opening storage schema versions newer than the compiled current storage schema version fails without mutation.
 - Interrupted storage schema migrations either resume migration on reopen or leave a valid compatible released schema.
 - Opening a compatible released database with missing column families introduced after its stored schema version creates those column families during migration.
 - Opening a compatible released database with missing column families required by its stored schema version fails as corrupt storage.
-- Event records expose file write and truncate payload sizes without payload bytes.
-- File event payload range reads expose file write and truncate payload bytes.
+- Event records expose file write payload sizes without payload bytes.
+- File event payload range reads expose file write payload bytes.
 - `get_event` returns the requested event or no event.
 - Per-file event listing returns only events for the requested active branch file in branch-position order.
 - Branch event listing returns only events for the requested branch in branch-position order.
 - File snapshots return the nearest snapshot at or before a requested sequence.
-- File snapshots and file event payloads can reconstruct file bytes before and after a write or truncate event.
+- File snapshots and file event payloads can reconstruct file bytes before and after a write event.
 - Snapshot and event payload content is read through range APIs backed by content chunk reads.
 - Content chunks are deduplicated by content identifier.
 - Branch creation copies namespace root identifiers and does not duplicate content chunks, content manifest nodes, namespace nodes, or file snapshot manifest records.
-- Cross-chunk reads, overwrites, truncates, and sparse zero-filled ranges return correct bytes.
+- Cross-chunk reads, overwrites, and sparse zero-filled ranges return correct bytes.
 - Branch creation from a branch position creates an independent branch.
 - Branch switching changes the mounted filesystem's future active state only when unmounted.
 - Branch deletion removes the branch ref without deleting committed events or content chunks.

@@ -2,6 +2,7 @@
 
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -118,6 +119,11 @@ pub fn create_empty_file(path: &Path) {
             .open(path)
             .expect("empty file is created"),
     );
+}
+
+pub fn write_mounted_file(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    let mut file = OpenOptions::new().create(true).write(true).open(path)?;
+    file.write_all(contents.as_ref())
 }
 
 pub fn event_page_limit(value: u64) -> EventPageLimit {

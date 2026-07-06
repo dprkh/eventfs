@@ -2,7 +2,6 @@ mod support;
 
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::fs::PermissionsExt;
 
 use eventfs::{
     BranchName, EventKind, EventRecord, EventSequence, FileEventPayloadPart, FileIdentifier,
@@ -11,11 +10,11 @@ use eventfs::{
 
 use support::{
     TestDirectories, event_page_limit, file_identifier_for_path, list_all_events,
-    open_test_filesystem,
+    open_test_filesystem, write_mounted_file,
 };
 
 #[test]
-fn event_records_expose_file_write_and_truncate_payload_sizes() {
+fn event_records_expose_file_write_payload_sizes() {
     let directories = TestDirectories::new();
     let filesystem = open_test_filesystem(&directories);
     let mounted = filesystem
@@ -23,23 +22,13 @@ fn event_records_expose_file_write_and_truncate_payload_sizes() {
         .expect("filesystem mounts in the background");
     let file_path = directories.mount_point_path().join("payload-file");
 
-    fs::write(&file_path, b"hello").expect("file is written through mounted filesystem");
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&file_path)
-        .expect("file opens")
-        .set_len(2)
-        .expect("file truncates");
+    write_mounted_file(&file_path, b"hello").expect("file is written through mounted filesystem");
 
     let events = list_all_events(&filesystem);
     let write = events
         .iter()
         .find(|event| event.kind() == EventKind::FileWritten)
         .expect("write event exists");
-    let truncate = events
-        .iter()
-        .find(|event| event.kind() == EventKind::FileTruncated)
-        .expect("truncate event exists");
 
     assert_eq!(write.old_file_size(), Some(0));
     assert_eq!(write.new_file_size(), Some(5));
@@ -47,21 +36,12 @@ fn event_records_expose_file_write_and_truncate_payload_sizes() {
     assert_eq!(write.byte_length(), Some(5));
     assert_eq!(write.overwritten_byte_length(), Some(0));
     assert_eq!(write.written_byte_length(), Some(5));
-    assert_eq!(write.removed_byte_length(), None);
-
-    assert_eq!(truncate.old_file_size(), Some(5));
-    assert_eq!(truncate.new_file_size(), Some(2));
-    assert_eq!(truncate.offset(), Some(2));
-    assert_eq!(truncate.byte_length(), Some(3));
-    assert_eq!(truncate.overwritten_byte_length(), None);
-    assert_eq!(truncate.written_byte_length(), None);
-    assert_eq!(truncate.removed_byte_length(), Some(3));
 
     mounted.unmount().expect("filesystem unmounts");
 }
 
 #[test]
-fn file_event_payload_range_reads_expose_write_and_truncate_bytes() {
+fn file_event_payload_range_reads_expose_write_bytes() {
     let directories = TestDirectories::new();
     let filesystem = open_test_filesystem(&directories);
     let mounted = filesystem
@@ -69,23 +49,13 @@ fn file_event_payload_range_reads_expose_write_and_truncate_bytes() {
         .expect("filesystem mounts in the background");
     let file_path = directories.mount_point_path().join("payload-file");
 
-    fs::write(&file_path, b"hello").expect("file is written through mounted filesystem");
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&file_path)
-        .expect("file opens")
-        .set_len(2)
-        .expect("file truncates");
+    write_mounted_file(&file_path, b"hello").expect("file is written through mounted filesystem");
 
     let events = list_all_events(&filesystem);
     let write = events
         .iter()
         .find(|event| event.kind() == EventKind::FileWritten)
         .expect("write event exists");
-    let truncate = events
-        .iter()
-        .find(|event| event.kind() == EventKind::FileTruncated)
-        .expect("truncate event exists");
 
     assert_eq!(
         filesystem
@@ -103,46 +73,6 @@ fn file_event_payload_range_reads_expose_write_and_truncate_bytes() {
             .read_file_event_payload_range(write.sequence(), FileEventPayloadPart::Written, 0, 100)
             .expect("written bytes are read"),
         b"hello"
-    );
-    assert_eq!(
-        filesystem
-            .read_file_event_payload_range(write.sequence(), FileEventPayloadPart::Removed, 0, 100)
-            .expect("missing removed bytes read as empty"),
-        b""
-    );
-
-    assert_eq!(
-        filesystem
-            .read_file_event_payload_range(
-                truncate.sequence(),
-                FileEventPayloadPart::Overwritten,
-                0,
-                100
-            )
-            .expect("missing overwritten bytes read as empty"),
-        b""
-    );
-    assert_eq!(
-        filesystem
-            .read_file_event_payload_range(
-                truncate.sequence(),
-                FileEventPayloadPart::Written,
-                0,
-                100
-            )
-            .expect("missing written bytes read as empty"),
-        b""
-    );
-    assert_eq!(
-        filesystem
-            .read_file_event_payload_range(
-                truncate.sequence(),
-                FileEventPayloadPart::Removed,
-                0,
-                100
-            )
-            .expect("removed bytes are read"),
-        b"llo"
     );
     assert_eq!(
         filesystem
@@ -168,7 +98,7 @@ fn overwrite_write_events_expose_overwritten_payload_bytes() {
         .expect("filesystem mounts in the background");
     let file_path = directories.mount_point_path().join("overwrite-payload");
 
-    fs::write(&file_path, b"hello").expect("file is written through mounted filesystem");
+    write_mounted_file(&file_path, b"hello").expect("file is written through mounted filesystem");
     let mut file = fs::OpenOptions::new()
         .write(true)
         .open(&file_path)
@@ -243,7 +173,6 @@ fn overwrite_write_events_expose_overwritten_payload_bytes() {
         Some(overwritten_length)
     );
     assert_eq!(overwrite.written_byte_length(), Some(written_length));
-    assert_eq!(overwrite.removed_byte_length(), None);
     assert_eq!(
         overwritten.len(),
         usize::try_from(overwritten_length).expect("overwritten length fits usize"),
@@ -254,17 +183,6 @@ fn overwrite_write_events_expose_overwritten_payload_bytes() {
     );
     assert!(!overwritten.is_empty(), "overwrite payload is not empty");
     assert_eq!(overwritten_tail, overwritten[1..]);
-    assert_eq!(
-        filesystem
-            .read_file_event_payload_range(
-                overwrite.sequence(),
-                FileEventPayloadPart::Removed,
-                0,
-                100,
-            )
-            .expect("missing removed bytes read as empty"),
-        b""
-    );
     assert_eq!(
         &before_bytes[offset..offset + overwritten.len()],
         overwritten.as_slice()
@@ -296,8 +214,10 @@ fn per_file_event_listing_paginates_in_active_branch_order_with_cursors() {
     let first_path = directories.mount_point_path().join("first");
     let second_path = directories.mount_point_path().join("second");
 
-    fs::write(&first_path, b"alpha").expect("first file is written through mounted filesystem");
-    fs::write(&second_path, b"other").expect("second file is written through mounted filesystem");
+    write_mounted_file(&first_path, b"alpha")
+        .expect("first file is written through mounted filesystem");
+    write_mounted_file(&second_path, b"other")
+        .expect("second file is written through mounted filesystem");
 
     let mut first = fs::OpenOptions::new()
         .write(true)
@@ -313,7 +233,6 @@ fn per_file_event_listing_paginates_in_active_branch_order_with_cursors() {
     first
         .write_all(b"ZZ")
         .expect("first file overwrite succeeds");
-    first.set_len(4).expect("first file truncates");
     drop(first);
 
     let first_identifier = file_identifier_for_path(&filesystem, "/first");
@@ -327,39 +246,22 @@ fn per_file_event_listing_paginates_in_active_branch_order_with_cursors() {
     let second_page = filesystem
         .list_file_events(first_identifier, Some(first_cursor), event_page_limit(2))
         .expect("second file page is listed");
-    let second_cursor = second_page
-        .next_after()
-        .expect("second file page exposes a cursor");
-
-    let third_page = filesystem
-        .list_file_events(first_identifier, Some(second_cursor), event_page_limit(2))
-        .expect("third file page is listed");
-
     let combined = first_page
         .records()
         .iter()
         .chain(second_page.records())
-        .chain(third_page.records())
         .cloned()
         .collect::<Vec<_>>();
 
     assert_eq!(first_page.records().len(), 2);
     assert_eq!(second_page.records().len(), 2);
-    assert_eq!(third_page.records().len(), 1);
-    assert_eq!(third_page.next_after(), None);
+    assert_eq!(second_page.next_after(), None);
     assert_eq!(first_cursor, first_page.records()[1].sequence());
-    assert_eq!(second_cursor, second_page.records()[1].sequence());
     assert!(
         second_page
             .records()
             .iter()
             .all(|event| event.sequence() > first_cursor)
-    );
-    assert!(
-        third_page
-            .records()
-            .iter()
-            .all(|event| event.sequence() > second_cursor)
     );
     assert_eq!(
         combined.iter().map(EventRecord::kind).collect::<Vec<_>>(),
@@ -368,7 +270,6 @@ fn per_file_event_listing_paginates_in_active_branch_order_with_cursors() {
             EventKind::FileWritten,
             EventKind::FileWritten,
             EventKind::FileWritten,
-            EventKind::FileTruncated,
         ]
     );
     assert!(combined.iter().all(|event| {
@@ -410,9 +311,9 @@ fn file_event_listing_accepts_non_file_cursors_without_restarting() {
     let first = directories.mount_point_path().join("first");
     let marker = directories.mount_point_path().join("marker");
 
-    fs::write(&first, b"one").expect("first file is written");
-    fs::write(&marker, b"marker").expect("marker file is written");
-    fs::write(&first, b"two").expect("first file is overwritten");
+    write_mounted_file(&first, b"one").expect("first file is written");
+    write_mounted_file(&marker, b"marker").expect("marker file is written");
+    write_mounted_file(&first, b"two").expect("first file is overwritten");
 
     let first_identifier = file_identifier_for_path(&filesystem, "/first");
     let marker_cursor = find_event_sequence(&filesystem, |event| {
@@ -448,7 +349,8 @@ fn file_history_and_snapshot_lookups_follow_renamed_and_unlinked_files() {
     let original_path = directories.mount_point_path().join("draft");
     let renamed_path = directories.mount_point_path().join("published");
 
-    fs::write(&original_path, b"hello").expect("file is written through mounted filesystem");
+    write_mounted_file(&original_path, b"hello")
+        .expect("file is written through mounted filesystem");
     fs::rename(&original_path, &renamed_path).expect("file is renamed through mounted filesystem");
     fs::remove_file(&renamed_path).expect("renamed file is removed through mounted filesystem");
     mounted.unmount().expect("filesystem unmounts");
@@ -537,7 +439,7 @@ fn file_history_and_snapshot_lookups_follow_renamed_and_unlinked_files() {
 }
 
 #[test]
-fn file_history_and_snapshot_lookups_follow_metadata_changes_and_hard_links() {
+fn file_history_and_snapshot_lookups_follow_hard_links() {
     let directories = TestDirectories::new();
     let filesystem = open_test_filesystem(&directories);
     let mounted = filesystem
@@ -546,9 +448,7 @@ fn file_history_and_snapshot_lookups_follow_metadata_changes_and_hard_links() {
     let file_path = directories.mount_point_path().join("document");
     let hard_link_path = directories.mount_point_path().join("document-link");
 
-    fs::write(&file_path, b"hello").expect("file is written through mounted filesystem");
-    fs::set_permissions(&file_path, fs::Permissions::from_mode(0o600))
-        .expect("file metadata is changed through mounted filesystem");
+    write_mounted_file(&file_path, b"hello").expect("file is written through mounted filesystem");
     fs::hard_link(&file_path, &hard_link_path)
         .expect("hard link is created through mounted filesystem");
     mounted.unmount().expect("filesystem unmounts");
@@ -560,24 +460,18 @@ fn file_history_and_snapshot_lookups_follow_metadata_changes_and_hard_links() {
     let records = file_events.records();
 
     assert_eq!(file_events.next_after(), None);
-    assert_eq!(records.len(), 4);
+    assert_eq!(records.len(), 3);
     assert_eq!(
         records.iter().map(EventRecord::kind).collect::<Vec<_>>(),
         vec![
             EventKind::FileCreated,
             EventKind::FileWritten,
-            EventKind::MetadataChanged,
             EventKind::HardLinkCreated,
         ]
     );
     assert_eq!(
         records.iter().map(EventRecord::path).collect::<Vec<_>>(),
-        vec![
-            Some("/document"),
-            Some("/document"),
-            Some("/document"),
-            Some("/document-link"),
-        ]
+        vec![Some("/document"), Some("/document"), Some("/document-link"),]
     );
     assert!(
         records
@@ -606,20 +500,12 @@ fn file_history_and_snapshot_lookups_follow_metadata_changes_and_hard_links() {
         .iter()
         .find(|event| event.kind() == EventKind::FileWritten)
         .expect("write event exists");
-    let metadata_changed = records
-        .iter()
-        .find(|event| event.kind() == EventKind::MetadataChanged)
-        .expect("metadata event exists");
     let hard_link_created = records
         .iter()
         .find(|event| event.kind() == EventKind::HardLinkCreated)
         .expect("hard-link event exists");
 
-    for sequence in [
-        metadata_changed.sequence(),
-        hard_link_created.sequence(),
-        EventSequence::new(u64::MAX),
-    ] {
+    for sequence in [hard_link_created.sequence(), EventSequence::new(u64::MAX)] {
         let snapshot = filesystem
             .file_snapshot_at_or_before(file_identifier, sequence)
             .expect("snapshot lookup succeeds")
@@ -645,7 +531,7 @@ fn active_branch_snapshots_and_file_events_ignore_other_branch_sequences() {
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"main one").expect("file is written on main");
+    write_mounted_file(&file_path, b"main one").expect("file is written on main");
     mounted.unmount().expect("filesystem unmounts");
 
     let file_identifier = file_identifier_for_path(&filesystem, "/message");
@@ -663,7 +549,7 @@ fn active_branch_snapshots_and_file_events_ignore_other_branch_sequences() {
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"feature").expect("file is changed on feature");
+    write_mounted_file(&file_path, b"feature!").expect("file is changed on feature");
     mounted.unmount().expect("filesystem unmounts");
 
     let feature_write = list_all_events(&filesystem)
@@ -681,7 +567,7 @@ fn active_branch_snapshots_and_file_events_ignore_other_branch_sequences() {
     let mounted = filesystem
         .spawn_mount()
         .expect("filesystem mounts in the background");
-    fs::write(&file_path, b"main later").expect("file is changed on main");
+    write_mounted_file(&file_path, b"main later").expect("file is changed on main");
     mounted.unmount().expect("filesystem unmounts");
 
     let main_later_write = list_all_events(&filesystem)
@@ -716,7 +602,7 @@ fn active_branch_snapshots_and_file_events_ignore_other_branch_sequences() {
         filesystem
             .read_file_snapshot_range(&feature_snapshot, 0, feature_snapshot.file_size())
             .expect("feature snapshot is read"),
-        b"feature"
+        b"feature!"
     );
 
     let after_other_branch = filesystem
@@ -747,24 +633,19 @@ fn file_snapshots_and_events_reconstruct_before_and_after_file_changes() {
         .expect("filesystem mounts in the background");
     let file_path = directories.mount_point_path().join("message");
 
-    fs::write(&file_path, b"hello").expect("file is written through mounted filesystem");
+    write_mounted_file(&file_path, b"hello").expect("file is written through mounted filesystem");
     let mut file = fs::OpenOptions::new()
         .write(true)
         .open(&file_path)
         .expect("file opens");
     file.seek(SeekFrom::Start(1)).expect("file seek succeeds");
     file.write_all(b"XY").expect("file overwrite succeeds");
-    file.set_len(1).expect("file truncates");
     drop(file);
 
     let events = list_all_events(&filesystem);
     let file_identifier = file_identifier_for_path(&filesystem, "/message");
     let initial_write = write_event_with_sizes(&events, 0, 5);
     let overwrite = write_event_with_sizes(&events, 5, 5);
-    let truncate = events
-        .iter()
-        .find(|event| event.kind() == EventKind::FileTruncated)
-        .expect("truncate event exists");
 
     let initial_snapshot = filesystem
         .file_snapshot_at_or_before(file_identifier, initial_write.sequence())
@@ -786,17 +667,9 @@ fn file_snapshots_and_events_reconstruct_before_and_after_file_changes() {
         EventSequence::new(overwrite.sequence().get() - 1),
     );
     let after_overwrite = reconstruct_file_at(&filesystem, file_identifier, overwrite.sequence());
-    let before_truncate = reconstruct_file_at(
-        &filesystem,
-        file_identifier,
-        EventSequence::new(truncate.sequence().get() - 1),
-    );
-    let after_truncate = reconstruct_file_at(&filesystem, file_identifier, truncate.sequence());
 
     assert_eq!(before_overwrite, b"hello");
     assert_eq!(after_overwrite, b"hXYlo");
-    assert_eq!(before_truncate, b"hXYlo");
-    assert_eq!(after_truncate, b"h");
 
     mounted.unmount().expect("filesystem unmounts");
 }
@@ -897,22 +770,12 @@ fn snapshot_and_payload_ranges_clamp_to_available_bytes_and_return_empty_beyond_
         .expect("filesystem mounts in the background");
     let file_path = directories.mount_point_path().join("ranges");
 
-    fs::write(&file_path, b"abcdef").expect("file is written through mounted filesystem");
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&file_path)
-        .expect("file opens")
-        .set_len(2)
-        .expect("file truncates");
+    write_mounted_file(&file_path, b"abcdef").expect("file is written through mounted filesystem");
     mounted.unmount().expect("filesystem unmounts");
 
     let events = list_all_events(&filesystem);
     let file_identifier = file_identifier_for_path(&filesystem, "/ranges");
     let write = write_event_with_sizes(&events, 0, 6);
-    let truncate = events
-        .iter()
-        .find(|event| event.kind() == EventKind::FileTruncated)
-        .expect("truncate event exists");
     let snapshot = filesystem
         .file_snapshot_at_or_before(file_identifier, EventSequence::new(u64::MAX))
         .expect("latest snapshot lookup succeeds")
@@ -922,7 +785,7 @@ fn snapshot_and_payload_ranges_clamp_to_available_bytes_and_return_empty_beyond_
         filesystem
             .read_file_snapshot_range(&snapshot, 1, 10)
             .expect("snapshot range clamps to file size"),
-        b"b"
+        b"bcdef"
     );
     assert_eq!(
         filesystem
@@ -949,28 +812,6 @@ fn snapshot_and_payload_ranges_clamp_to_available_bytes_and_return_empty_beyond_
             .expect("written payload range at end is empty"),
         b""
     );
-    assert_eq!(
-        filesystem
-            .read_file_event_payload_range(
-                truncate.sequence(),
-                FileEventPayloadPart::Removed,
-                1,
-                10,
-            )
-            .expect("removed payload range clamps to payload length"),
-        b"def"
-    );
-    assert_eq!(
-        filesystem
-            .read_file_event_payload_range(
-                truncate.sequence(),
-                FileEventPayloadPart::Removed,
-                4,
-                10,
-            )
-            .expect("removed payload range at end is empty"),
-        b""
-    );
 }
 
 #[test]
@@ -982,7 +823,7 @@ fn active_branch_snapshot_lookup_returns_none_before_file_history_exists() {
         .expect("filesystem mounts in the background");
     let file_path = directories.mount_point_path().join("appears-later");
 
-    fs::write(&file_path, b"late").expect("file is written through mounted filesystem");
+    write_mounted_file(&file_path, b"late").expect("file is written through mounted filesystem");
     mounted.unmount().expect("filesystem unmounts");
 
     let file_identifier = file_identifier_for_path(&filesystem, "/appears-later");
@@ -1092,11 +933,6 @@ fn apply_file_event(filesystem: &Filesystem, bytes: &mut Vec<u8>, event: &EventR
                 0,
             );
         }
-        EventKind::FileTruncated => bytes.resize(
-            usize::try_from(event.new_file_size().expect("new size exists"))
-                .expect("new size fits usize"),
-            0,
-        ),
         _ => {}
     }
 }

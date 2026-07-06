@@ -57,7 +57,6 @@ Criterion reports mean time per operation:
 | --- | ---: | ---: | ---: |
 | `lookup` | 968.22 ns | 901.04 ns | 1.1x |
 | `getattr` | 740.21 ns | 737.59 ns | 1.0x |
-| `setattr` | 53.543 us | 2.2561 us | 23.7x |
 | `access` | 32.717 us | 734.32 ns | 44.6x |
 | `statfs` | 31.113 us | 909.04 ns | 34.2x |
 | `mknod` | 89.561 us | 5.2850 us | 16.9x |
@@ -73,7 +72,6 @@ Criterion reports mean time per operation:
 | `open` | 34.745 us | 1.3152 us | 26.4x |
 | `read` | 490.74 ns | 537.27 ns | 0.9x |
 | `write` | 154.89 us | 747.69 ns | 207.2x |
-| `truncate` | 157.99 us | 3.1089 us | 50.8x |
 | `flush` | 27.127 us | 334.74 ns | 81.0x |
 | `release` | 24.526 us | 585.73 ns | 41.9x |
 | `fsync` | 60.436 us | 26.270 us | 2.3x |
@@ -98,17 +96,3 @@ Criterion reports mean time per operation:
 | `fallocate_zero_range` | 260.33 us | 8.4055 us | 31.0x |
 | `lseek_data` | 88.582 us | 535.84 ns | 165.3x |
 | `lseek_hole` | 88.763 us | 448.63 ns | 197.9x |
-
-A later write-only profiling run on the same droplet size measured
-`write/eventfs` at 139.42 us and `write/host` at 1.3250 us. Direct storage
-instrumentation in that run measured these mean write-path costs:
-
-| Write path bucket | Mean |
-| --- | ---: |
-| Prepare inode and namespace | 18.496 us |
-| Load content extents | 22.866 us |
-| Compute overwrite chunks | 2.187 us |
-| Put content and manifests | 7.657 us |
-| Build event | 798 ns |
-| Commit event and indexes | 53.251 us |
-| RocksDB batch and WAL write | 26.736 us |
