@@ -1,5 +1,6 @@
 //! Event-sourced filesystem library mounted through FUSE and persisted in RocksDB.
 
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 

@@ -493,6 +493,63 @@ mod tests {
         assert!(remove_path_if_exists(Path::new(OsStr::from_bytes(b"bad\0path"))).is_err());
     }
 
+    #[test]
+    fn backup_value_accessors_and_path_validation_helpers_cover_edges() {
+        assert_eq!(
+            BackupDirectory::new(PathBuf::new()),
+            Err(ConfigurationError::EmptyValue)
+        );
+        let backup_directory =
+            BackupDirectory::new(PathBuf::from("backups")).expect("backup path is valid");
+        assert_eq!(backup_directory.as_path(), Path::new("backups"));
+
+        assert_eq!(BackupIdentifier::new(0), Err(ConfigurationError::ZeroValue));
+        let backup_identifier = BackupIdentifier::new(7).expect("backup identifier is valid");
+        assert_eq!(backup_identifier.get(), 7);
+
+        let backup_receipt = BackupReceipt {
+            backup_identifier,
+            source_event_sequence: EventSequence::new(9),
+        };
+        assert_eq!(backup_receipt.backup_identifier(), backup_identifier);
+        assert_eq!(
+            backup_receipt.source_event_sequence(),
+            EventSequence::new(9)
+        );
+
+        let import_receipt = ImportReceipt {
+            backup_identifier,
+            imported_event_sequence: EventSequence::new(11),
+        };
+        assert_eq!(import_receipt.backup_identifier(), backup_identifier);
+        assert_eq!(
+            import_receipt.imported_event_sequence(),
+            EventSequence::new(11)
+        );
+
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let parent = temporary.path().join("parent");
+        let child = parent.join("child");
+        let sibling = temporary.path().join("sibling");
+        assert!(paths_overlap(&parent, &child));
+        assert!(paths_overlap(&child, &parent));
+        assert!(!paths_overlap(&parent, &sibling));
+
+        fs::write(&sibling, b"not a directory").expect("backup file placeholder is written");
+        assert_eq!(
+            validate_existing_backup_directory(&sibling),
+            Err(FilesystemError::Integrity)
+        );
+        assert_eq!(
+            validate_import_database_directory(Path::new(""), &parent),
+            Err(FilesystemError::Import)
+        );
+        assert_eq!(
+            validate_import_database_directory(&child, &parent),
+            Err(FilesystemError::Import)
+        );
+    }
+
     fn assert_import_fault_preserves_target(fault: BackupFault) {
         let temporary = tempfile::tempdir().expect("temporary directory is created");
         let source = filesystem_at(

@@ -7,7 +7,6 @@ use eventfs::{
     EventPageLimit, EventSequence, Filesystem, FilesystemConfiguration, FilesystemError,
     MountOption, SessionAccessControlList,
 };
-use rocksdb::{ColumnFamilyDescriptor, DB, IteratorMode, Options};
 
 use support::{TestDirectories, list_all_events, open_test_filesystem};
 
@@ -119,19 +118,6 @@ fn valid_filesystem_configuration_opens_a_new_database_and_exposes_the_initial_e
 }
 
 #[test]
-fn opening_an_existing_database_missing_required_metadata_values_returns_integrity() {
-    let directories = TestDirectories::new();
-    let filesystem = open_test_filesystem(&directories);
-
-    drop(filesystem);
-    clear_configuration_metadata(directories.database_directory_path());
-    let error = Filesystem::open(directories.configuration())
-        .expect_err("existing database missing required metadata is rejected");
-
-    assert_eq!(error, FilesystemError::Integrity);
-}
-
-#[test]
 fn opening_a_filesystem_does_not_require_the_mount_point_to_exist_yet() {
     let directories = TestDirectories::new();
     let missing_mount_point = directories.root_path().join("future-mount-point");
@@ -166,139 +152,4 @@ fn reopening_an_existing_database_preserves_the_initial_event_history() {
     let reopened = Filesystem::open(directories.configuration()).expect("filesystem reopens");
 
     assert_eq!(list_all_events(&reopened), events_before_reopen);
-}
-
-#[test]
-fn opening_storage_schema_baseline_preserves_existing_database() {
-    let directories = TestDirectories::new();
-    let filesystem = open_test_filesystem(&directories);
-    let events_before_reopen = list_all_events(&filesystem);
-
-    drop(filesystem);
-    write_configuration_schema_version(directories.database_directory_path(), 8);
-
-    let reopened =
-        Filesystem::open(directories.configuration()).expect("baseline schema database opens");
-
-    assert_eq!(list_all_events(&reopened), events_before_reopen);
-    drop(reopened);
-    assert_eq!(
-        read_configuration_schema_version(directories.database_directory_path()),
-        8
-    );
-}
-
-#[test]
-fn opening_storage_schema_outside_compatibility_window_fails_without_mutation() {
-    for schema_version in [7, u64::MAX] {
-        let directories = TestDirectories::new();
-        let filesystem = open_test_filesystem(&directories);
-
-        drop(filesystem);
-        write_configuration_schema_version(directories.database_directory_path(), schema_version);
-        let error = Filesystem::open(directories.configuration())
-            .expect_err("incompatible storage schema is rejected");
-
-        assert_eq!(error, FilesystemError::Integrity);
-        assert_eq!(
-            read_configuration_schema_version(directories.database_directory_path()),
-            schema_version
-        );
-    }
-}
-
-#[test]
-fn opening_database_missing_column_family_required_by_stored_schema_returns_integrity() {
-    let directories = TestDirectories::new();
-    let filesystem = open_test_filesystem(&directories);
-
-    drop(filesystem);
-    drop_configuration_column_family(
-        directories.database_directory_path(),
-        CONFIGURATION_COLUMN_FAMILY_EVENT_PAYLOAD_MANIFESTS,
-    );
-    let error = Filesystem::open(directories.configuration())
-        .expect_err("missing required stored-schema column family is rejected");
-
-    assert_eq!(error, FilesystemError::Integrity);
-}
-
-const CONFIGURATION_COLUMN_FAMILY_FILESYSTEM_METADATA: &str = "filesystem_metadata";
-const CONFIGURATION_COLUMN_FAMILY_EVENT_PAYLOAD_MANIFESTS: &str = "event_payload_manifests";
-const CONFIGURATION_METADATA_KEY_STORAGE_SCHEMA_VERSION: &[u8] = b"schema_version";
-
-fn write_configuration_schema_version(database_directory: &std::path::Path, version: u64) {
-    let database = open_configuration_database(database_directory);
-    let metadata = database
-        .cf_handle(CONFIGURATION_COLUMN_FAMILY_FILESYSTEM_METADATA)
-        .expect("metadata column family exists");
-
-    database
-        .put_cf(
-            metadata,
-            CONFIGURATION_METADATA_KEY_STORAGE_SCHEMA_VERSION,
-            version.to_be_bytes(),
-        )
-        .expect("schema version is written");
-    database
-        .flush_cf(metadata)
-        .expect("schema version write is flushed");
-}
-
-fn read_configuration_schema_version(database_directory: &std::path::Path) -> u64 {
-    let database = open_configuration_database(database_directory);
-    let metadata = database
-        .cf_handle(CONFIGURATION_COLUMN_FAMILY_FILESYSTEM_METADATA)
-        .expect("metadata column family exists");
-    let value = database
-        .get_cf(metadata, CONFIGURATION_METADATA_KEY_STORAGE_SCHEMA_VERSION)
-        .expect("schema version is read")
-        .expect("schema version exists");
-    let bytes: [u8; 8] = value
-        .as_slice()
-        .try_into()
-        .expect("schema version is encoded as u64");
-
-    u64::from_be_bytes(bytes)
-}
-
-fn drop_configuration_column_family(database_directory: &std::path::Path, name: &str) {
-    let mut database = open_configuration_database(database_directory);
-
-    database
-        .drop_cf(name)
-        .expect("column family is dropped from test database");
-}
-
-fn open_configuration_database(database_directory: &std::path::Path) -> DB {
-    let options = Options::default();
-    let descriptors = DB::list_cf(&options, database_directory)
-        .expect("existing column families are listed")
-        .into_iter()
-        .map(|name| ColumnFamilyDescriptor::new(name, Options::default()))
-        .collect::<Vec<_>>();
-
-    DB::open_cf_descriptors(&options, database_directory, descriptors)
-        .expect("configuration test database opens")
-}
-
-fn clear_configuration_metadata(database_directory: &std::path::Path) {
-    let database = open_configuration_database(database_directory);
-    let metadata = database
-        .cf_handle(CONFIGURATION_COLUMN_FAMILY_FILESYSTEM_METADATA)
-        .expect("metadata column family exists");
-    let keys = database
-        .iterator_cf(metadata, IteratorMode::Start)
-        .map(|entry| entry.expect("metadata entry is readable").0.to_vec())
-        .collect::<Vec<_>>();
-
-    for key in keys {
-        database
-            .delete_cf(metadata, key)
-            .expect("metadata entry is removed");
-    }
-
-    database
-        .flush_cf(metadata)
-        .expect("metadata removals are flushed");
 }

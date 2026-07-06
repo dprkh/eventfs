@@ -10,6 +10,9 @@ readme = "README.md"
 default = []
 tracing = ["dep:tracing"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
+
 [dependencies]
 fuser = "0.17"
 blake3 = "1"

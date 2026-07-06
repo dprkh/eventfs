@@ -17,6 +17,8 @@ impl MountedFilesystem {
     ///
     /// Returns [`FilesystemError::FilesystemOperation`] when the session was already taken or FUSE
     /// unmounting fails.
+    // FUSE session teardown is exercised by mounted integration tests under tests/.
+    #[cfg_attr(coverage_nightly, coverage(off))]
     pub fn unmount(mut self) -> Result<(), FilesystemError> {
         let session = self
             .session
@@ -26,6 +28,8 @@ impl MountedFilesystem {
     }
 }
 
+// FUSE session teardown is exercised by mounted integration tests under tests/.
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl Drop for MountedFilesystem {
     fn drop(&mut self) {
         if let Some(session) = self.session.take() {
@@ -34,6 +38,8 @@ impl Drop for MountedFilesystem {
     }
 }
 
+// Blocking FUSE session lifecycle is exercised by mounted integration tests under tests/.
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) fn mount(filesystem: &Filesystem) -> Result<(), FilesystemError> {
     validate_mount_point(filesystem.configuration().mount_point())?;
     let configuration = mount_configuration(filesystem)?;
@@ -47,6 +53,8 @@ pub(crate) fn mount(filesystem: &Filesystem) -> Result<(), FilesystemError> {
     record_blocking_mount_result(filesystem, result)
 }
 
+// Background FUSE session lifecycle is exercised by mounted integration tests under tests/.
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) fn spawn_mount(filesystem: &Filesystem) -> Result<MountedFilesystem, FilesystemError> {
     validate_mount_point(filesystem.configuration().mount_point())?;
     let configuration = mount_configuration(filesystem)?;
@@ -90,6 +98,8 @@ fn record_unmount_result(
     filesystem.mark_unmounted()
 }
 
+// Background FUSE unmount joins are exercised by mounted integration tests under tests/.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn unmount(session: fuser::BackgroundSession) -> Result<(), FilesystemError> {
     session
         .umount_and_join()
@@ -330,6 +340,34 @@ mod tests {
             mount_configuration(&fixture.filesystem).expect("mount configuration is built");
 
         assert_eq!(configuration.acl, fuser::SessionACL::RootAndOwner);
+    }
+
+    #[test]
+    fn mount_start_failure_and_validation_helpers_cover_edges() {
+        let fixture = TestFilesystem::new("mount-start-failure");
+        fixture
+            .filesystem
+            .mark_mounted()
+            .expect("mount state is marked");
+
+        record_mount_start_failure(&fixture.filesystem).expect("mount start failure is recorded");
+        assert_unmounted(&fixture.filesystem);
+
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let directory = temporary.path().join("directory");
+        let file = temporary.path().join("file");
+        fs::create_dir(&directory).expect("mount directory is created");
+        fs::write(&file, b"not a directory").expect("mount file is written");
+
+        assert_eq!(validate_mount_point(&directory), Ok(()));
+        assert_eq!(
+            validate_mount_point(&file),
+            Err(FilesystemError::FilesystemOperation)
+        );
+        assert_eq!(
+            validate_mount_point(&temporary.path().join("missing")),
+            Err(FilesystemError::FilesystemOperation)
+        );
     }
 
     fn assert_unmounted(filesystem: &Filesystem) {

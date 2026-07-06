@@ -8278,6 +8278,558 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn branch_and_listing_cursor_edges_reject_invalid_or_exhausted_cursors() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let limit = EventPageLimit::new(2).expect("limit is valid");
+
+        assert!(
+            storage
+                .list_events(Some(EventSequence::new(u64::MAX)), limit)
+                .expect("exhausted event cursor lists as empty")
+                .records()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .list_branches(
+                    Some(BranchIdentifier::new(u64::MAX)),
+                    BranchPageLimit::new(2).expect("limit is valid")
+                )
+                .expect("exhausted branch cursor lists as empty")
+                .records()
+                .is_empty()
+        );
+
+        let file = create_regular_file(&storage, "cursor-file");
+        let main = storage.current_branch().expect("main branch is readable");
+        assert!(
+            storage
+                .list_file_events(
+                    FileIdentifier::new(file),
+                    Some(EventSequence::new(u64::MAX)),
+                    limit
+                )
+                .expect("exhausted active file cursor lists as empty")
+                .records()
+                .is_empty()
+        );
+
+        let wrong_branch_position =
+            BranchPosition::new(BranchIdentifier::new(main.branch_identifier().get() + 1), 0);
+        assert!(matches!(
+            storage.list_branch_events(
+                main.branch_identifier(),
+                Some(wrong_branch_position),
+                limit
+            ),
+            Err(FilesystemError::Integrity)
+        ));
+        assert!(matches!(
+            storage.list_branch_file_events(
+                main.branch_identifier(),
+                FileIdentifier::new(file),
+                Some(wrong_branch_position),
+                limit,
+            ),
+            Err(FilesystemError::Integrity)
+        ));
+        assert!(matches!(
+            storage.list_branch_events(
+                main.branch_identifier(),
+                Some(BranchPosition::new(main.branch_identifier(), u64::MAX)),
+                limit,
+            ),
+            Err(FilesystemError::Integrity)
+        ));
+
+        assert!(matches!(
+            storage.delete_branch(main.name()),
+            Err(FilesystemError::Integrity)
+        ));
+        let deleted_name = BranchName::new("deleted-source").expect("branch name is valid");
+        let deleted = storage
+            .create_branch(&deleted_name, main.head_position())
+            .expect("branch is created");
+        storage
+            .delete_branch(&deleted_name)
+            .expect("inactive branch is deleted");
+        assert!(matches!(
+            storage.create_branch(
+                &BranchName::new("from-deleted").expect("branch name is valid"),
+                deleted.head_position(),
+            ),
+            Err(FilesystemError::Integrity)
+        ));
+    }
+
+    #[test]
+    fn key_metadata_and_identifier_decoders_fail_closed_on_corruption() {
+        assert_eq!(decode_u64(&[1, 2, 3]), Err(FilesystemError::Integrity));
+        assert_eq!(
+            decode_branch_position_ordinal(&[0; 15]),
+            Err(FilesystemError::Integrity)
+        );
+        assert_eq!(
+            decode_branch_file_position_key(&[0; 23]),
+            Err(FilesystemError::Integrity)
+        );
+        assert!(matches!(
+            decode_stored_event(&[0xff; 8]),
+            Err(FilesystemError::Integrity)
+        ));
+        assert!(matches!(
+            decode_branch(&[0xff; 8]),
+            Err(FilesystemError::Integrity)
+        ));
+        assert!(matches!(
+            decode_branch_root(&[0xff; 8]),
+            Err(FilesystemError::Integrity)
+        ));
+        assert!(matches!(
+            decode_snapshot_metadata(&[0xff; 8]),
+            Err(FilesystemError::Integrity)
+        ));
+        assert!(matches!(
+            decode_event_payload_manifest(&[0xff; 8]),
+            Err(FilesystemError::Integrity)
+        ));
+        assert!(matches!(
+            decode_content_manifest(&[0xff; 8]),
+            Err(FilesystemError::Integrity)
+        ));
+        assert!(matches!(
+            decode_namespace_state(&[0xff; 8]),
+            Err(FilesystemError::Integrity)
+        ));
+
+        let empty_manifest = encode_content_manifest(&[]).expect("empty manifest encodes");
+        let content_identifier = content_manifest_identifier_for_bytes(&empty_manifest);
+        assert_eq!(
+            ContentManifestIdentifier::from_bytes(&content_identifier)
+                .expect("content manifest identifier is valid")
+                .as_bytes(),
+            content_identifier.as_slice()
+        );
+        assert_eq!(
+            ContentManifestIdentifier::from_bytes(&content_identifier[1..]),
+            Err(FilesystemError::Integrity)
+        );
+        let mut wrong_content_prefix = content_identifier.clone();
+        wrong_content_prefix[0] = NAMESPACE_HASH_BLAKE3;
+        assert_eq!(
+            validate_content_manifest(&wrong_content_prefix, &empty_manifest),
+            Err(FilesystemError::Integrity)
+        );
+        assert_eq!(
+            validate_content_manifest(&content_identifier, b"changed"),
+            Err(FilesystemError::Integrity)
+        );
+
+        let namespace_bytes =
+            encode_namespace_state(&MaterializedBranchState::default()).expect("namespace encodes");
+        let namespace_identifier = namespace_identifier_for_bytes(&namespace_bytes);
+        assert_eq!(
+            NamespaceIdentifier::from_bytes(&namespace_identifier)
+                .expect("namespace identifier is valid")
+                .as_bytes(),
+            namespace_identifier.as_slice()
+        );
+        assert_eq!(
+            NamespaceIdentifier::from_bytes(&namespace_identifier[1..]),
+            Err(FilesystemError::Integrity)
+        );
+        assert_eq!(
+            validate_namespace(&namespace_identifier, b"changed"),
+            Err(FilesystemError::Integrity)
+        );
+
+        let invalid_branch = StoredBranch {
+            identifier: 1,
+            name: String::new(),
+            status: BranchStatus::Open,
+            head_sequence: 0,
+            head_ordinal: 0,
+            namespace_identifier,
+            fork_branch_identifier: None,
+            fork_ordinal: None,
+        };
+        assert!(matches!(
+            branch_record_from_stored(invalid_branch),
+            Err(FilesystemError::Integrity)
+        ));
+
+        assert_eq!(
+            event_payload_part_byte(FileEventPayloadPart::Overwritten),
+            EVENT_PAYLOAD_PART_OVERWRITTEN
+        );
+        assert_eq!(
+            event_payload_part_byte(FileEventPayloadPart::Written),
+            EVENT_PAYLOAD_PART_WRITTEN
+        );
+        assert_eq!(
+            event_payload_part_byte(FileEventPayloadPart::Removed),
+            EVENT_PAYLOAD_PART_REMOVED
+        );
+    }
+
+    #[test]
+    fn metadata_reads_reject_missing_malformed_and_non_utf8_values() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let database = temporary.path().join("database");
+        let storage = open_database_path(&database).expect("storage opens");
+        let metadata = storage
+            .database()
+            .cf_handle(COLUMN_FAMILY_FILESYSTEM_METADATA)
+            .expect("metadata column family exists");
+
+        let mut batch = WriteBatch::default();
+        batch.delete_cf(metadata, METADATA_KEY_VOLUME_NAME);
+        write_batch(storage.database(), batch).expect("volume name metadata is deleted");
+        assert_eq!(
+            read_metadata_string(storage.database(), METADATA_KEY_VOLUME_NAME),
+            Err(FilesystemError::Integrity)
+        );
+
+        let mut batch = WriteBatch::default();
+        batch.put_cf(metadata, METADATA_KEY_VOLUME_NAME, [0xff]);
+        write_batch(storage.database(), batch).expect("invalid volume name metadata is written");
+        assert_eq!(
+            read_metadata_string(storage.database(), METADATA_KEY_VOLUME_NAME),
+            Err(FilesystemError::Integrity)
+        );
+
+        let mut batch = WriteBatch::default();
+        batch.put_cf(metadata, METADATA_KEY_NEXT_INODE_NUMBER, [1, 2, 3]);
+        write_batch(storage.database(), batch).expect("invalid inode metadata is written");
+        assert_eq!(
+            read_metadata_u64(storage.database(), METADATA_KEY_NEXT_INODE_NUMBER),
+            Err(FilesystemError::Integrity)
+        );
+        drop(storage);
+
+        assert!(matches!(
+            open_database_path(&database),
+            Err(FilesystemError::Integrity)
+        ));
+    }
+
+    #[test]
+    fn snapshot_and_payload_manifest_corruption_paths_are_rejected() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let inode_number = create_regular_file(&storage, "manifest-corruption");
+        storage
+            .write_file(inode_number, 0, b"abcdef", current_uid(), current_gid())
+            .expect("file is written");
+        let sequence = storage
+            .last_event_sequence()
+            .expect("write event sequence is readable");
+        let file_identifier = FileIdentifier::new(inode_number);
+        let snapshot = storage
+            .file_snapshot_at_or_before(file_identifier, sequence)
+            .expect("snapshot lookup succeeds")
+            .expect("snapshot exists");
+
+        assert_eq!(
+            storage
+                .read_file_event_payload_range(sequence, FileEventPayloadPart::Written, 2, 3)
+                .expect("payload slice is readable"),
+            b"cde"
+        );
+        assert_eq!(
+            storage
+                .read_file_event_payload_range(sequence, FileEventPayloadPart::Removed, 0, 3)
+                .expect("missing payload part reads as empty"),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            storage
+                .read_file_snapshot_range(&snapshot, snapshot.file_size(), 16)
+                .expect("snapshot range at EOF reads as empty"),
+            Vec::<u8>::new()
+        );
+
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            storage
+                .event_payload_manifests()
+                .expect("event payload manifests column family exists"),
+            encode_event_payload_manifest_key(sequence.get(), EVENT_PAYLOAD_PART_WRITTEN),
+            [0xff; 8],
+        );
+        write_batch(storage.database(), batch).expect("corrupt payload manifest is written");
+        assert!(matches!(
+            storage.read_file_event_payload_range(sequence, FileEventPayloadPart::Written, 0, 1,),
+            Err(FilesystemError::Integrity)
+        ));
+
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            storage
+                .file_snapshot_manifests()
+                .expect("file snapshot manifests column family exists"),
+            encode_file_snapshot_manifest_key(
+                snapshot.branch_position().branch_identifier().get(),
+                snapshot.file_identifier().get(),
+                snapshot.branch_position().ordinal(),
+            ),
+            [0xff; 8],
+        );
+        write_batch(storage.database(), batch).expect("corrupt snapshot manifest is written");
+        assert!(matches!(
+            storage.read_file_snapshot_range(&snapshot, 0, 1),
+            Err(FilesystemError::Integrity)
+        ));
+    }
+
+    #[test]
+    fn permission_name_xattr_statfs_and_mode_helpers_cover_edges() {
+        assert_eq!(
+            validate_name(OsStr::new("child")).expect("name is valid"),
+            b"child"
+        );
+        assert_fuse_errno(
+            validate_name(OsStr::new("")).expect_err("empty names are rejected"),
+            fuser::Errno::ENOENT,
+        );
+        assert_fuse_errno(
+            validate_name(OsStr::new(".")).expect_err("dot names are rejected"),
+            fuser::Errno::EINVAL,
+        );
+        assert_fuse_errno(
+            validate_name(OsStr::new("..")).expect_err("dot-dot names are rejected"),
+            fuser::Errno::EINVAL,
+        );
+        assert_fuse_errno(
+            validate_name(OsStr::new("bad/name")).expect_err("slash names are rejected"),
+            fuser::Errno::EINVAL,
+        );
+        assert_fuse_errno(
+            validate_name(OsStr::from_bytes(&[0xff])).expect_err("non-utf8 names are rejected"),
+            fuser::Errno::EINVAL,
+        );
+        assert_fuse_errno(
+            validate_name(OsStr::from_bytes(&[b'a'; FUSE_MAX_NAME_LENGTH + 1]))
+                .expect_err("overlong names are rejected"),
+            fuser::Errno::ENAMETOOLONG,
+        );
+
+        assert_eq!(
+            validate_extended_attribute_name(OsStr::new("user.key")).expect("xattr name is valid"),
+            b"user.key"
+        );
+        assert_fuse_errno(
+            validate_extended_attribute_name(OsStr::new(""))
+                .expect_err("empty xattr names are rejected"),
+            fuser::Errno::EINVAL,
+        );
+        assert_fuse_errno(
+            validate_extended_attribute_name(OsStr::from_bytes(b"user\0key"))
+                .expect_err("nul-containing xattr names are rejected"),
+            fuser::Errno::EINVAL,
+        );
+        assert_fuse_errno(
+            validate_extended_attribute_name(OsStr::from_bytes(&[b'a'; FUSE_MAX_NAME_LENGTH + 1]))
+                .expect_err("overlong xattr names are rejected"),
+            fuser::Errno::ERANGE,
+        );
+
+        assert_eq!(permissions_from_mode(0o7777, 0o027), 0o7750);
+        assert_eq!(permission_bits(0o100755), 0o755);
+        assert_eq!(
+            special_kind_from_mode(u32::from(libc::S_IFREG)).expect("regular mode maps"),
+            StoredNodeKind::RegularFile
+        );
+        assert_eq!(
+            special_kind_from_mode(u32::from(libc::S_IFIFO)).expect("fifo mode maps"),
+            StoredNodeKind::NamedPipe
+        );
+        assert_eq!(
+            special_kind_from_mode(u32::from(libc::S_IFCHR)).expect("char mode maps"),
+            StoredNodeKind::CharacterDevice
+        );
+        assert_eq!(
+            special_kind_from_mode(u32::from(libc::S_IFBLK)).expect("block mode maps"),
+            StoredNodeKind::BlockDevice
+        );
+        assert_eq!(
+            special_kind_from_mode(u32::from(libc::S_IFSOCK)).expect("socket mode maps"),
+            StoredNodeKind::Socket
+        );
+        assert_fuse_errno(
+            special_kind_from_mode(u32::from(libc::S_IFDIR))
+                .expect_err("directory special mode is rejected"),
+            fuser::Errno::EINVAL,
+        );
+        assert_eq!(
+            file_identifier_for_kind(12, StoredNodeKind::RegularFile),
+            Some(FileIdentifier::new(12))
+        );
+        assert_eq!(
+            file_identifier_for_kind(12, StoredNodeKind::Directory),
+            None
+        );
+
+        assert_eq!(
+            access_mask_for_open_flags(fuser::OpenFlags(libc::O_RDONLY)),
+            fuser::AccessFlags::R_OK
+        );
+        assert_eq!(
+            access_mask_for_open_flags(fuser::OpenFlags(libc::O_WRONLY)),
+            fuser::AccessFlags::W_OK
+        );
+        assert_eq!(
+            access_mask_for_open_flags(fuser::OpenFlags(libc::O_RDWR)),
+            fuser::AccessFlags::R_OK | fuser::AccessFlags::W_OK
+        );
+        assert_eq!(
+            write_directory_access_mask(),
+            fuser::AccessFlags::W_OK | fuser::AccessFlags::X_OK
+        );
+
+        let inode = stored_inode_for_test(StoredNodeKind::RegularFile, 0o640, 100, 200);
+        assert!(access_allowed(&inode, 100, 1, fuser::AccessFlags::R_OK));
+        assert!(access_allowed(&inode, 100, 1, fuser::AccessFlags::W_OK));
+        assert!(!access_allowed(&inode, 100, 1, fuser::AccessFlags::X_OK));
+        assert!(access_allowed(&inode, 1, 200, fuser::AccessFlags::R_OK));
+        assert!(!access_allowed(&inode, 1, 200, fuser::AccessFlags::W_OK));
+        assert!(!access_allowed(&inode, 1, 1, fuser::AccessFlags::R_OK));
+        assert!(access_allowed(&inode, 1, 1, fuser::AccessFlags::empty()));
+
+        assert!(matches!(
+            statistics_from_backing(
+                BackingFileSystemStatistics {
+                    blocks: 1,
+                    free_blocks: 1,
+                    available_blocks: 1,
+                    fragment_size: 4096,
+                },
+                INODE_FIRST_ALLOCATED - 1,
+            ),
+            Err(FuseError::Integrity)
+        ));
+        assert_fuse_errno(
+            next_inode_number_after(u64::MAX).expect_err("inode number overflow is rejected"),
+            fuser::Errno::ENOSPC,
+        );
+    }
+
+    #[test]
+    fn extent_seek_zero_and_bounds_helpers_cover_edge_errors() {
+        let first = stored_extent_for_test(0, 4, 0, b"first");
+        let second = stored_extent_for_test(8, 4, 0, b"second");
+        assert_eq!(
+            slice_extents(std::slice::from_ref(&first), 1, 3, 100).expect("extent slice succeeds"),
+            vec![StoredExtent {
+                logical_offset: 100,
+                length: 2,
+                chunk_identifier: b"first".to_vec(),
+                chunk_offset: 1,
+            }]
+        );
+        assert!(
+            slice_extents(std::slice::from_ref(&first), 2, 2, 0)
+                .expect("empty slice succeeds")
+                .is_empty()
+        );
+
+        assert_eq!(
+            current_extents_after_zero(&[first.clone(), second.clone()], 12, 4, 8)
+                .expect("zeroing an existing hole keeps extents"),
+            vec![first.clone(), second.clone()]
+        );
+        assert_eq!(
+            current_extents_after_zero(&[first.clone(), second.clone()], 12, 2, 10)
+                .expect("zeroing data removes covered extent ranges"),
+            vec![
+                StoredExtent {
+                    logical_offset: 0,
+                    length: 2,
+                    chunk_identifier: b"first".to_vec(),
+                    chunk_offset: 0,
+                },
+                StoredExtent {
+                    logical_offset: 10,
+                    length: 2,
+                    chunk_identifier: b"second".to_vec(),
+                    chunk_offset: 2,
+                },
+            ]
+        );
+
+        assert_eq!(
+            seek_data(&[first.clone(), second.clone()], 4, 12).expect("next data is found"),
+            8
+        );
+        assert_fuse_errno(
+            seek_data(&[], 0, 12).expect_err("no data is rejected"),
+            fuser::Errno::ENXIO,
+        );
+        assert_eq!(
+            seek_hole(&[first.clone(), second.clone()], 0, 12).expect("first hole is found"),
+            4
+        );
+        assert_eq!(
+            seek_hole(&[first.clone(), second.clone()], 5, 12).expect("middle hole is found"),
+            5
+        );
+        assert_eq!(
+            seek_hole(&[first.clone(), second.clone()], 8, 12).expect("hole after data is found"),
+            12
+        );
+
+        assert!(matches!(
+            validate_extent_bounds(&[stored_extent_for_test(10, 3, 0, b"bounds")], 12),
+            Err(FuseError::Integrity)
+        ));
+        let overflowing = StoredExtent {
+            logical_offset: u64::MAX,
+            length: 1,
+            chunk_identifier: b"overflow".to_vec(),
+            chunk_offset: 0,
+        };
+        assert!(matches!(
+            validate_extent_bounds(std::slice::from_ref(&overflowing), u64::MAX),
+            Err(FuseError::Integrity)
+        ));
+        assert!(matches!(
+            seek_data(std::slice::from_ref(&overflowing), 0, u64::MAX),
+            Err(FuseError::Integrity)
+        ));
+        assert!(matches!(
+            seek_hole(std::slice::from_ref(&overflowing), u64::MAX, u64::MAX),
+            Err(FuseError::Integrity)
+        ));
+        assert_fuse_errno(
+            current_extents_after_write(
+                &[],
+                0,
+                u64::MAX,
+                u64::MAX,
+                &[stored_extent_for_test(0, 1, 0, b"write")],
+            )
+            .expect_err("overflowing write range is rejected"),
+            fuser::Errno::EFBIG,
+        );
+        assert!(matches!(
+            stored_extents_from_pending(
+                u64::MAX,
+                &[PendingExtent {
+                    logical_offset: 1,
+                    length: 1,
+                    byte_start: 0,
+                    byte_end: 1,
+                    chunk_identifier: b"pending".to_vec(),
+                }],
+            ),
+            Err(FuseError::Integrity)
+        ));
+    }
+
     #[derive(Clone, Debug)]
     enum BoundedFileOperation {
         Write { offset: u64, bytes: Vec<u8> },
@@ -8894,6 +9446,46 @@ mod tests {
             .attr
             .ino
             .into()
+    }
+
+    fn stored_inode_for_test(kind: StoredNodeKind, mode: u16, uid: u32, gid: u32) -> StoredInode {
+        let time = StoredTime {
+            seconds: 0,
+            nanoseconds: 0,
+        };
+        StoredInode {
+            kind,
+            mode,
+            uid,
+            gid,
+            size: 0,
+            nlink: 1,
+            rdev: 0,
+            atime: time,
+            mtime: time,
+            ctime: time,
+            crtime: time,
+            bkuptime: time,
+            flags: 0,
+            parent: INODE_ROOT,
+            name: b"test".to_vec(),
+            symlink_target: None,
+            content_manifest_identifier: None,
+        }
+    }
+
+    fn stored_extent_for_test(
+        logical_offset: u64,
+        length: u64,
+        chunk_offset: u64,
+        chunk_identifier: &[u8],
+    ) -> StoredExtent {
+        StoredExtent {
+            logical_offset,
+            length,
+            chunk_identifier: chunk_identifier.to_vec(),
+            chunk_offset,
+        }
     }
 
     fn assert_fuse_errno(error: FuseError, expected: fuser::Errno) {

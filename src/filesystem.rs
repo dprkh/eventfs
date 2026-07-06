@@ -1409,6 +1409,8 @@ impl FilesystemConfiguration {
     }
 }
 
+// Mounted FUSE callbacks are exercised by integration tests under tests/.
+#[cfg_attr(coverage_nightly, coverage(off))]
 impl fuser::Filesystem for Filesystem {
     fn init(
         &mut self,
@@ -2789,6 +2791,471 @@ mod tests {
         assert_eq!(errors.next(), None);
     }
 
+    #[test]
+    fn paged_record_iterators_advance_cursors_until_exhaustion() {
+        let requested_cursors = Arc::new(Mutex::new(Vec::new()));
+        let observed_cursors = Arc::clone(&requested_cursors);
+        let records = paged_records::<TestPage, u64, u64>(move |after| {
+            observed_cursors
+                .lock()
+                .expect("cursor log lock is available")
+                .push(after);
+            match after {
+                None => Ok(TestPage {
+                    records: vec![10, 11],
+                    next_after: Some(11),
+                }),
+                Some(11) => Ok(TestPage {
+                    records: vec![12],
+                    next_after: Some(12),
+                }),
+                Some(12) => Ok(TestPage {
+                    records: Vec::new(),
+                    next_after: Some(13),
+                }),
+                _ => Ok(TestPage {
+                    records: vec![99],
+                    next_after: None,
+                }),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .expect("paged records load");
+
+        assert_eq!(records, vec![10, 11, 12]);
+        assert_eq!(
+            *requested_cursors
+                .lock()
+                .expect("cursor log lock is available"),
+            vec![None, Some(11), Some(12)]
+        );
+    }
+
+    #[test]
+    fn page_scalar_branch_and_snapshot_accessors_return_expected_values() {
+        let sequence = EventSequence::new(42);
+        let file_identifier = FileIdentifier::new(7);
+        let branch_identifier = BranchIdentifier::new(3);
+        let branch_position = BranchPosition::new(branch_identifier, 9);
+        let branch_name = BranchName::new("accessors").expect("branch name is valid");
+        let branch = BranchRecord::new(
+            branch_identifier,
+            branch_name.clone(),
+            BranchStatus::Open,
+            branch_position,
+            sequence,
+        );
+
+        assert_eq!(sequence.get(), 42);
+        assert_eq!(file_identifier.get(), 7);
+        assert_eq!(branch_identifier.get(), 3);
+        assert_eq!(branch_name.as_str(), "accessors");
+        assert_eq!(branch_position.branch_identifier(), branch_identifier);
+        assert_eq!(branch_position.ordinal(), 9);
+        assert_eq!(branch.branch_identifier(), branch_identifier);
+        assert_eq!(branch.name(), &branch_name);
+        assert_eq!(branch.status(), BranchStatus::Open);
+        assert_eq!(branch.head_position(), branch_position);
+        assert_eq!(branch.head_sequence(), sequence);
+
+        let branch_page = BranchPage::new(vec![branch.clone()], Some(branch_identifier));
+        assert_eq!(branch_page.records(), std::slice::from_ref(&branch));
+        assert_eq!(branch_page.next_after(), Some(branch_identifier));
+        assert_eq!(branch_page.into_records(), vec![branch]);
+
+        let snapshot = FileSnapshot::new(file_identifier, sequence, branch_position, 1024);
+        assert_eq!(snapshot.file_identifier(), file_identifier);
+        assert_eq!(snapshot.sequence(), sequence);
+        assert_eq!(snapshot.branch_position(), branch_position);
+        assert_eq!(snapshot.file_size(), 1024);
+    }
+
+    #[test]
+    fn event_page_and_record_accessors_cover_payload_variants_and_debug_equality() {
+        let created_at = UtcDateTime::now();
+        let branch_identifier = BranchIdentifier::new(5);
+        let branch_position = BranchPosition::new(branch_identifier, 8);
+        let first_parent = EventSequence::new(40);
+        let base = EventRecord::new(
+            EventSequence::new(41),
+            EventKind::FileWritten,
+            created_at,
+            Some(FileIdentifier::new(10)),
+            Some("/primary".to_owned()),
+            Some(3),
+            Some(4),
+        )
+        .with_secondary_file(FileIdentifier::new(11), Some("/secondary".to_owned()))
+        .with_branch(branch_identifier, branch_position, first_parent);
+
+        assert_eq!(base.sequence(), EventSequence::new(41));
+        assert_eq!(base.kind(), EventKind::FileWritten);
+        assert_eq!(base.created_at(), created_at);
+        assert_eq!(base.file_identifier(), Some(FileIdentifier::new(10)));
+        assert_eq!(
+            base.secondary_file_identifier(),
+            Some(FileIdentifier::new(11))
+        );
+        assert_eq!(base.branch_identifier(), Some(branch_identifier));
+        assert_eq!(base.branch_position(), Some(branch_position));
+        assert_eq!(base.first_parent_sequence(), Some(first_parent));
+        assert_eq!(base.path(), Some("/primary"));
+        assert_eq!(base.secondary_path(), Some("/secondary"));
+        assert_eq!(base.offset(), Some(3));
+        assert_eq!(base.byte_length(), Some(4));
+        assert_eq!(base.old_file_size(), None);
+        assert_eq!(base.new_file_size(), None);
+        assert_eq!(base.overwritten_byte_length(), None);
+        assert_eq!(base.written_byte_length(), None);
+        assert_eq!(base.removed_byte_length(), None);
+
+        let write = base.clone().with_payload(EventPayload::FileWrite {
+            old_file_size: 10,
+            new_file_size: 14,
+            overwritten_byte_length: 2,
+            written_byte_length: 4,
+        });
+        assert_eq!(write.old_file_size(), Some(10));
+        assert_eq!(write.new_file_size(), Some(14));
+        assert_eq!(write.overwritten_byte_length(), Some(2));
+        assert_eq!(write.written_byte_length(), Some(4));
+        assert_eq!(write.removed_byte_length(), None);
+
+        let truncate = base.clone().with_payload(EventPayload::FileTruncate {
+            old_file_size: 14,
+            new_file_size: 9,
+            removed_byte_length: 5,
+        });
+        assert_eq!(truncate.old_file_size(), Some(14));
+        assert_eq!(truncate.new_file_size(), Some(9));
+        assert_eq!(truncate.overwritten_byte_length(), None);
+        assert_eq!(truncate.written_byte_length(), None);
+        assert_eq!(truncate.removed_byte_length(), Some(5));
+
+        for payload in [
+            EventPayload::FileSizeChange {
+                old_file_size: 9,
+                new_file_size: 20,
+            },
+            EventPayload::FileExchange {
+                primary_file_size: 20,
+                secondary_file_size: 30,
+            },
+        ] {
+            let event = base.clone().with_payload(payload);
+            assert_eq!(event.old_file_size(), None);
+            assert_eq!(event.new_file_size(), None);
+            assert_eq!(event.overwritten_byte_length(), None);
+            assert_eq!(event.written_byte_length(), None);
+            assert_eq!(event.removed_byte_length(), None);
+        }
+
+        assert_ne!(write, truncate, "payload participates in event equality");
+        let debug = format!("{write:?}");
+        assert!(debug.contains("EventRecord"));
+        assert!(!debug.contains("payload"));
+        assert!(!debug.contains("FileWrite"));
+
+        let event_page = EventPage::new(vec![write.clone()], Some(write.sequence()));
+        assert_eq!(event_page.records(), std::slice::from_ref(&write));
+        assert_eq!(event_page.next_after(), Some(write.sequence()));
+        assert_eq!(event_page.into_records(), vec![write.clone()]);
+
+        let branch_event_page = BranchEventPage::new(vec![write.clone()], Some(branch_position));
+        assert_eq!(branch_event_page.records(), std::slice::from_ref(&write));
+        assert_eq!(branch_event_page.next_after(), Some(branch_position));
+        assert_eq!(branch_event_page.into_records(), vec![write]);
+    }
+
+    #[test]
+    fn configuration_and_error_formatting_paths_are_stable() {
+        assert_eq!(
+            ConfigurationError::EmptyValue.to_string(),
+            "configuration value must not be empty"
+        );
+        assert_eq!(
+            ConfigurationError::ZeroValue.to_string(),
+            "configuration value must be non-zero"
+        );
+        assert_eq!(
+            FilesystemError::FilesystemOperation.to_string(),
+            "filesystem operation failed"
+        );
+        assert_eq!(
+            FilesystemError::Database.to_string(),
+            "database operation failed"
+        );
+        assert_eq!(
+            FilesystemError::Integrity.to_string(),
+            "integrity check failed"
+        );
+        assert_eq!(
+            FilesystemError::Backup.to_string(),
+            "backup operation failed"
+        );
+        assert_eq!(
+            FilesystemError::Import.to_string(),
+            "import operation failed"
+        );
+
+        let configuration = FilesystemConfiguration::new("database", "mount")
+            .expect("configuration is valid")
+            .with_session_access_control_list(SessionAccessControlList::RootAndOwner)
+            .with_mount_options([MountOption::Custom("debug".to_owned())]);
+        let cloned = configuration.clone();
+        assert_eq!(configuration, cloned);
+        let debug = format!("{configuration:?}");
+        assert!(debug.contains("RootAndOwner"));
+        assert!(debug.contains("fuse_error_callback: false"));
+
+        let callback_configuration = configuration.clone().with_fuse_error_callback(|_error| {});
+        assert_eq!(callback_configuration, callback_configuration.clone());
+        assert_ne!(callback_configuration, configuration);
+        assert!(format!("{callback_configuration:?}").contains("fuse_error_callback: true"));
+        assert_ne!(
+            callback_configuration,
+            cloned.with_fuse_error_callback(|_error| {})
+        );
+    }
+
+    #[test]
+    fn fuse_operation_error_accessors_and_callbacks_preserve_error_context() {
+        let error = new_fuse_operation_error("ioctl", fuser::Errno::EINVAL, true);
+        assert_eq!(error.operation(), "ioctl");
+        assert_eq!(error.errno(), fuser::Errno::EINVAL.code());
+        assert_eq!(
+            error.filesystem_error(),
+            FilesystemError::FilesystemOperation
+        );
+        assert!(error.is_unsupported());
+        assert_eq!(error, error);
+        assert!(format!("{error:?}").contains("unsupported: true"));
+
+        let (sender, receiver) = mpsc::channel();
+        let fixture =
+            TestFilesystem::new_with_configuration("fuse-error-callback", |configuration| {
+                configuration.with_fuse_error_callback(move |error| {
+                    sender.send(error).expect("callback error is sent");
+                })
+            });
+
+        let errno = fixture
+            .filesystem
+            .fuse_error("lookup", storage::FuseError::Errno(fuser::Errno::ENOENT));
+        assert_eq!(errno.code(), fuser::Errno::ENOENT.code());
+        let callback_error = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("callback receives fuse error");
+        assert_eq!(callback_error.operation(), "lookup");
+        assert_eq!(callback_error.errno(), fuser::Errno::ENOENT.code());
+        assert_eq!(
+            callback_error.filesystem_error(),
+            FilesystemError::FilesystemOperation
+        );
+        assert!(!callback_error.is_unsupported());
+
+        fixture
+            .filesystem
+            .notify_fuse_error("poll", fuser::Errno::ENOSYS, true);
+        let unsupported = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("callback receives unsupported fuse error");
+        assert_eq!(unsupported.operation(), "poll");
+        assert!(unsupported.is_unsupported());
+    }
+
+    #[test]
+    fn rename_and_lock_adapters_accept_supported_values_and_reject_unknown_values() {
+        assert_eq!(
+            rename_mode(fuser::RenameFlags::empty()).expect("empty rename flags are supported"),
+            false
+        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                rename_mode(fuser::RenameFlags::RENAME_NOREPLACE)
+                    .expect("noreplace rename flag is supported"),
+                true
+            );
+            assert_eq!(
+                rename_mode(fuser::RenameFlags::from_bits_retain(0x4000))
+                    .expect_err("unknown rename flags are rejected")
+                    .errno()
+                    .code(),
+                fuser::Errno::EINVAL.code()
+            );
+        }
+
+        assert_eq!(
+            lock_type(libc::F_RDLCK as i32).expect("read locks are accepted"),
+            libc::F_RDLCK as i32
+        );
+        assert_eq!(
+            lock_type(libc::F_WRLCK as i32).expect("write locks are accepted"),
+            libc::F_WRLCK as i32
+        );
+        assert_eq!(
+            lock_type(libc::F_UNLCK as i32).expect("unlock records are accepted"),
+            libc::F_UNLCK as i32
+        );
+        assert_eq!(
+            lock_type(999)
+                .expect_err("unknown lock types are rejected")
+                .errno()
+                .code(),
+            fuser::Errno::EINVAL.code()
+        );
+    }
+
+    #[test]
+    fn filesystem_public_listing_snapshot_payload_and_branch_methods_delegate_to_storage() {
+        let fixture = TestFilesystem::new("filesystem-public-delegates");
+        let filesystem = &fixture.filesystem;
+        let event_limit = EventPageLimit::new(2).expect("event limit is valid");
+        let branch_limit = BranchPageLimit::new(2).expect("branch limit is valid");
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+
+        let initial_event = filesystem
+            .get_event(EventSequence::new(0))
+            .expect("initial event lookup succeeds")
+            .expect("initial event exists");
+        assert_eq!(initial_event.kind(), EventKind::FilesystemInitialized);
+        let main = filesystem
+            .current_branch()
+            .expect("current branch is returned");
+        assert_eq!(main.name().as_str(), "main");
+        assert_eq!(
+            filesystem
+                .branches(branch_limit)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("branches iterator succeeds"),
+            filesystem
+                .list_branches(None, branch_limit)
+                .expect("branches are listed")
+                .into_records()
+        );
+
+        let created = filesystem
+            .storage()
+            .create_node(
+                1,
+                OsStr::new("delegated"),
+                0o644,
+                0,
+                storage::FuseCredentials { uid, gid },
+                storage::CreateNodeKind::RegularFile,
+            )
+            .expect("file is created through storage");
+        let inode_number: u64 = created.attr.ino.into();
+        filesystem
+            .storage()
+            .write_file(inode_number, 0, b"delegated bytes", uid, gid)
+            .expect("file is written through storage");
+        let write_sequence = filesystem
+            .storage()
+            .last_event_sequence()
+            .expect("last event sequence is readable");
+        let file_identifier = FileIdentifier::new(inode_number);
+
+        assert_eq!(
+            filesystem
+                .events(event_limit)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("events iterator succeeds"),
+            collect_all_filesystem_events(filesystem, event_limit)
+        );
+        assert_eq!(
+            filesystem
+                .file_events(file_identifier, event_limit)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("file events iterator succeeds"),
+            collect_all_filesystem_file_events(filesystem, file_identifier, event_limit)
+        );
+
+        let current = filesystem
+            .current_branch()
+            .expect("current branch after write is returned");
+        assert_eq!(
+            filesystem
+                .branch_events(current.branch_identifier(), event_limit)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("branch events iterator succeeds"),
+            collect_all_filesystem_branch_events(
+                filesystem,
+                current.branch_identifier(),
+                event_limit
+            )
+        );
+        assert_eq!(
+            filesystem
+                .branch_file_events(current.branch_identifier(), file_identifier, event_limit)
+                .collect::<Result<Vec<_>, _>>()
+                .expect("branch file events iterator succeeds"),
+            collect_all_filesystem_branch_file_events(
+                filesystem,
+                current.branch_identifier(),
+                file_identifier,
+                event_limit,
+            )
+        );
+        assert_eq!(
+            filesystem
+                .read_file_event_payload_range(
+                    write_sequence,
+                    FileEventPayloadPart::Written,
+                    10,
+                    5,
+                )
+                .expect("payload range is read"),
+            b"bytes"
+        );
+
+        let snapshot = filesystem
+            .file_snapshot_at_or_before(file_identifier, write_sequence)
+            .expect("active branch snapshot lookup succeeds")
+            .expect("active branch snapshot exists");
+        assert_eq!(
+            filesystem
+                .read_file_snapshot_range(&snapshot, 0, snapshot.file_size())
+                .expect("snapshot bytes are read"),
+            b"delegated bytes"
+        );
+        assert_eq!(
+            filesystem
+                .file_snapshot_on_branch_at_or_before(
+                    current.branch_identifier(),
+                    file_identifier,
+                    snapshot.branch_position(),
+                )
+                .expect("branch snapshot lookup succeeds"),
+            Some(snapshot)
+        );
+
+        let branch_name = BranchName::new("delegated-branch").expect("branch name is valid");
+        let branch = filesystem
+            .create_branch(&branch_name, current.head_position())
+            .expect("branch is created");
+        assert_eq!(branch.name(), &branch_name);
+        assert_eq!(
+            filesystem
+                .switch_branch(&branch_name)
+                .expect("branch switch succeeds")
+                .branch_identifier(),
+            branch.branch_identifier()
+        );
+        assert_eq!(
+            filesystem
+                .switch_branch(main.name())
+                .expect("main switch succeeds")
+                .branch_identifier(),
+            main.branch_identifier()
+        );
+        filesystem
+            .delete_branch(&branch_name)
+            .expect("inactive branch is deleted");
+    }
+
     #[cfg(feature = "tracing")]
     #[test]
     fn trace_fuse_operation_emits_trace_level_operation_event() {
@@ -2909,13 +3376,22 @@ mod tests {
 
     impl TestFilesystem {
         fn new(name: &str) -> Self {
+            Self::new_with_configuration(name, |configuration| configuration)
+        }
+
+        fn new_with_configuration(
+            name: &str,
+            configure: impl FnOnce(FilesystemConfiguration) -> FilesystemConfiguration,
+        ) -> Self {
             let root = TempDir::new().expect("temporary directory is created");
+            let mount_point = root.path().join(format!("{name}-mount"));
+            fs::create_dir(&mount_point).expect("mount point is created");
             let configuration = FilesystemConfiguration::new(
                 root.path().join(format!("{name}-database")),
-                root.path().join(format!("{name}-mount")),
+                mount_point,
             )
             .expect("configuration is valid");
-            let filesystem = Filesystem::open(configuration).expect("filesystem opens");
+            let filesystem = Filesystem::open(configure(configuration)).expect("filesystem opens");
             Self {
                 _root: root,
                 filesystem,
@@ -2931,6 +3407,82 @@ mod tests {
             end,
             typ,
             pid: owner as u32,
+        }
+    }
+
+    fn collect_all_filesystem_events(
+        filesystem: &Filesystem,
+        limit: EventPageLimit,
+    ) -> Vec<EventRecord> {
+        let mut records = Vec::new();
+        let mut after = None;
+        loop {
+            let page = filesystem
+                .list_events(after, limit)
+                .expect("event page is readable");
+            records.extend(page.records().iter().cloned());
+            match page.next_after() {
+                Some(next_after) => after = Some(next_after),
+                None => return records,
+            }
+        }
+    }
+
+    fn collect_all_filesystem_file_events(
+        filesystem: &Filesystem,
+        file_identifier: FileIdentifier,
+        limit: EventPageLimit,
+    ) -> Vec<EventRecord> {
+        let mut records = Vec::new();
+        let mut after = None;
+        loop {
+            let page = filesystem
+                .list_file_events(file_identifier, after, limit)
+                .expect("file event page is readable");
+            records.extend(page.records().iter().cloned());
+            match page.next_after() {
+                Some(next_after) => after = Some(next_after),
+                None => return records,
+            }
+        }
+    }
+
+    fn collect_all_filesystem_branch_events(
+        filesystem: &Filesystem,
+        branch: BranchIdentifier,
+        limit: EventPageLimit,
+    ) -> Vec<EventRecord> {
+        let mut records = Vec::new();
+        let mut after = None;
+        loop {
+            let page = filesystem
+                .list_branch_events(branch, after, limit)
+                .expect("branch event page is readable");
+            records.extend(page.records().iter().cloned());
+            match page.next_after() {
+                Some(next_after) => after = Some(next_after),
+                None => return records,
+            }
+        }
+    }
+
+    fn collect_all_filesystem_branch_file_events(
+        filesystem: &Filesystem,
+        branch: BranchIdentifier,
+        file_identifier: FileIdentifier,
+        limit: EventPageLimit,
+    ) -> Vec<EventRecord> {
+        let mut records = Vec::new();
+        let mut after = None;
+        loop {
+            let page = filesystem
+                .list_branch_file_events(branch, file_identifier, after, limit)
+                .expect("branch file event page is readable");
+            records.extend(page.records().iter().cloned());
+            match page.next_after() {
+                Some(next_after) => after = Some(next_after),
+                None => return records,
+            }
         }
     }
 }

@@ -1,15 +1,17 @@
 #![allow(dead_code)]
 
 use std::ffi::CString;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::{Arc, Mutex};
 
 use eventfs::{
     BackupDirectory, BranchIdentifier, BranchPageLimit, EventKind, EventPageLimit, EventRecord,
-    FileIdentifier, FileSnapshot, Filesystem, FilesystemConfiguration, MountedFilesystem,
+    FileIdentifier, FileSnapshot, Filesystem, FilesystemConfiguration, FilesystemError,
+    FuseOperationError, MountedFilesystem,
 };
 use tempfile::TempDir;
 
@@ -84,12 +86,38 @@ pub fn open_test_filesystem(directories: &TestDirectories) -> Filesystem {
     Filesystem::open(directories.configuration()).expect("filesystem opens")
 }
 
+pub fn filesystem_with_fuse_error_callback(
+    directories: &TestDirectories,
+    errors: &Arc<Mutex<Vec<FuseOperationError>>>,
+) -> Filesystem {
+    let errors = Arc::clone(errors);
+    let configuration = directories
+        .configuration()
+        .with_fuse_error_callback(move |error| {
+            errors
+                .lock()
+                .expect("callback error collection lock is available")
+                .push(error);
+        });
+    Filesystem::open(configuration).expect("filesystem opens")
+}
+
 pub fn mount(filesystem: &Filesystem) -> MountedGuard {
     MountedGuard(Some(
         filesystem
             .spawn_mount()
             .expect("filesystem mounts in the background"),
     ))
+}
+
+pub fn create_empty_file(path: &Path) {
+    drop(
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .expect("empty file is created"),
+    );
 }
 
 pub fn event_page_limit(value: u64) -> EventPageLimit {
@@ -105,6 +133,45 @@ pub fn list_all_events(filesystem: &Filesystem) -> Vec<EventRecord> {
         .events(event_page_limit(100))
         .collect::<Result<Vec<_>, _>>()
         .expect("events are listed")
+}
+
+pub fn event_count(filesystem: &Filesystem) -> usize {
+    list_all_events(filesystem).len()
+}
+
+pub fn events_after(filesystem: &Filesystem, count: usize) -> Vec<EventRecord> {
+    list_all_events(filesystem)
+        .into_iter()
+        .skip(count)
+        .collect()
+}
+
+pub fn expect_no_events(events: &mut usize, filesystem: &Filesystem, message: &str) {
+    assert_eq!(event_count(filesystem), *events, "{message}");
+}
+
+pub fn expect_event_count_delta(
+    events: &mut usize,
+    filesystem: &Filesystem,
+    delta: usize,
+    message: &str,
+) -> Vec<EventRecord> {
+    let new_events = events_after(filesystem, *events);
+    assert_eq!(new_events.len(), delta, "{message}");
+    *events += delta;
+    new_events
+}
+
+pub fn expect_event_kinds(
+    events: &mut usize,
+    filesystem: &Filesystem,
+    expected: &[EventKind],
+    message: &str,
+) -> Vec<EventRecord> {
+    let new_events = expect_event_count_delta(events, filesystem, expected.len(), message);
+    let actual = new_events.iter().map(EventRecord::kind).collect::<Vec<_>>();
+    assert_eq!(actual, expected, "{message}");
+    new_events
 }
 
 pub fn list_all_file_events(
@@ -144,6 +211,15 @@ pub fn read_snapshot_bytes(filesystem: &Filesystem, snapshot: &FileSnapshot) -> 
         .expect("snapshot bytes are read")
 }
 
+pub fn recorded_callback_errors(
+    errors: &Arc<Mutex<Vec<FuseOperationError>>>,
+) -> Vec<FuseOperationError> {
+    errors
+        .lock()
+        .expect("callback error collection lock is available")
+        .clone()
+}
+
 pub fn file_identifier_for_path(filesystem: &Filesystem, path: &str) -> FileIdentifier {
     list_all_events(filesystem)
         .into_iter()
@@ -179,6 +255,23 @@ pub fn assert_branch_positions_increase(events: &[EventRecord]) {
             "branch positions increase"
         );
     }
+}
+
+pub fn assert_callback_errors_include(
+    errors: &[FuseOperationError],
+    operation: &'static str,
+    errno: i32,
+    unsupported: bool,
+) {
+    assert!(
+        errors.iter().any(|error| {
+            error.operation() == operation
+                && error.errno() == errno
+                && error.filesystem_error() == FilesystemError::FilesystemOperation
+                && error.is_unsupported() == unsupported
+        }),
+        "callback errors include operation {operation} with errno {errno}: {errors:?}"
+    );
 }
 
 pub fn mkfifo(path: &Path) {

@@ -585,10 +585,11 @@ Storage requirements:
 Acceptance test requirements:
 
 - Tests MUST NOT assert the complete public API inventory.
-- End-to-end tests MUST cover only user-facing flows.
-- End-to-end tests MUST cover every new and existing code path reachable through public library APIs, mounted FUSE operations, or documented operational workflows.
+- End-to-end tests under `tests/` MUST contain only realistic user-facing use cases and edge cases.
+- End-to-end tests under `tests/` MUST comprehensively cover every FUSE operation defined in this specification.
 - End-to-end tests MUST NOT assert private dependencies, private storage encodings, or other internal implementation details.
-- Internal behavior MUST be tested below end-to-end boundaries.
+- Unit tests located inside Rust source files MUST test internal behavior below end-to-end boundaries.
+- Unit tests located inside Rust source files MUST maintain at least 95% test coverage as measured by `llvm-conv`.
 - Longer FUSE stress, crash/fault-injection, and concurrency/load tests MUST use bounded deterministic workloads in the default test suite.
 
 Implementations MUST include automated tests for:
