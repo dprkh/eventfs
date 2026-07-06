@@ -34,48 +34,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 # FUSE operation support
 
-| Operation | Supported |
-| --- | --- |
-| `lookup` | [x] |
-| `getattr` | [x] |
-| `setattr` | [ ] |
-| `readlink` | [x] |
-| `mknod` | [x] |
-| `mkdir` | [x] |
-| `unlink` | [x] |
-| `rmdir` | [x] |
-| `symlink` | [x] |
-| `rename` | [x] |
-| `link` | [x] |
-| `open` | [x] |
-| `read` | [x] |
-| `write` | [x] |
-| `flush` | [x] |
-| `release` | [x] |
-| `fsync` | [x] |
-| `opendir` | [x] |
-| `readdir` | [x] |
-| `releasedir` | [x] |
-| `fsyncdir` | [x] |
-| `statfs` | [x] |
-| `setxattr` | [x] |
-| `getxattr` | [x] |
-| `listxattr` | [x] |
-| `removexattr` | [x] |
-| `access` | [x] |
-| `create` | [x] |
-| `readdirplus` | [x] |
-| `getlk` | [x] |
-| `setlk` | [x] |
-| `bmap` | [x] |
-| `ioctl` | [x] |
-| `poll` | [x] |
-| `fallocate` | [x] |
-| `lseek` | [x] |
-| `copy_file_range` | [x] |
-| `setvolname` | [x] |
-| `exchange` | [x] |
-| `getxtimes` | [x] |
+- [x] `lookup`
+- [x] `getattr`
+- [ ] `setattr`
+- [x] `readlink`
+- [x] `mknod`
+- [x] `mkdir`
+- [x] `unlink`
+- [x] `rmdir`
+- [x] `symlink`
+- [x] `rename`
+- [x] `link`
+- [x] `open`
+- [x] `read`
+- [x] `write`
+- [x] `flush`
+- [x] `release`
+- [x] `fsync`
+- [x] `opendir`
+- [x] `readdir`
+- [x] `releasedir`
+- [x] `fsyncdir`
+- [x] `statfs`
+- [x] `setxattr`
+- [x] `getxattr`
+- [x] `listxattr`
+- [x] `removexattr`
+- [x] `access`
+- [x] `create`
+- [x] `readdirplus`
+- [x] `getlk`
+- [x] `setlk`
+- [x] `bmap`
+- [x] `ioctl`
+- [x] `poll`
+- [x] `fallocate`
+- [x] `lseek`
+- [x] `copy_file_range`
+- [x] `setvolname`
+- [x] `exchange`
+- [x] `getxtimes`
 
 # Benchmarks
 
