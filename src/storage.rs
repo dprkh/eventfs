@@ -553,6 +553,13 @@ enum EventPayloadExtents {
     },
 }
 
+#[derive(Clone, Debug)]
+struct CommitEventPayloads<'a> {
+    event_payload_extents: EventPayloadExtents,
+    snapshot_extents: Option<&'a [StoredExtent]>,
+    snapshot_content_manifest_identifier: Option<&'a [u8]>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
 struct MaterializedBranchState {
     inodes: BTreeMap<u64, StoredInode>,
@@ -662,6 +669,32 @@ impl StoredMutation {
     }
 }
 
+impl<'a> CommitEventPayloads<'a> {
+    fn none() -> Self {
+        Self {
+            event_payload_extents: EventPayloadExtents::None,
+            snapshot_extents: None,
+            snapshot_content_manifest_identifier: None,
+        }
+    }
+
+    fn file_write(
+        overwritten_extents: Vec<StoredExtent>,
+        written_extents: Vec<StoredExtent>,
+        snapshot_extents: &'a [StoredExtent],
+        snapshot_content_manifest_identifier: &'a [u8],
+    ) -> Self {
+        Self {
+            event_payload_extents: EventPayloadExtents::FileWrite {
+                overwritten_extents,
+                written_extents,
+            },
+            snapshot_extents: Some(snapshot_extents),
+            snapshot_content_manifest_identifier: Some(snapshot_content_manifest_identifier),
+        }
+    }
+}
+
 impl MaterializedBranchState {
     fn apply(&mut self, mutation: &StoredMutation) {
         for inode_number in &mutation.inode_deletes {
@@ -696,11 +729,7 @@ fn namespace_inode_after_mutation<'a>(
     mutation: &'a StoredMutation,
     inode_number: u64,
 ) -> Option<&'a StoredInode> {
-    if mutation
-        .inode_deletes
-        .iter()
-        .any(|deleted| *deleted == inode_number)
-    {
+    if mutation.inode_deletes.contains(&inode_number) {
         return None;
     }
     mutation
@@ -1933,12 +1962,12 @@ impl Storage {
             &active_state,
             event_sequence,
             &event,
-            EventPayloadExtents::FileWrite {
+            CommitEventPayloads::file_write(
                 overwritten_extents,
-                written_extents: written_payload_extents,
-            },
-            Some(&final_extents),
-            Some(&content_manifest_identifier),
+                written_payload_extents,
+                &final_extents,
+                &content_manifest_identifier,
+            ),
             mutation,
         )?;
         self.commit_mutation(
@@ -2404,12 +2433,12 @@ impl Storage {
             &active_state,
             event_sequence,
             &event,
-            EventPayloadExtents::FileWrite {
+            CommitEventPayloads::file_write(
                 overwritten_extents,
-                written_extents: Vec::new(),
-            },
-            Some(&final_extents),
-            Some(&content_manifest_identifier),
+                Vec::new(),
+                &final_extents,
+                &content_manifest_identifier,
+            ),
             mutation,
         )?;
         self.commit_mutation(
@@ -2987,9 +3016,7 @@ impl Storage {
             active_state,
             event_sequence,
             event,
-            EventPayloadExtents::None,
-            None,
-            None,
+            CommitEventPayloads::none(),
             mutation,
         )
     }
@@ -3000,11 +3027,14 @@ impl Storage {
         active_state: &ActiveBranchState,
         event_sequence: EventSequence,
         event: &EventRecord,
-        payload_extents: EventPayloadExtents,
-        snapshot_extents: Option<&[StoredExtent]>,
-        snapshot_content_manifest_identifier: Option<&[u8]>,
+        payloads: CommitEventPayloads<'_>,
         mutation: StoredMutation,
     ) -> FuseResult<ActiveBranchCommit> {
+        let CommitEventPayloads {
+            event_payload_extents,
+            snapshot_extents,
+            snapshot_content_manifest_identifier,
+        } = payloads;
         let events = self.events().map_err(|_| FuseError::Integrity)?;
         let metadata = self.metadata().map_err(|_| FuseError::Integrity)?;
         let branches = self.branches().map_err(|_| FuseError::Integrity)?;
@@ -3047,7 +3077,7 @@ impl Storage {
             encode_u64(branch_identifier.get()),
             encode_branch(&branch).map_err(|_| FuseError::Database)?,
         );
-        self.put_event_payloads(batch, event_sequence, &event, payload_extents)?;
+        self.put_event_payloads(batch, event_sequence, &event, event_payload_extents)?;
         self.put_file_event_index(batch, event_sequence, &event)?;
         self.put_branch_event_index(batch, event_sequence, branch_position)?;
         self.put_branch_file_event_index(batch, event_sequence, &event)?;
@@ -3874,7 +3904,11 @@ fn migrate_database_to_current_schema(
         &required_column_family_names_for_schema(schema_version)?,
     )?;
 
-    while schema_version < STORAGE_SCHEMA_VERSION_CURRENT {
+    loop {
+        if schema_version == STORAGE_SCHEMA_VERSION_CURRENT {
+            break;
+        }
+
         let migration = storage_schema_migration(schema_version)?;
         create_column_families_for_schema(database, migration.target_version, block_cache)?;
 
@@ -3906,7 +3940,7 @@ fn storage_schema_migration(
         .find(|migration| migration.source_version == schema_version)
         .filter(|migration| {
             migration.target_version > migration.source_version
-                && migration.target_version <= STORAGE_SCHEMA_VERSION_CURRENT
+                && validate_supported_storage_schema_version(migration.target_version).is_ok()
         })
         .ok_or(FilesystemError::Integrity)
 }
@@ -4411,7 +4445,15 @@ fn put_namespace_map_mutations(
         identifier = match mutation {
             NamespaceMapMutation::Put { key, value } => {
                 let path = namespace_map_entry_path(kind, &key);
-                put_namespace_map_entry_at(database, batch, kind, &identifier, key, value, path, 0)?
+                put_namespace_map_entry_at(
+                    database,
+                    batch,
+                    kind,
+                    &identifier,
+                    StoredNamespaceEntry { key, value },
+                    path,
+                    0,
+                )?
             }
             NamespaceMapMutation::Delete { key } => {
                 let path = namespace_map_entry_path(kind, &key);
@@ -4512,17 +4554,18 @@ fn put_namespace_map_entry_at(
     batch: &mut WriteBatch,
     kind: NamespaceMapKind,
     node_identifier: &[u8],
-    key: Vec<u8>,
-    value: Vec<u8>,
+    entry: StoredNamespaceEntry,
     path: [u8; 32],
     depth: usize,
 ) -> Result<Vec<u8>, FilesystemError> {
     match namespace_node_in_database(database, node_identifier)? {
         StoredNamespaceNode::Leaf(mut entries) => {
             validate_namespace_entries(&entries)?;
-            match entries.binary_search_by(|entry| entry.key.as_slice().cmp(key.as_slice())) {
-                Ok(index) => entries[index].value = value,
-                Err(index) => entries.insert(index, StoredNamespaceEntry { key, value }),
+            match entries
+                .binary_search_by(|existing| existing.key.as_slice().cmp(entry.key.as_slice()))
+            {
+                Ok(index) => entries[index].value = entry.value,
+                Err(index) => entries.insert(index, entry),
             }
             put_namespace_map_entries_at(database, batch, kind, entries, depth)
         }
@@ -4536,8 +4579,7 @@ fn put_namespace_map_entry_at(
                         batch,
                         kind,
                         &children[index].identifier,
-                        key,
-                        value,
+                        entry,
                         path,
                         depth + 1,
                     )?;
@@ -4548,7 +4590,7 @@ fn put_namespace_map_entry_at(
                         database,
                         batch,
                         kind,
-                        vec![StoredNamespaceEntry { key, value }],
+                        vec![entry],
                         depth + 1,
                     )?;
                     children.insert(
