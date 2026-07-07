@@ -1,22 +1,26 @@
 use std::ffi::CString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+use std::os::raw::c_int;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use criterion::measurement::WallTime;
+use criterion::profiler::Profiler;
 use criterion::{BenchmarkGroup, BenchmarkId, Criterion};
 use eventfs::{Filesystem, FilesystemConfiguration, MountedFilesystem};
+use pprof::{ProfilerGuard, ProfilerGuardBuilder};
 use tempfile::TempDir;
 
 const BENCHMARK_SAMPLE_SIZE: usize = 10;
 const BENCHMARK_WARM_UP_MS: u64 = 50;
 const BENCHMARK_MEASUREMENT_MS: u64 = 200;
+const BENCHMARK_PROFILE_FREQUENCY: c_int = 997;
 const BENCHMARK_BLOCK_SIZE: usize = 4096;
 const BENCHMARK_DIRECTORY_ENTRY_COUNT: usize = 16;
 const BENCHMARK_XATTR_VALUE: &[u8] = b"value";
@@ -26,6 +30,7 @@ pub(crate) fn criterion_configuration() -> Criterion {
         .sample_size(BENCHMARK_SAMPLE_SIZE)
         .warm_up_time(Duration::from_millis(BENCHMARK_WARM_UP_MS))
         .measurement_time(Duration::from_millis(BENCHMARK_MEASUREMENT_MS))
+        .with_profiler(FuseBenchmarkProfiler::new(BENCHMARK_PROFILE_FREQUENCY))
 }
 
 pub(crate) fn bench_fuse_operations(criterion: &mut Criterion) {
@@ -81,6 +86,53 @@ impl Drop for FuseBenchmarkFixture {
             let _ = mounted.unmount();
         }
         let _ = self.root.path();
+    }
+}
+
+struct FuseBenchmarkProfiler {
+    frequency: c_int,
+    active: Option<ProfilerGuard<'static>>,
+}
+
+impl FuseBenchmarkProfiler {
+    fn new(frequency: c_int) -> Self {
+        Self {
+            frequency,
+            active: None,
+        }
+    }
+}
+
+impl Profiler for FuseBenchmarkProfiler {
+    fn start_profiling(&mut self, _benchmark_id: &str, _benchmark_dir: &Path) {
+        self.active = Some(
+            ProfilerGuardBuilder::default()
+                .frequency(self.frequency)
+                .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+                .build()
+                .expect("pprof profiler starts"),
+        );
+    }
+
+    fn stop_profiling(&mut self, benchmark_id: &str, benchmark_dir: &Path) {
+        let Some(profiler) = self.active.take() else {
+            return;
+        };
+        fs::create_dir_all(benchmark_dir).expect("benchmark profile directory is created");
+
+        let report = profiler.report().build().expect("pprof report is built");
+        let mut flamegraph =
+            File::create(benchmark_dir.join("flamegraph.svg")).unwrap_or_else(|error| {
+                panic!("flamegraph for {benchmark_id} is created: {error}")
+            });
+        report
+            .flamegraph(&mut flamegraph)
+            .unwrap_or_else(|error| panic!("flamegraph for {benchmark_id} is written: {error}"));
+
+        let mut stacks = File::create(benchmark_dir.join("stacks.txt"))
+            .unwrap_or_else(|error| panic!("stack report for {benchmark_id} is created: {error}"));
+        write!(stacks, "{report:?}")
+            .unwrap_or_else(|error| panic!("stack report for {benchmark_id} is written: {error}"));
     }
 }
 

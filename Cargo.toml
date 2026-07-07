@@ -29,6 +29,11 @@ tracing = { version = "0.1", optional = true }
 [dev-dependencies]
 anyhow = "1.0"
 criterion = "0.8.2"
+pprof = { version = "0.15", features = ["flamegraph"] }
+
+[profile.bench]
+debug = "line-tables-only"
+strip = "none"
 
 [[bench]]
 name = "fuse_operations"

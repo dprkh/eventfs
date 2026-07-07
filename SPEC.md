@@ -501,9 +501,8 @@ Storage requirements:
 - New non-root inodes MUST be owned by the FUSE request user, MUST use the FUSE request group unless parent-directory setgid inheritance applies, and MUST apply the request umask to the requested permission mode.
 - New symbolic links MUST use permission mode `0777`.
 - `Filesystem::open` MUST create a missing database and required column families for a new database directory.
-- Storage schema version `11` MUST be the first supported storage schema compatibility baseline.
+- Storage schema version `0` MUST be the first supported storage schema compatibility baseline.
 - `Filesystem::open` MUST reject existing databases missing metadata required by their stored schema version.
-- `Filesystem::open` MUST reject storage schema versions older than `11`.
 - `Filesystem::open` MUST reject storage schema versions newer than the compiled current storage schema version before mutating storage.
 - `Filesystem::open` MUST automatically migrate compatible released storage schema versions to the compiled current storage schema version before returning.
 - Storage schema migrations MUST run in storage schema version order.
@@ -593,9 +592,8 @@ Implementations MUST include automated tests for:
 - Local backup creates increasing non-zero BackupEngine backup identifiers in a persistent backup directory.
 - Local import verifies a requested BackupEngine backup, replaces existing target data, and opens and migrates the imported database before success.
 - Local backup and import reject overlapping source, backup, and target directories after path normalization.
-- Opening storage schema version `11` succeeds and preserves public filesystem behavior.
+- Opening storage schema version `0` succeeds and preserves public filesystem behavior.
 - Opening every compatible released storage schema version migrates it to the current storage schema version.
-- Opening storage schema version `10` and older storage schema versions fail without mutation.
 - Opening storage schema versions newer than the compiled current storage schema version fails without mutation.
 - Interrupted storage schema migrations either resume migration on reopen or leave a valid compatible released schema.
 - Opening a compatible released database with missing column families introduced after its stored schema version creates those column families during migration.

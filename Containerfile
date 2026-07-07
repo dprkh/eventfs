@@ -22,6 +22,7 @@ RUN apt-get update \
         fuse3 \
         libclang-dev \
         libfuse3-dev \
+        linux-perf \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 

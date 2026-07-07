@@ -26,6 +26,7 @@ use crate::filesystem::{
 pub(crate) struct Storage {
     database: DB,
     write_state: Mutex<WriteState>,
+    active_branch_state: Mutex<ActiveBranchState>,
     active_branch_identifier: AtomicU64,
 }
 
@@ -161,22 +162,32 @@ pub(crate) fn open_database_path(path: &Path) -> Result<Storage, FilesystemError
         database
     };
     let write_state = load_write_state(&database)?;
-    Ok(storage(database, write_state))
+    let active_branch =
+        stored_branch_in_database(&database, BranchIdentifier::new(write_state.active_branch_identifier))?;
+    let active_namespace =
+        namespace_state_for_identifier_in_database(&database, &active_branch.namespace_identifier)?;
+    Ok(storage(database, write_state, active_branch, active_namespace))
 }
 
-fn storage(database: DB, write_state: WriteState) -> Storage {
+fn storage(
+    database: DB,
+    write_state: WriteState,
+    active_branch: StoredBranch,
+    active_namespace: MaterializedBranchState,
+) -> Storage {
     let active_branch_identifier = write_state.active_branch_identifier;
     Storage {
         database,
         write_state: Mutex::new(write_state),
+        active_branch_state: Mutex::new(ActiveBranchState::new(active_branch, active_namespace)),
         active_branch_identifier: AtomicU64::new(active_branch_identifier),
     }
 }
 
 type FuseResult<T> = Result<T, FuseError>;
 
-const STORAGE_SCHEMA_VERSION_BASELINE: u64 = 11;
-const STORAGE_SCHEMA_VERSION_CURRENT: u64 = 11;
+const STORAGE_SCHEMA_VERSION_BASELINE: u64 = 0;
+const STORAGE_SCHEMA_VERSION_CURRENT: u64 = 0;
 
 const EVENT_SEQUENCE_INITIAL: EventSequence = EventSequence::new(0);
 const BRANCH_IDENTIFIER_INITIAL: BranchIdentifier = BranchIdentifier::new(1);
@@ -282,6 +293,20 @@ struct WriteState {
 enum WriteDurability {
     Buffered,
     Synchronous,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveBranchState {
+    branch: StoredBranch,
+    namespace: MaterializedBranchState,
+    file_extents: BTreeMap<u64, Vec<StoredExtent>>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveBranchCommit {
+    branch: StoredBranch,
+    namespace: MaterializedBranchState,
+    file_extents: Option<(FileIdentifier, Vec<StoredExtent>)>,
 }
 
 impl WriteState {
@@ -4951,7 +4976,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_schema_version_11_is_current_and_10_is_rejected() {
+    fn storage_schema_version_0_is_current_and_1_is_rejected() {
         let temporary = tempfile::tempdir().expect("temporary directory is created");
         let database = temporary.path().join("database");
         let storage = open_database_path(&database).expect("storage opens");
@@ -4968,9 +4993,9 @@ mod tests {
         batch.put_cf(
             metadata,
             METADATA_KEY_STORAGE_SCHEMA_VERSION,
-            encode_u64(10),
+            encode_u64(1),
         );
-        write_batch(storage.database(), batch).expect("old schema version is written");
+        write_batch(storage.database(), batch).expect("newer schema version is written");
         drop(storage);
 
         assert!(matches!(
