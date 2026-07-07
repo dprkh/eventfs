@@ -22,8 +22,6 @@ RUN apt-get update \
         fuse3 \
         libclang-dev \
         libfuse3-dev \
-        openssh-client \
-        openssh-sftp-server \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 

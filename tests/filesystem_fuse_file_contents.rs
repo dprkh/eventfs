@@ -157,7 +157,7 @@ fn mounted_file_read_write_and_eof_edges_project_contents() {
 }
 
 #[test]
-fn mounted_open_truncate_and_append_flags_match_sftp_expectations() {
+fn mounted_open_truncate_and_append_flags_match_client_expectations() {
     let directories = TestDirectories::new();
     let filesystem = open_test_filesystem(&directories);
     let _mounted = mount(&filesystem);

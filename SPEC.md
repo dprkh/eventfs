@@ -618,7 +618,7 @@ Implementations MUST include automated tests for:
 - Event debug formatting does not expose stored file payload bytes.
 - Every supported FUSE operation works through the mounted filesystem.
 - Extended attributes, metadata changes, and file size changes work through the mounted filesystem.
-- Linux OpenSSH SFTP upload, overwrite upload, metadata-preserving upload, download, directory, rename, remove, hard link, symbolic link, filesystem-statistics, and fsync workflows work through the mounted filesystem.
+- Mounted client-style upload, overwrite upload, metadata-preserving upload, download, directory, rename, remove, hard link, symbolic link, symbolic link read, filesystem-statistics, and fsync workflows work through the mounted filesystem.
 - POSIX byte-range locks, block mapping, ioctl, poll, space allocation, sparse seek, and file-range copy fail as unsupported mounted filesystem operations.
 - Mutating supported FUSE operations append exactly the specified event kinds, and supported read-only or no-op operations append none.
 - Configured FUSE error callbacks receive failed supported operation errors and unsupported operation errors with the returned errno.
