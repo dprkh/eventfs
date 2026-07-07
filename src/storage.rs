@@ -95,6 +95,9 @@ pub(crate) struct SetattrMetadata {
     pub(crate) mode: Option<u32>,
     pub(crate) uid: Option<u32>,
     pub(crate) gid: Option<u32>,
+    pub(crate) size: Option<u64>,
+    pub(crate) atime: Option<SystemTime>,
+    pub(crate) mtime: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug)]
@@ -1097,6 +1100,7 @@ impl Storage {
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
         validate_metadata_change(&inode, metadata)?;
 
+        let now = StoredTime::now();
         let original_inode = inode.clone();
         if let Some(mode) = metadata.mode {
             inode.mode = permission_mode(mode, 0);
@@ -1110,6 +1114,36 @@ impl Storage {
         if metadata.uid.is_some() || metadata.gid.is_some() {
             inode.mode &= !(setuid_mode_bit() | setgid_mode_bit());
         }
+        if let Some(atime) = metadata.atime {
+            inode.atime = StoredTime::from_system_time(atime);
+        }
+        if let Some(mtime) = metadata.mtime {
+            inode.mtime = StoredTime::from_system_time(mtime);
+        }
+
+        let size_changed = metadata
+            .size
+            .is_some_and(|size| size != original_inode.size);
+        if size_changed {
+            if inode.kind != StoredNodeKind::RegularFile {
+                return Err(FuseError::Errno(fuser::Errno::EINVAL));
+            }
+            inode.size = original_inode.size;
+            inode.content_manifest_identifier = original_inode.content_manifest_identifier.clone();
+            if metadata.mtime.is_none() {
+                inode.mtime = now;
+            }
+            inode.ctime = now;
+            return self.commit_file_size_change(
+                &mut write_state,
+                inode_number,
+                inode,
+                metadata
+                    .size
+                    .expect("size changed only when size is present"),
+            );
+        }
+
         if inode == original_inode {
             return Ok(EntrySnapshot {
                 ttl: FUSE_ATTRIBUTE_TTL,
@@ -1118,7 +1152,6 @@ impl Storage {
         }
 
         let event_sequence = write_state.next_event_sequence()?;
-        let now = StoredTime::now();
         inode.ctime = now;
         let mut batch = WriteBatch::default();
         let mut mutation = StoredMutation::default();
@@ -1607,13 +1640,20 @@ impl Storage {
         })
     }
 
-    pub(crate) fn open_file(&self, inode_number: u64) -> FuseResult<()> {
-        let inode = self
+    pub(crate) fn open_file(&self, inode_number: u64, truncate: bool) -> FuseResult<()> {
+        let mut write_state = self.lock_write_state()?;
+        let mut inode = self
             .inode(inode_number)
             .map_err(to_fuse_integrity)?
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
         if inode.kind != StoredNodeKind::RegularFile {
             return Err(FuseError::Errno(fuser::Errno::EISDIR));
+        }
+        if truncate && inode.size != 0 {
+            let now = StoredTime::now();
+            inode.mtime = now;
+            inode.ctime = now;
+            self.commit_file_size_change(&mut write_state, inode_number, inode, 0)?;
         }
         Ok(())
     }
@@ -1655,7 +1695,7 @@ impl Storage {
         offset: u64,
         data: &[u8],
     ) -> FuseResult<FuseWrite> {
-        self.write_file_with_metadata(inode_number, offset, data, false)
+        self.write_file_with_metadata(inode_number, offset, data, false, false)
     }
 
     pub(crate) fn write_file_with_metadata(
@@ -1663,6 +1703,7 @@ impl Storage {
         inode_number: u64,
         offset: u64,
         data: &[u8],
+        append: bool,
         clear_suid_sgid: bool,
     ) -> FuseResult<FuseWrite> {
         let mut write_state = self.lock_write_state()?;
@@ -1673,6 +1714,7 @@ impl Storage {
         if inode.kind != StoredNodeKind::RegularFile {
             return Err(FuseError::Errno(fuser::Errno::EISDIR));
         }
+        let offset = if append { inode.size } else { offset };
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or(FuseError::Errno(fuser::Errno::EFBIG))?;
@@ -2267,6 +2309,93 @@ impl Storage {
             write_state.record_committed_inode_number(next_inode_number);
         }
         Ok(())
+    }
+
+    fn commit_file_size_change(
+        &self,
+        write_state: &mut WriteState,
+        inode_number: u64,
+        mut inode: StoredInode,
+        new_size: u64,
+    ) -> FuseResult<EntrySnapshot> {
+        if inode.kind != StoredNodeKind::RegularFile {
+            return Err(FuseError::Errno(fuser::Errno::EINVAL));
+        }
+        let old_size = inode.size;
+        if old_size == new_size {
+            return Ok(EntrySnapshot {
+                ttl: FUSE_ATTRIBUTE_TTL,
+                attr: inode_attr(inode_number, &inode),
+            });
+        }
+
+        let existing_extents = self
+            .file_content_manifest_extents(
+                self.active_branch_identifier(),
+                FileIdentifier::new(inode_number),
+            )
+            .map_err(to_fuse_integrity)?;
+        self.validate_stored_extents(&existing_extents)?;
+        let (offset, overwritten_byte_length, overwritten_extents, final_extents) =
+            if new_size < old_size {
+                (
+                    new_size,
+                    old_size - new_size,
+                    slice_extents(&existing_extents, new_size, old_size, 0)
+                        .map_err(to_fuse_integrity)?,
+                    slice_extents(&existing_extents, 0, new_size, 0).map_err(to_fuse_integrity)?,
+                )
+            } else {
+                (old_size, 0, Vec::new(), existing_extents.clone())
+            };
+
+        let event_sequence = write_state.next_event_sequence()?;
+        let mut batch = WriteBatch::default();
+        let content_manifest_identifier = self.put_content_manifest(&mut batch, &final_extents)?;
+        inode.size = new_size;
+        inode.content_manifest_identifier = Some(content_manifest_identifier);
+        let mut mutation = StoredMutation::default();
+        mutation.put_inode(inode_number, &inode);
+
+        let event = EventRecord::new(
+            event_sequence,
+            EventKind::FileWritten,
+            UtcDateTime::now(),
+            Some(FileIdentifier::new(inode_number)),
+            inode_event_path(
+                self.active_branch_identifier(),
+                inode_number,
+                &inode,
+                &self.database,
+            )
+            .ok(),
+            Some(offset),
+            Some(0),
+        )
+        .with_payload(EventPayload::FileWrite {
+            old_file_size: old_size,
+            new_file_size: new_size,
+            overwritten_byte_length,
+            written_byte_length: 0,
+        });
+        self.commit_event_with_payloads(
+            &mut batch,
+            event_sequence,
+            &event,
+            EventPayloadExtents::FileWrite {
+                overwritten_extents,
+                written_extents: Vec::new(),
+            },
+            Some(&final_extents),
+            None,
+            mutation,
+        )?;
+        self.commit_mutation(&mut *write_state, batch, event_sequence, None)?;
+
+        Ok(EntrySnapshot {
+            ttl: FUSE_ATTRIBUTE_TTL,
+            attr: inode_attr(inode_number, &inode),
+        })
     }
 
     fn remove_directory_entry(&self, parent: u64, name: &OsStr, directory: bool) -> FuseResult<()> {
@@ -6581,7 +6710,7 @@ mod tests {
         );
         assert_fuse_errno(
             storage
-                .open_file(INODE_ROOT)
+                .open_file(INODE_ROOT, false)
                 .expect_err("open_file rejects directories"),
             fuser::Errno::EISDIR,
         );
@@ -6679,6 +6808,9 @@ mod tests {
                     mode: Some(0o600),
                     uid: None,
                     gid: None,
+                    size: None,
+                    atime: None,
+                    mtime: None,
                 },
             )
             .expect("owner updates file mode")
@@ -6708,6 +6840,9 @@ mod tests {
                     mode: Some(0o600),
                     uid: None,
                     gid: None,
+                    size: None,
+                    atime: None,
+                    mtime: None,
                 },
             )
             .expect("unchanged metadata is accepted");
@@ -6728,6 +6863,9 @@ mod tests {
                         mode: None,
                         uid: Some(11),
                         gid: None,
+                        size: None,
+                        atime: None,
+                        mtime: None,
                     },
                 )
                 .expect_err("non-root owner cannot change uid"),
@@ -6743,6 +6881,9 @@ mod tests {
                     mode: Some(0o6755),
                     uid: None,
                     gid: None,
+                    size: None,
+                    atime: None,
+                    mtime: None,
                 },
             )
             .expect("root sets setuid and setgid mode bits")
@@ -6758,6 +6899,9 @@ mod tests {
                     mode: None,
                     uid: Some(100),
                     gid: Some(200),
+                    size: None,
+                    atime: None,
+                    mtime: None,
                 },
             )
             .expect("root updates ownership")
@@ -7703,6 +7847,7 @@ mod tests {
     #[derive(Clone, Debug)]
     enum BoundedFileOperation {
         Write { offset: u64, bytes: Vec<u8> },
+        Truncate { size: u64 },
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7769,6 +7914,7 @@ mod tests {
         fn apply(&mut self, operation: &BoundedFileOperation) -> FuseResult<()> {
             match operation {
                 BoundedFileOperation::Write { offset, bytes } => self.apply_write(*offset, bytes),
+                BoundedFileOperation::Truncate { size } => self.apply_truncate(*size),
             }
         }
 
@@ -7793,6 +7939,15 @@ mod tests {
                 &written_extents,
             )?;
             self.file_size = new_size;
+            Ok(())
+        }
+
+        fn apply_truncate(&mut self, size: u64) -> FuseResult<()> {
+            if size < self.file_size {
+                self.extents =
+                    slice_extents(&self.extents, 0, size, 0).map_err(to_fuse_integrity)?;
+            }
+            self.file_size = size;
             Ok(())
         }
 
@@ -7840,6 +7995,8 @@ mod tests {
                 offset: 192 * 1024,
                 bytes: patterned_bytes(12 * 1024, 41),
             },
+            BoundedFileOperation::Truncate { size: 96 * 1024 },
+            BoundedFileOperation::Truncate { size: 180 * 1024 },
         ]
     }
 
@@ -7866,6 +8023,8 @@ mod tests {
                 offset: 128 * 1024,
                 bytes: patterned_bytes(8 * 1024, 59),
             },
+            BoundedFileOperation::Truncate { size: 72 * 1024 },
+            BoundedFileOperation::Truncate { size: 160 * 1024 },
         ]
     }
 
@@ -7901,6 +8060,31 @@ mod tests {
                     written: bytes.clone(),
                 }
             }
+            BoundedFileOperation::Truncate { size } => {
+                let before = dense.clone();
+                let size = usize::try_from(*size).expect("bounded truncate size fits usize");
+                let overwritten = if size < before.len() {
+                    before[size..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let event_offset = if size < before.len() {
+                    size as u64
+                } else {
+                    before.len() as u64
+                };
+                dense.resize(size, 0);
+
+                BoundedFileExpectation {
+                    kind: EventKind::FileWritten,
+                    before,
+                    after: dense.clone(),
+                    offset: Some(event_offset),
+                    byte_length: Some(0),
+                    overwritten,
+                    written: Vec::new(),
+                }
+            }
         }
     }
 
@@ -7914,6 +8098,23 @@ mod tests {
                 storage
                     .write_file(inode_number, *offset, bytes)
                     .expect("bounded write succeeds");
+            }
+            BoundedFileOperation::Truncate { size } => {
+                storage
+                    .setattr_metadata(
+                        inode_number,
+                        SetattrMetadata {
+                            request_uid: 0,
+                            request_gid: 0,
+                            mode: None,
+                            uid: None,
+                            gid: None,
+                            size: Some(*size),
+                            atime: None,
+                            mtime: None,
+                        },
+                    )
+                    .expect("bounded truncate succeeds");
             }
         }
     }

@@ -366,7 +366,7 @@ impl Filesystem {
 - `Filesystem::mount` and `Filesystem::spawn_mount` MUST apply caller-supplied mount options.
 - Mounted sessions MUST use unrestricted FUSE session access control.
 - eventfs MUST supply `MountOption::FilesystemName` from the persisted volume name when the caller did not supply `MountOption::FilesystemName`.
-- The mounted filesystem MUST support lookup, attribute read, permission metadata changes, node creation, directory creation, file creation, file open, file read, file write, flush, file synchronization, directory open, directory read, directory read with attributes, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, filesystem statistics, extended attributes, macOS volume rename, macOS file-content exchange, and macOS extended times.
+- The mounted filesystem MUST support lookup, attribute read, metadata changes, file size changes, node creation, directory creation, file creation, file open, file read, file write, flush, file synchronization, directory open, directory read, directory read with attributes, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, filesystem statistics, extended attributes, macOS volume rename, macOS file-content exchange, and macOS extended times.
 - The mounted filesystem MUST NOT support POSIX byte-range locks, block mapping, ioctl, poll, space allocation, sparse seek, or file-range copy.
 - When the `tracing` Cargo feature is enabled, every eventfs-handled FUSE operation MUST emit one `tracing::trace!` event containing the operation name.
 - FUSE operation trace logging MUST NOT append events, change FUSE replies, change errno mapping, or affect the configured FUSE error callback.
@@ -376,8 +376,13 @@ impl Filesystem {
 - Successful FUSE operations MUST NOT invoke the configured FUSE error callback.
 - FUSE error callback failures MUST NOT change the FUSE error returned to the caller.
 - eventfs MUST always enable kernel default permission checking when mounting and MUST NOT expose default permission checking as a public mount option.
-- `setattr` MUST support `mode`, `uid`, and `gid` changes, MUST append a metadata-changed event when those fields change, and MUST NOT append events for no-op metadata changes.
-- `setattr` MUST reject `size`, `atime`, `mtime`, `ctime`, `crtime`, `chgtime`, `bkuptime`, and file flag changes as unsupported without appending events.
+- `setattr` MUST support `mode`, `uid`, `gid`, `size`, `atime`, and `mtime` changes.
+- `setattr` MUST append a metadata-changed event when only supported metadata fields change, and MUST NOT append events for no-op metadata changes.
+- `setattr` size changes MUST apply only to regular files, MUST discard trailing bytes when shrinking, and MUST make extended ranges read as zero bytes when growing.
+- `setattr` MUST reject `ctime`, `crtime`, `chgtime`, `bkuptime`, and file flag changes as unsupported without appending events.
+- File opens with `O_TRUNC` MUST truncate existing regular files to zero bytes before returning a successful open handle.
+- File creates MUST return zero-size regular files.
+- File writes through handles opened with `O_APPEND` MUST append at the current file size.
 - Inode numbers MUST be stable across process restarts.
 - File handles MAY be process-local and MUST NOT be required to reconstruct persistent filesystem state.
 - Filesystem statistics MUST NOT append events or mutate storage.
@@ -418,6 +423,10 @@ impl Filesystem {
 - File write events MUST store old file size, new file size, overwritten byte length, and written byte length in the event record.
 - File write events MUST store overwritten bytes and written bytes as event payload manifests outside event metadata.
 - Zero-filled file extension MUST be represented by old and new file sizes, not repeated zero bytes.
+- Successful file truncation and file extension through mounted operations MUST append one file-write event when the file size changes.
+- File truncation events MUST store discarded bytes as overwritten payload bytes, no written payload bytes, old and new file sizes, the new file size as the event offset, and zero byte length.
+- File extension events MUST store no payload bytes, old and new file sizes, the old file size as the event offset, and zero byte length.
+- A single supported `setattr` operation that changes file size and metadata MUST commit all changes atomically in one event and MUST use a file-write event when the file size changes.
 - `EventKind` MUST include filesystem initialization, node creation, directory creation, file creation, file write, metadata change, node unlink, directory removal, node rename, hard link creation, symbolic link creation, extended attribute set, extended attribute removal, file contents exchange, and volume rename.
 - Metadata changes, extended attribute set and removal, file contents exchange, and volume rename MUST append events when they change logical filesystem state.
 - Read-only operations and unsupported operations MUST NOT append events.
@@ -562,7 +571,7 @@ Storage requirements:
 - `fuse_operations` MUST compile only on Linux and MUST fail to compile on non-Linux targets with an explicit Linux-only error.
 - `fuse_operations` MUST mount eventfs through the public `FilesystemConfiguration`, `Filesystem::open`, and `Filesystem::spawn_mount` APIs.
 - `fuse_operations` MUST benchmark every supported Linux mounted FUSE operation with an equivalent operation on a sibling directory in the current host's normal filesystem.
-- `fuse_operations` MUST benchmark lookup, attribute read, permission metadata changes, node creation, directory creation, file creation, file open, file read, file write, flush, file synchronization, directory open, directory read, directory read with attributes, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, filesystem statistics, and extended attributes.
+- `fuse_operations` MUST benchmark lookup, attribute read, metadata changes, file size changes, node creation, directory creation, file creation, file open, file read, file write, flush, file synchronization, directory open, directory read, directory read with attributes, directory synchronization, file release, directory release, unlink, directory removal, rename, hard link, symbolic link, symbolic link read, access check, filesystem statistics, and extended attributes.
 - `fuse_operations` MUST NOT benchmark fuser lifecycle or cache callbacks that have no normal-filesystem operation baseline.
 - `fuse_operations` MUST exclude macOS-only mounted operations.
 - `fuse_operations` MUST exclude per-iteration setup and cleanup from timed measurements for mutating operations.
@@ -612,7 +621,8 @@ Implementations MUST include automated tests for:
 - Branch switching, divergence, file event listing, and snapshot reads preserve independent file contents across branches.
 - Event debug formatting does not expose stored file payload bytes.
 - Every supported FUSE operation works through the mounted filesystem.
-- Extended attributes, permission metadata changes, macOS volume rename, macOS file exchange, and macOS extended times work through the mounted filesystem where supported by the target operating system.
+- Extended attributes, metadata changes, file size changes, macOS volume rename, macOS file exchange, and macOS extended times work through the mounted filesystem where supported by the target operating system.
+- Linux OpenSSH SFTP upload, overwrite upload, metadata-preserving upload, download, directory, rename, remove, hard link, symbolic link, filesystem-statistics, and fsync workflows work through the mounted filesystem.
 - POSIX byte-range locks, block mapping, ioctl, poll, space allocation, sparse seek, and file-range copy fail as unsupported mounted filesystem operations.
 - Mutating supported FUSE operations append exactly the specified event kinds, and supported read-only or no-op operations append none.
 - Configured FUSE error callbacks receive failed supported operation errors and unsupported operation errors with the returned errno.

@@ -1402,18 +1402,20 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyAttr,
     ) {
         trace_fuse_operation("setattr");
-        if unsupported_setattr_fields_present(
-            size, atime, mtime, ctime, crtime, chgtime, bkuptime, flags,
-        ) {
+        if unsupported_setattr_fields_present(ctime, crtime, chgtime, bkuptime, flags) {
             reply.error(self.unsupported_fuse_error("setattr"));
             return;
         }
+        let now = SystemTime::now();
         let metadata = storage::SetattrMetadata {
             request_uid: req.uid(),
             request_gid: req.gid(),
             mode,
             uid,
             gid,
+            size,
+            atime: atime.map(|time| setattr_time(time, now)),
+            mtime: mtime.map(|time| setattr_time(time, now)),
         };
         match self.storage.setattr_metadata(ino.into(), metadata) {
             Ok(entry) => reply.attr(&entry.ttl, &entry.attr),
@@ -1607,11 +1609,21 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyOpen,
     ) {
         trace_fuse_operation("open");
-        match self.storage.open_file(ino.into()) {
-            Ok(()) => match self.record_open_handle(_flags) {
-                Ok(handle) => reply.opened(handle, fuser::FopenFlags::empty()),
-                Err(error) => reply.error(self.fuse_error("open", error)),
-            },
+        let result = validate_open_flags_for_truncate(_flags)
+            .and_then(|()| {
+                self.storage
+                    .open_file(ino.into(), open_flags_truncate(_flags))
+            })
+            .and_then(|()| {
+                self.synchronize_if_needed(
+                    open_flags_truncate(_flags)
+                        && (self.mount_synchronization_required()
+                            || open_flags_synchronous(_flags)),
+                )
+            })
+            .and_then(|()| self.record_open_handle(_flags));
+        match result {
+            Ok(handle) => reply.opened(handle, fopen_flags_for_open_flags(_flags)),
             Err(error) => reply.error(self.fuse_error("open", error)),
         }
     }
@@ -1653,6 +1665,7 @@ impl fuser::Filesystem for Filesystem {
                 ino.into(),
                 offset,
                 data,
+                self.write_append_required(fh, flags),
                 write_flags.contains(fuser::WriteFlags::FUSE_WRITE_KILL_SUIDGID),
             )
             .and_then(|write| {
@@ -1909,7 +1922,7 @@ impl fuser::Filesystem for Filesystem {
                     &entry.attr,
                     fuser::Generation(0),
                     handle,
-                    fuser::FopenFlags::empty(),
+                    fopen_flags_for_open_flags(fuser::OpenFlags(_flags)),
                 ),
                 Err(error) => reply.error(self.fuse_error("create", error)),
             },
@@ -2140,23 +2153,24 @@ fn create_node_metadata(
 }
 
 fn unsupported_setattr_fields_present(
-    size: Option<u64>,
-    atime: Option<fuser::TimeOrNow>,
-    mtime: Option<fuser::TimeOrNow>,
     ctime: Option<SystemTime>,
     crtime: Option<SystemTime>,
     chgtime: Option<SystemTime>,
     bkuptime: Option<SystemTime>,
     flags: Option<fuser::BsdFileFlags>,
 ) -> bool {
-    size.is_some()
-        || atime.is_some()
-        || mtime.is_some()
-        || ctime.is_some()
+    ctime.is_some()
         || crtime.is_some()
         || chgtime.is_some()
         || bkuptime.is_some()
         || flags.is_some()
+}
+
+fn setattr_time(time: fuser::TimeOrNow, now: SystemTime) -> SystemTime {
+    match time {
+        fuser::TimeOrNow::SpecificTime(time) => time,
+        fuser::TimeOrNow::Now => now,
+    }
 }
 
 fn reply_xattr_bytes(
@@ -2186,6 +2200,31 @@ fn reply_xattr_bytes(
 
 fn open_flags_synchronous(flags: fuser::OpenFlags) -> bool {
     flags.0 & (libc::O_SYNC | libc::O_DSYNC) != 0
+}
+
+fn open_flags_truncate(flags: fuser::OpenFlags) -> bool {
+    flags.0 & libc::O_TRUNC != 0
+}
+
+fn open_flags_append(flags: fuser::OpenFlags) -> bool {
+    flags.0 & libc::O_APPEND != 0
+}
+
+fn open_flags_writeable(flags: fuser::OpenFlags) -> bool {
+    flags.0 & libc::O_ACCMODE != libc::O_RDONLY
+}
+
+fn validate_open_flags_for_truncate(flags: fuser::OpenFlags) -> Result<(), storage::FuseError> {
+    if open_flags_truncate(flags) && !open_flags_writeable(flags) {
+        Err(storage::FuseError::Errno(fuser::Errno::EACCES))
+    } else {
+        Ok(())
+    }
+}
+
+fn fopen_flags_for_open_flags(flags: fuser::OpenFlags) -> fuser::FopenFlags {
+    let _ = flags;
+    fuser::FopenFlags::FOPEN_DIRECT_IO
 }
 
 impl Filesystem {
@@ -2251,9 +2290,18 @@ impl Filesystem {
             || self.handle_synchronization_required(handle)
     }
 
+    fn write_append_required(&self, handle: fuser::FileHandle, flags: fuser::OpenFlags) -> bool {
+        open_flags_append(flags) || self.handle_append_required(handle)
+    }
+
     fn handle_synchronization_required(&self, handle: fuser::FileHandle) -> bool {
         self.handle(handle)
             .is_some_and(|open_handle| open_flags_synchronous(open_handle.flags))
+    }
+
+    fn handle_append_required(&self, handle: fuser::FileHandle) -> bool {
+        self.handle(handle)
+            .is_some_and(|open_handle| open_flags_append(open_handle.flags))
     }
 
     fn handle(&self, handle: fuser::FileHandle) -> Option<OpenHandle> {

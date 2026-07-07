@@ -118,9 +118,24 @@ mod linux {
             .expect("setattr files are prepared");
         benchmark_pair(
             group,
-            "setattr",
+            "setattr_metadata",
             repeated_chmod(eventfs_root.join("setattr-file")),
             repeated_chmod(host_root.join("setattr-file")),
+        );
+
+        let (eventfs_root, host_root) = fixture.roots();
+        prepare_file_pair(
+            &eventfs_root,
+            &host_root,
+            "setattr-size-file",
+            &vec![b's'; BENCHMARK_BLOCK_SIZE],
+        )
+        .expect("setattr size files are prepared");
+        benchmark_pair(
+            group,
+            "setattr_size",
+            repeated_set_len(eventfs_root.join("setattr-size-file")),
+            repeated_set_len(host_root.join("setattr-size-file")),
         );
 
         let (eventfs_root, host_root) = fixture.roots();
@@ -553,6 +568,26 @@ mod linux {
                     0o644
                 };
                 elapsed += timed(|| fs::set_permissions(&path, fs::Permissions::from_mode(mode)))?;
+            }
+            Ok(elapsed)
+        }
+    }
+
+    fn repeated_set_len(path: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("setattr size file opens");
+        move |iterations| {
+            let mut elapsed = Duration::ZERO;
+            for index in 0..iterations {
+                let length = if index.is_multiple_of(2) {
+                    BENCHMARK_BLOCK_SIZE / 2
+                } else {
+                    BENCHMARK_BLOCK_SIZE
+                };
+                elapsed += timed(|| file.set_len(length as u64))?;
             }
             Ok(elapsed)
         }
