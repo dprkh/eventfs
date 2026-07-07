@@ -135,15 +135,6 @@ fn mount_configuration(filesystem: &Filesystem) -> Result<fuser::Config, Filesys
     configuration
         .mount_options
         .extend(caller_mount_options.iter().map(fuser_mount_option));
-    #[cfg(target_os = "macos")]
-    {
-        configuration
-            .mount_options
-            .push(fuser::MountOption::CUSTOM("noappledouble".to_owned()));
-        configuration
-            .mount_options
-            .push(fuser::MountOption::CUSTOM("noapplexattr".to_owned()));
-    }
     Ok(configuration)
 }
 

@@ -122,7 +122,11 @@ pub fn create_empty_file(path: &Path) {
 }
 
 pub fn write_mounted_file(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
-    let mut file = OpenOptions::new().create(true).write(true).open(path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)?;
     file.write_all(contents.as_ref())
 }
 
@@ -392,7 +396,6 @@ pub fn remove_xattr(path: &Path, name: &str) -> std::io::Result<()> {
     }
 }
 
-#[cfg(target_os = "linux")]
 unsafe fn setxattr_raw(path: &CString, name: &CString, value: &[u8], flags: i32) -> i32 {
     unsafe {
         libc::setxattr(
@@ -405,21 +408,6 @@ unsafe fn setxattr_raw(path: &CString, name: &CString, value: &[u8], flags: i32)
     }
 }
 
-#[cfg(target_os = "macos")]
-unsafe fn setxattr_raw(path: &CString, name: &CString, value: &[u8], flags: i32) -> i32 {
-    unsafe {
-        libc::setxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-            flags,
-        )
-    }
-}
-
-#[cfg(target_os = "linux")]
 unsafe fn getxattr_raw(
     path: &CString,
     name: &CString,
@@ -429,34 +417,12 @@ unsafe fn getxattr_raw(
     unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), value, size) }
 }
 
-#[cfg(target_os = "macos")]
-unsafe fn getxattr_raw(
-    path: &CString,
-    name: &CString,
-    value: *mut libc::c_void,
-    size: usize,
-) -> isize {
-    unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), value, size, 0, 0) }
-}
-
-#[cfg(target_os = "linux")]
 unsafe fn listxattr_raw(path: &CString, value: *mut libc::c_char, size: usize) -> isize {
     unsafe { libc::listxattr(path.as_ptr(), value, size) }
 }
 
-#[cfg(target_os = "macos")]
-unsafe fn listxattr_raw(path: &CString, value: *mut libc::c_char, size: usize) -> isize {
-    unsafe { libc::listxattr(path.as_ptr(), value, size, 0) }
-}
-
-#[cfg(target_os = "linux")]
 unsafe fn removexattr_raw(path: &CString, name: &CString) -> i32 {
     unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) }
-}
-
-#[cfg(target_os = "macos")]
-unsafe fn removexattr_raw(path: &CString, name: &CString) -> i32 {
-    unsafe { libc::removexattr(path.as_ptr(), name.as_ptr(), 0) }
 }
 
 fn c_path(path: &Path) -> CString {

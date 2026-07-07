@@ -695,6 +695,7 @@ fn public_snapshot_and_payload_ranges_cross_content_chunks_and_sparse_zeroes() {
 
     let mut file = fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(&file_path)
         .expect("large file opens");

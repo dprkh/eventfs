@@ -1,0 +1,11 @@
+target
+target/
+**/target
+.git
+.git/
+.jj
+.jj/
+.DS_Store
+eventfs.*.db
+eventfs.*.mount
+eventfs.*.backup

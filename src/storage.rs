@@ -101,12 +101,6 @@ pub(crate) struct SetattrMetadata {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ExtendedTimes {
-    pub(crate) bkuptime: SystemTime,
-    pub(crate) crtime: SystemTime,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) enum FuseError {
     Errno(fuser::Errno),
     Database,
@@ -181,8 +175,8 @@ fn storage(database: DB, write_state: WriteState) -> Storage {
 
 type FuseResult<T> = Result<T, FuseError>;
 
-const STORAGE_SCHEMA_VERSION_BASELINE: u64 = 10;
-const STORAGE_SCHEMA_VERSION_CURRENT: u64 = 10;
+const STORAGE_SCHEMA_VERSION_BASELINE: u64 = 11;
+const STORAGE_SCHEMA_VERSION_CURRENT: u64 = 11;
 
 const EVENT_SEQUENCE_INITIAL: EventSequence = EventSequence::new(0);
 const BRANCH_IDENTIFIER_INITIAL: BranchIdentifier = BranchIdentifier::new(1);
@@ -214,6 +208,7 @@ const CONTENT_CHUNK_FASTCDC_SEED: u64 = 0;
 const FUSE_ATTRIBUTE_TTL: Duration = Duration::from_secs(1);
 const FUSE_STATFS_BLOCK_SIZE: u32 = 4096;
 const FUSE_MAX_NAME_LENGTH: usize = 255;
+const FUSE_DIRECTORY_ENTRY_FIRST_OFFSET: u64 = 3;
 
 const ROCKSDB_BLOCK_CACHE_CAPACITY: usize = 128 * 1024 * 1024;
 const ROCKSDB_BLOOM_FILTER_BITS_PER_KEY: f64 = 10.0;
@@ -347,8 +342,6 @@ struct StoredInode {
     atime: StoredTime,
     mtime: StoredTime,
     ctime: StoredTime,
-    crtime: StoredTime,
-    bkuptime: StoredTime,
     parent: u64,
     name: Vec<u8>,
     symlink_target: Option<Vec<u8>>,
@@ -440,6 +433,15 @@ struct StoredSnapshotMetadata {
     file_size: u64,
     sequence: u64,
     content_manifest_identifier: Vec<u8>,
+}
+
+struct FileSnapshotWriteContext<'a> {
+    event_sequence: EventSequence,
+    event: &'a EventRecord,
+    file_identifier: FileIdentifier,
+    branch_position: BranchPosition,
+    namespace: &'a MaterializedBranchState,
+    snapshot_extents: Option<&'a [StoredExtent]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -732,7 +734,7 @@ impl Storage {
             .lock()
             .map_err(|_| FilesystemError::Database)?;
         let branch_names = self.branch_names()?;
-        if self.branch_name_exists(&name)? {
+        if self.branch_name_exists(name)? {
             return Err(FilesystemError::Integrity);
         }
         let source = self.branch_record(from.branch_identifier())?;
@@ -1279,8 +1281,6 @@ impl Storage {
             atime: now,
             mtime: now,
             ctime: now,
-            crtime: now,
-            bkuptime: now,
             parent,
             name: name_bytes.clone(),
             symlink_target,
@@ -1401,8 +1401,6 @@ impl Storage {
             atime: now,
             mtime: now,
             ctime: now,
-            crtime: now,
-            bkuptime: now,
             parent,
             name: name_bytes.clone(),
             symlink_target: Some(target_bytes),
@@ -1503,34 +1501,30 @@ impl Storage {
         let mut batch = WriteBatch::default();
         let mut removed_destination = None;
 
-        if let Some(destination) = existing_destination {
-            if destination.inode != entry.inode {
-                let destination_inode = self
-                    .inode(destination.inode)
-                    .map_err(to_fuse_integrity)?
-                    .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-                if destination_inode.kind == StoredNodeKind::Directory {
-                    if entry.kind != StoredNodeKind::Directory {
-                        return Err(FuseError::Errno(fuser::Errno::EISDIR));
-                    }
-                    if !self.directory_is_empty(destination.inode)? {
-                        return Err(FuseError::Errno(fuser::Errno::ENOTEMPTY));
-                    }
-                } else if entry.kind == StoredNodeKind::Directory {
-                    return Err(FuseError::Errno(fuser::Errno::ENOTDIR));
+        if let Some(destination) =
+            existing_destination.filter(|destination| destination.inode != entry.inode)
+        {
+            let destination_inode = self
+                .inode(destination.inode)
+                .map_err(to_fuse_integrity)?
+                .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
+            if destination_inode.kind == StoredNodeKind::Directory {
+                if entry.kind != StoredNodeKind::Directory {
+                    return Err(FuseError::Errno(fuser::Errno::EISDIR));
                 }
-                removed_destination = Some((destination.clone(), destination_inode.clone()));
-                let destination_parent_inode = if new_parent == parent {
-                    &mut old_parent_inode
-                } else {
-                    new_parent_inode.as_mut().ok_or(FuseError::Integrity)?
-                };
-                update_parent_after_entry_removal(
-                    &destination_inode,
-                    destination_parent_inode,
-                    now,
-                );
+                if !self.directory_is_empty(destination.inode)? {
+                    return Err(FuseError::Errno(fuser::Errno::ENOTEMPTY));
+                }
+            } else if entry.kind == StoredNodeKind::Directory {
+                return Err(FuseError::Errno(fuser::Errno::ENOTDIR));
             }
+            removed_destination = Some((destination.clone(), destination_inode.clone()));
+            let destination_parent_inode = if new_parent == parent {
+                &mut old_parent_inode
+            } else {
+                new_parent_inode.as_mut().ok_or(FuseError::Integrity)?
+            };
+            update_parent_after_entry_removal(&destination_inode, destination_parent_inode, now);
         }
 
         if entry.kind == StoredNodeKind::Directory && parent != new_parent {
@@ -1798,7 +1792,6 @@ impl Storage {
                 written_extents: written_payload_extents,
             },
             Some(&final_extents),
-            None,
             mutation,
         )?;
         self.commit_mutation(&mut write_state, batch, event_sequence, None)?;
@@ -1861,22 +1854,22 @@ impl Storage {
             return Ok(());
         }
 
-        let mut entry_offset = 3;
-        for ((parent, name), entry) in state.directory_entries.range((inode_number, Vec::new())..) {
+        for (entry_offset, ((parent, name), entry)) in (FUSE_DIRECTORY_ENTRY_FIRST_OFFSET..)
+            .zip(state.directory_entries.range((inode_number, Vec::new())..))
+        {
             if *parent != inode_number {
                 break;
             }
-            if entry_offset > offset {
-                if !emit(DirectoryEntrySnapshot {
+            if entry_offset > offset
+                && !emit(DirectoryEntrySnapshot {
                     inode: entry.inode,
                     offset: entry_offset + 1,
                     kind: fuser_file_type(entry.kind),
                     name: OsString::from_vec(name.clone()),
-                }) {
-                    return Ok(());
-                }
+                })
+            {
+                return Ok(());
             }
-            entry_offset += 1;
         }
         Ok(())
     }
@@ -1940,8 +1933,9 @@ impl Storage {
             }
         }
 
-        let mut entry_offset = 3;
-        for ((parent, name), entry) in state.directory_entries.range((inode_number, Vec::new())..) {
+        for (entry_offset, ((parent, name), entry)) in (FUSE_DIRECTORY_ENTRY_FIRST_OFFSET..)
+            .zip(state.directory_entries.range((inode_number, Vec::new())..))
+        {
             if *parent != inode_number {
                 break;
             }
@@ -1963,7 +1957,6 @@ impl Storage {
                     return Ok(());
                 }
             }
-            entry_offset += 1;
         }
         Ok(())
     }
@@ -2141,156 +2134,6 @@ impl Storage {
         read_metadata_string(&self.database, METADATA_KEY_VOLUME_NAME)
     }
 
-    pub(crate) fn set_volume_name(&self, name: &OsStr) -> FuseResult<()> {
-        let bytes = name.as_bytes();
-        if bytes.is_empty() || bytes.len() > FUSE_MAX_NAME_LENGTH {
-            return Err(FuseError::Errno(fuser::Errno::EINVAL));
-        }
-        let name =
-            std::str::from_utf8(bytes).map_err(|_| FuseError::Errno(fuser::Errno::EINVAL))?;
-        if self.volume_name().map_err(to_fuse_integrity)? == name {
-            return Ok(());
-        }
-        let mut write_state = self.lock_write_state()?;
-        let event_sequence = write_state.next_event_sequence()?;
-        let mut batch = WriteBatch::default();
-        let metadata = self.metadata().map_err(to_fuse_integrity)?;
-        batch.put_cf(metadata, METADATA_KEY_VOLUME_NAME, name.as_bytes());
-        let event = EventRecord::new(
-            event_sequence,
-            EventKind::VolumeRenamed,
-            UtcDateTime::now(),
-            None,
-            Some("/".to_owned()),
-            None,
-            None,
-        );
-        self.commit_event(
-            &mut batch,
-            event_sequence,
-            &event,
-            StoredMutation::default(),
-        )?;
-        self.commit_mutation(&mut write_state, batch, event_sequence, None)
-    }
-
-    pub(crate) fn getxtimes(&self, inode_number: u64) -> FuseResult<ExtendedTimes> {
-        let inode = self
-            .inode(inode_number)
-            .map_err(to_fuse_integrity)?
-            .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        Ok(ExtendedTimes {
-            bkuptime: inode.bkuptime.to_system_time(),
-            crtime: inode.crtime.to_system_time(),
-        })
-    }
-
-    pub(crate) fn exchange(
-        &self,
-        parent: u64,
-        name: &OsStr,
-        new_parent: u64,
-        new_name: &OsStr,
-    ) -> FuseResult<()> {
-        let mut write_state = self.lock_write_state()?;
-        let name_bytes = validate_name(name)?;
-        let new_name_bytes = validate_name(new_name)?;
-        let entry = self
-            .directory_entry(parent, &name_bytes)
-            .map_err(to_fuse_integrity)?
-            .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        let new_entry = self
-            .directory_entry(new_parent, &new_name_bytes)
-            .map_err(to_fuse_integrity)?
-            .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        if entry.inode == new_entry.inode {
-            return Ok(());
-        }
-        let mut inode = self
-            .inode(entry.inode)
-            .map_err(to_fuse_integrity)?
-            .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        let mut new_inode = self
-            .inode(new_entry.inode)
-            .map_err(to_fuse_integrity)?
-            .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
-        if inode.kind != StoredNodeKind::RegularFile
-            || new_inode.kind != StoredNodeKind::RegularFile
-        {
-            return Err(FuseError::Errno(fuser::Errno::EINVAL));
-        }
-        let path = child_event_path(
-            self.active_branch_identifier(),
-            parent,
-            &name_bytes,
-            &self.database,
-        )?;
-        let new_path = child_event_path(
-            self.active_branch_identifier(),
-            new_parent,
-            &new_name_bytes,
-            &self.database,
-        )?;
-        let extents = self
-            .file_content_manifest_extents(
-                self.active_branch_identifier(),
-                FileIdentifier::new(entry.inode),
-            )
-            .map_err(to_fuse_integrity)?;
-        let new_extents = self
-            .file_content_manifest_extents(
-                self.active_branch_identifier(),
-                FileIdentifier::new(new_entry.inode),
-            )
-            .map_err(to_fuse_integrity)?;
-        self.validate_stored_extents(&extents)?;
-        self.validate_stored_extents(&new_extents)?;
-
-        let event_sequence = write_state.next_event_sequence()?;
-        let now = StoredTime::now();
-        let old_size = inode.size;
-        let new_old_size = new_inode.size;
-        let mut batch = WriteBatch::default();
-        let content_manifest_identifier = self.put_content_manifest(&mut batch, &new_extents)?;
-        let new_content_manifest_identifier = self.put_content_manifest(&mut batch, &extents)?;
-        inode.size = new_old_size;
-        inode.content_manifest_identifier = Some(content_manifest_identifier);
-        inode.mtime = now;
-        inode.ctime = now;
-        new_inode.size = old_size;
-        new_inode.content_manifest_identifier = Some(new_content_manifest_identifier);
-        new_inode.mtime = now;
-        new_inode.ctime = now;
-
-        let mut mutation = StoredMutation::default();
-        mutation.put_inode(entry.inode, &inode);
-        mutation.put_inode(new_entry.inode, &new_inode);
-        let event = EventRecord::new(
-            event_sequence,
-            EventKind::FileContentsExchanged,
-            UtcDateTime::now(),
-            Some(FileIdentifier::new(entry.inode)),
-            Some(path),
-            None,
-            None,
-        )
-        .with_secondary_file(FileIdentifier::new(new_entry.inode), Some(new_path))
-        .with_payload(EventPayload::FileExchange {
-            primary_file_size: inode.size,
-            secondary_file_size: new_inode.size,
-        });
-        self.commit_event_with_payloads(
-            &mut batch,
-            event_sequence,
-            &event,
-            EventPayloadExtents::None,
-            Some(&new_extents),
-            Some(&extents),
-            mutation,
-        )?;
-        self.commit_mutation(&mut write_state, batch, event_sequence, None)
-    }
-
     fn lock_write_state(&self) -> FuseResult<MutexGuard<'_, WriteState>> {
         self.write_state.lock().map_err(|_| FuseError::Database)
     }
@@ -2387,7 +2230,6 @@ impl Storage {
                 written_extents: Vec::new(),
             },
             Some(&final_extents),
-            None,
             mutation,
         )?;
         self.commit_mutation(&mut *write_state, batch, event_sequence, None)?;
@@ -2694,23 +2536,22 @@ impl Storage {
             file_identifier.get(),
             position.ordinal(),
         ));
-        while iterator.valid() {
+        if iterator.valid() {
             let key = iterator.key().ok_or(FilesystemError::Database)?;
-            if !key.starts_with(&prefix) {
-                break;
+            if key.starts_with(&prefix) {
+                let (key_branch, key_file, ordinal) = decode_file_snapshot_manifest_key(key)?;
+                if key_branch != branch.get() || key_file != file_identifier.get() {
+                    return Err(FilesystemError::Integrity);
+                }
+                let metadata =
+                    decode_snapshot_metadata(iterator.value().ok_or(FilesystemError::Database)?)?;
+                return Ok(Some(FileSnapshot::new(
+                    file_identifier,
+                    EventSequence::new(metadata.sequence),
+                    BranchPosition::new(branch, ordinal),
+                    metadata.file_size,
+                )));
             }
-            let (key_branch, key_file, ordinal) = decode_file_snapshot_manifest_key(key)?;
-            if key_branch != branch.get() || key_file != file_identifier.get() {
-                return Err(FilesystemError::Integrity);
-            }
-            let metadata =
-                decode_snapshot_metadata(iterator.value().ok_or(FilesystemError::Database)?)?;
-            return Ok(Some(FileSnapshot::new(
-                file_identifier,
-                EventSequence::new(metadata.sequence),
-                BranchPosition::new(branch, ordinal),
-                metadata.file_size,
-            )));
         }
         iterator.status().map_err(|_| FilesystemError::Database)?;
 
@@ -2946,7 +2787,6 @@ impl Storage {
             event,
             EventPayloadExtents::None,
             None,
-            None,
             mutation,
         )
     }
@@ -2958,7 +2798,6 @@ impl Storage {
         event: &EventRecord,
         payload_extents: EventPayloadExtents,
         snapshot_extents: Option<&[StoredExtent]>,
-        secondary_snapshot_extents: Option<&[StoredExtent]>,
         mutation: StoredMutation,
     ) -> FuseResult<()> {
         let events = self.events().map_err(|_| FuseError::Integrity)?;
@@ -3023,7 +2862,6 @@ impl Storage {
             &event,
             &namespace,
             snapshot_extents,
-            secondary_snapshot_extents,
         )?;
         batch.put_cf(
             metadata,
@@ -3383,40 +3221,27 @@ impl Storage {
         event: &EventRecord,
         namespace: &MaterializedBranchState,
         snapshot_extents: Option<&[StoredExtent]>,
-        secondary_snapshot_extents: Option<&[StoredExtent]>,
     ) -> FuseResult<()> {
         let Some(branch_position) = event.branch_position() else {
             return Err(FuseError::Integrity);
         };
         if !matches!(
             event.kind(),
-            EventKind::NodeCreated
-                | EventKind::FileCreated
-                | EventKind::FileWritten
-                | EventKind::FileContentsExchanged
+            EventKind::NodeCreated | EventKind::FileCreated | EventKind::FileWritten
         ) {
             return Ok(());
         };
         if let Some(file_identifier) = event.file_identifier() {
             self.put_file_snapshot_for_identifier(
                 batch,
-                event_sequence,
-                event,
-                file_identifier,
-                branch_position,
-                namespace,
-                snapshot_extents,
-            )?;
-        }
-        if let Some(file_identifier) = event.secondary_file_identifier() {
-            self.put_file_snapshot_for_identifier(
-                batch,
-                event_sequence,
-                event,
-                file_identifier,
-                branch_position,
-                namespace,
-                secondary_snapshot_extents,
+                FileSnapshotWriteContext {
+                    event_sequence,
+                    event,
+                    file_identifier,
+                    branch_position,
+                    namespace,
+                    snapshot_extents,
+                },
             )?;
         }
         Ok(())
@@ -3425,35 +3250,32 @@ impl Storage {
     fn put_file_snapshot_for_identifier(
         &self,
         batch: &mut WriteBatch,
-        event_sequence: EventSequence,
-        event: &EventRecord,
-        file_identifier: FileIdentifier,
-        branch_position: BranchPosition,
-        namespace: &MaterializedBranchState,
-        snapshot_extents: Option<&[StoredExtent]>,
+        context: FileSnapshotWriteContext<'_>,
     ) -> FuseResult<()> {
-        let file_size = event_snapshot_file_size(event, file_identifier).unwrap_or(0);
-        let content_manifest_identifier = if let Some(extents) = snapshot_extents {
+        let file_size =
+            event_snapshot_file_size(context.event, context.file_identifier).unwrap_or(0);
+        let content_manifest_identifier = if let Some(extents) = context.snapshot_extents {
             self.put_content_manifest(batch, extents)?
         } else {
-            namespace
+            context
+                .namespace
                 .inodes
-                .get(&file_identifier.get())
+                .get(&context.file_identifier.get())
                 .and_then(|inode| inode.content_manifest_identifier.clone())
                 .unwrap_or(empty_content_manifest_identifier().map_err(to_fuse_integrity)?)
         };
         let metadata = StoredSnapshotMetadata {
             file_size,
-            sequence: event_sequence.get(),
+            sequence: context.event_sequence.get(),
             content_manifest_identifier,
         };
         batch.put_cf(
             self.file_snapshot_manifests()
                 .map_err(|_| FuseError::Integrity)?,
             encode_file_snapshot_manifest_key(
-                branch_position.branch_identifier().get(),
-                file_identifier.get(),
-                branch_position.ordinal(),
+                context.branch_position.branch_identifier().get(),
+                context.file_identifier.get(),
+                context.branch_position.ordinal(),
             ),
             encode_snapshot_metadata(&metadata).map_err(|_| FuseError::Database)?,
         );
@@ -3701,8 +3523,6 @@ fn initialize_new_database(database: &DB) -> Result<(), FilesystemError> {
         atime: now,
         mtime: now,
         ctime: now,
-        crtime: now,
-        bkuptime: now,
         parent: INODE_ROOT,
         name: Vec::new(),
         symlink_target: None,
@@ -4345,7 +4165,7 @@ fn inode_attr(inode_number: u64, inode: &StoredInode) -> fuser::FileAttr {
         atime: inode.atime.to_system_time(),
         mtime: inode.mtime.to_system_time(),
         ctime: inode.ctime.to_system_time(),
-        crtime: inode.crtime.to_system_time(),
+        crtime: UNIX_EPOCH,
         kind: fuser_file_type(inode.kind),
         perm: inode.mode,
         nlink: inode.nlink,
@@ -4461,12 +4281,12 @@ fn current_effective_gid() -> u32 {
 }
 
 fn special_kind_from_mode(mode: u32) -> FuseResult<StoredNodeKind> {
-    match mode & u32::from(libc::S_IFMT) {
-        value if value == u32::from(libc::S_IFREG) => Ok(StoredNodeKind::RegularFile),
-        value if value == u32::from(libc::S_IFIFO) => Ok(StoredNodeKind::NamedPipe),
-        value if value == u32::from(libc::S_IFCHR) => Ok(StoredNodeKind::CharacterDevice),
-        value if value == u32::from(libc::S_IFBLK) => Ok(StoredNodeKind::BlockDevice),
-        value if value == u32::from(libc::S_IFSOCK) => Ok(StoredNodeKind::Socket),
+    match mode & libc::S_IFMT {
+        value if value == libc::S_IFREG => Ok(StoredNodeKind::RegularFile),
+        value if value == libc::S_IFIFO => Ok(StoredNodeKind::NamedPipe),
+        value if value == libc::S_IFCHR => Ok(StoredNodeKind::CharacterDevice),
+        value if value == libc::S_IFBLK => Ok(StoredNodeKind::BlockDevice),
+        value if value == libc::S_IFSOCK => Ok(StoredNodeKind::Socket),
         _ => Err(FuseError::Errno(fuser::Errno::EINVAL)),
     }
 }
@@ -4947,16 +4767,7 @@ fn event_payload_part_length(event: &EventRecord, part: FileEventPayloadPart) ->
 }
 
 fn event_file_identifiers(event: &EventRecord) -> Vec<FileIdentifier> {
-    let mut identifiers = Vec::new();
-    if let Some(file_identifier) = event.file_identifier() {
-        identifiers.push(file_identifier);
-    }
-    if let Some(file_identifier) = event.secondary_file_identifier()
-        && !identifiers.contains(&file_identifier)
-    {
-        identifiers.push(file_identifier);
-    }
-    identifiers
+    event.file_identifier().into_iter().collect()
 }
 
 fn event_snapshot_file_size(event: &EventRecord, file_identifier: FileIdentifier) -> Option<u64> {
@@ -4965,18 +4776,6 @@ fn event_snapshot_file_size(event: &EventRecord, file_identifier: FileIdentifier
             if event.file_identifier() == Some(file_identifier) =>
         {
             Some(*new_file_size)
-        }
-        EventPayload::FileExchange {
-            primary_file_size,
-            secondary_file_size,
-        } => {
-            if event.file_identifier() == Some(file_identifier) {
-                Some(*primary_file_size)
-            } else if event.secondary_file_identifier() == Some(file_identifier) {
-                Some(*secondary_file_size)
-            } else {
-                None
-            }
         }
         EventPayload::None | EventPayload::FileWrite { .. } => None,
     }
@@ -5149,6 +4948,35 @@ mod tests {
                 .expect("last event sequence is readable"),
             EventSequence::new(initial.last_event_sequence)
         );
+    }
+
+    #[test]
+    fn storage_schema_version_11_is_current_and_10_is_rejected() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let database = temporary.path().join("database");
+        let storage = open_database_path(&database).expect("storage opens");
+        assert_eq!(
+            read_metadata_u64(storage.database(), METADATA_KEY_STORAGE_SCHEMA_VERSION),
+            Ok(STORAGE_SCHEMA_VERSION_CURRENT)
+        );
+
+        let metadata = storage
+            .database()
+            .cf_handle(COLUMN_FAMILY_FILESYSTEM_METADATA)
+            .expect("metadata column family exists");
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            metadata,
+            METADATA_KEY_STORAGE_SCHEMA_VERSION,
+            encode_u64(10),
+        );
+        write_batch(storage.database(), batch).expect("old schema version is written");
+        drop(storage);
+
+        assert!(matches!(
+            open_database_path(&database),
+            Err(FilesystemError::Integrity)
+        ));
     }
 
     #[test]
@@ -6332,151 +6160,6 @@ mod tests {
     }
 
     #[test]
-    fn exchange_swaps_contents_and_indexes_both_file_histories() {
-        let temporary = tempfile::tempdir().expect("temporary directory is created");
-        let storage =
-            open_database_path(&temporary.path().join("database")).expect("storage opens");
-        let left = create_regular_file(&storage, "left");
-        let right = create_regular_file(&storage, "right");
-        storage
-            .write_file(left, 0, b"left")
-            .expect("left is written");
-        storage
-            .write_file(right, 0, b"right")
-            .expect("right is written");
-
-        storage
-            .exchange(
-                INODE_ROOT,
-                OsStr::new("left"),
-                INODE_ROOT,
-                OsStr::new("right"),
-            )
-            .expect("contents are exchanged");
-
-        assert_eq!(
-            storage.read_file(left, 0, 8).expect("left is readable"),
-            b"right"
-        );
-        assert_eq!(
-            storage.read_file(right, 0, 8).expect("right is readable"),
-            b"left"
-        );
-        let event = storage
-            .get_event(
-                storage
-                    .last_event_sequence()
-                    .expect("last event is readable"),
-            )
-            .expect("event lookup succeeds")
-            .expect("event exists");
-        assert_eq!(event.kind(), EventKind::FileContentsExchanged);
-        assert_eq!(event.file_identifier(), Some(FileIdentifier::new(left)));
-        assert_eq!(event.path(), Some("/left"));
-        assert_eq!(
-            event.secondary_file_identifier(),
-            Some(FileIdentifier::new(right))
-        );
-        assert_eq!(event.secondary_path(), Some("/right"));
-        assert_eq!(
-            collect_all_file_events(&storage, FileIdentifier::new(left))
-                .last()
-                .map(EventRecord::kind),
-            Some(EventKind::FileContentsExchanged)
-        );
-        assert_eq!(
-            collect_all_file_events(&storage, FileIdentifier::new(right))
-                .last()
-                .map(EventRecord::kind),
-            Some(EventKind::FileContentsExchanged)
-        );
-    }
-
-    #[test]
-    fn volume_name_persists_and_appends_rename_events() {
-        let temporary = tempfile::tempdir().expect("temporary directory is created");
-        let database = temporary.path().join("database");
-        let storage = open_database_path(&database).expect("storage opens");
-        assert_eq!(
-            storage.volume_name().expect("volume name is readable"),
-            METADATA_VOLUME_NAME_DEFAULT
-        );
-
-        storage
-            .set_volume_name(OsStr::new("eventfs-renamed"))
-            .expect("volume name is changed");
-        let sequence = storage
-            .last_event_sequence()
-            .expect("last event is readable");
-        assert_eq!(
-            storage
-                .get_event(sequence)
-                .expect("event lookup succeeds")
-                .expect("event exists")
-                .kind(),
-            EventKind::VolumeRenamed
-        );
-        drop(storage);
-
-        let storage = open_database_path(&database).expect("storage reopens");
-        assert_eq!(
-            storage.volume_name().expect("volume name persists"),
-            "eventfs-renamed"
-        );
-    }
-
-    #[test]
-    fn volume_name_and_extended_times_cover_noop_and_error_edges() {
-        let temporary = tempfile::tempdir().expect("temporary directory is created");
-        let storage =
-            open_database_path(&temporary.path().join("database")).expect("storage opens");
-        let file = create_regular_file(&storage, "xtimes");
-        let before_noop = storage
-            .last_event_sequence()
-            .expect("last event sequence is readable");
-
-        storage
-            .set_volume_name(OsStr::new(METADATA_VOLUME_NAME_DEFAULT))
-            .expect("setting the same volume name is a no-op");
-        assert_eq!(
-            storage
-                .last_event_sequence()
-                .expect("last event sequence is reread"),
-            before_noop
-        );
-        assert_fuse_errno(
-            storage
-                .set_volume_name(OsStr::new(""))
-                .expect_err("empty volume names are rejected"),
-            fuser::Errno::EINVAL,
-        );
-        assert_fuse_errno(
-            storage
-                .set_volume_name(OsStr::from_bytes(&[b'v'; 256]))
-                .expect_err("overlong volume names are rejected"),
-            fuser::Errno::EINVAL,
-        );
-        assert_fuse_errno(
-            storage
-                .set_volume_name(OsStr::from_bytes(&[0xff]))
-                .expect_err("non-utf8 volume names are rejected"),
-            fuser::Errno::EINVAL,
-        );
-
-        let times = storage
-            .getxtimes(file)
-            .expect("extended times are readable");
-        assert!(times.bkuptime <= SystemTime::now());
-        assert!(times.crtime <= SystemTime::now());
-        assert_fuse_errno(
-            storage
-                .getxtimes(u64::MAX)
-                .expect_err("extended times reject missing inodes"),
-            fuser::Errno::ENOENT,
-        );
-    }
-
-    #[test]
     fn payload_reads_and_index_listings_handle_empty_ranges_and_prefix_boundaries() {
         let temporary = tempfile::tempdir().expect("temporary directory is created");
         let storage =
@@ -6746,12 +6429,6 @@ mod tests {
                 .expect_err("access rejects missing inodes"),
             fuser::Errno::ENOENT,
         );
-        let extended_times = storage
-            .getxtimes(file)
-            .expect("extended times are readable");
-        assert_eq!(extended_times.bkuptime, attributes.crtime);
-        assert_eq!(extended_times.crtime, attributes.crtime);
-
         let xattr_name = OsStr::new("user.eventfs.access");
         storage
             .setxattr(file, xattr_name, b"value", libc::XATTR_CREATE)
@@ -6912,7 +6589,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_remove_link_and_exchange_edges_cover_user_errors() {
+    fn rename_remove_and_link_edges_cover_user_errors() {
         let temporary = tempfile::tempdir().expect("temporary directory is created");
         let storage =
             open_database_path(&temporary.path().join("database")).expect("storage opens");
@@ -7158,41 +6835,6 @@ mod tests {
         storage
             .rmdir(INODE_ROOT, OsStr::new("removable-directory"))
             .expect("empty directory is removed");
-
-        let exchange_file = create_regular_file(&storage, "exchange-file");
-        storage
-            .create_node(
-                INODE_ROOT,
-                OsStr::new("exchange-directory"),
-                CreateNodeKind::Directory,
-            )
-            .expect("exchange directory is created");
-        storage
-            .exchange(
-                INODE_ROOT,
-                OsStr::new("exchange-file"),
-                INODE_ROOT,
-                OsStr::new("exchange-file"),
-            )
-            .expect("exchanging a file with itself is a no-op");
-        assert_fuse_errno(
-            storage
-                .exchange(
-                    INODE_ROOT,
-                    OsStr::new("exchange-file"),
-                    INODE_ROOT,
-                    OsStr::new("exchange-directory"),
-                )
-                .expect_err("exchange rejects non-regular files"),
-            fuser::Errno::EINVAL,
-        );
-        let looked_up_exchange: u64 = storage
-            .lookup(INODE_ROOT, OsStr::new("exchange-file"))
-            .expect("exchange file remains present")
-            .attr
-            .ino
-            .into();
-        assert_eq!(looked_up_exchange, exchange_file);
 
         let scratch_name = BranchName::new("deleted-switch-target").expect("branch name is valid");
         let main = storage.current_branch().expect("main branch is readable");
@@ -7735,28 +7377,27 @@ mod tests {
         );
 
         assert_eq!(
-            special_kind_from_mode(u32::from(libc::S_IFREG)).expect("regular mode maps"),
+            special_kind_from_mode(libc::S_IFREG).expect("regular mode maps"),
             StoredNodeKind::RegularFile
         );
         assert_eq!(
-            special_kind_from_mode(u32::from(libc::S_IFIFO)).expect("fifo mode maps"),
+            special_kind_from_mode(libc::S_IFIFO).expect("fifo mode maps"),
             StoredNodeKind::NamedPipe
         );
         assert_eq!(
-            special_kind_from_mode(u32::from(libc::S_IFCHR)).expect("char mode maps"),
+            special_kind_from_mode(libc::S_IFCHR).expect("char mode maps"),
             StoredNodeKind::CharacterDevice
         );
         assert_eq!(
-            special_kind_from_mode(u32::from(libc::S_IFBLK)).expect("block mode maps"),
+            special_kind_from_mode(libc::S_IFBLK).expect("block mode maps"),
             StoredNodeKind::BlockDevice
         );
         assert_eq!(
-            special_kind_from_mode(u32::from(libc::S_IFSOCK)).expect("socket mode maps"),
+            special_kind_from_mode(libc::S_IFSOCK).expect("socket mode maps"),
             StoredNodeKind::Socket
         );
         assert_fuse_errno(
-            special_kind_from_mode(u32::from(libc::S_IFDIR))
-                .expect_err("directory special mode is rejected"),
+            special_kind_from_mode(libc::S_IFDIR).expect_err("directory special mode is rejected"),
             fuser::Errno::EINVAL,
         );
         assert_eq!(

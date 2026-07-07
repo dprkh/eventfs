@@ -1,5 +1,21 @@
 Never use your own knowledge. When planning, read `SPEC.md` fully.
 
+## Development Under macOS
+
+- When developing on macOS, do not run Linux-sensitive Cargo or Rust verification commands directly on the host.
+- Use `./dev.sh` for checks, tests, examples, benchmark compilation, clippy, rustfmt checks, and arbitrary Cargo commands.
+- The required host runtime is Apple `container`; do not use macFUSE for eventfs verification.
+- Before running repo commands, Apple `container` must be installed and `container system status --format json` must report `"status":"running"`. If it is not running, start it with `container system start --enable-kernel-install`.
+- `./dev.sh` builds the development image from the root `Containerfile`, bind-mounts the repo at `/work`, validates FUSE inside the container, then runs the requested command in that container.
+- The normal full verification command is `./dev.sh test`.
+- Use `./dev.sh check` for `cargo check --locked --all-targets`.
+- Use `./dev.sh lib`, `./dev.sh tests`, `./dev.sh examples`, or `./dev.sh benches` for narrower verification.
+- `./dev.sh fmt` is the host-side formatting exception and runs `cargo fmt --all -- --check` without the container; use host `cargo fmt --all` only when formatting edits are intended.
+- Use `./dev.sh cargo -- <args...>` for any other Cargo command.
+- Override container resources with command options, for example `./dev.sh test --cpus 14 --memory 48G`.
+- Container-backed commands reuse the existing image by default. Rebuild first with `./dev.sh build-image`, or pass `--build`, for example `./dev.sh check --build`.
+- Container Cargo caches live under `target/container`; keep them out of commits.
+
 ## Source Organization
 
 - Rust source files MUST order definitions from most important to least important.

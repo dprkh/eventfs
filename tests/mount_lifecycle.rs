@@ -567,14 +567,14 @@ fn create_probe_file_through_mount(
 
     for attempt in 0_u64.. {
         let probe_path = mount_point.join(format!("{name_prefix}-{attempt}"));
-        if fs::write(&probe_path, b"probe").is_ok() {
-            if list_all_events(filesystem).len() > initial_events {
-                assert_eq!(
-                    fs::read(&probe_path).expect("probe file is readable through the mount"),
-                    b"probe"
-                );
-                return probe_path;
-            }
+        if fs::write(&probe_path, b"probe").is_ok()
+            && list_all_events(filesystem).len() > initial_events
+        {
+            assert_eq!(
+                fs::read(&probe_path).expect("probe file is readable through the mount"),
+                b"probe"
+            );
+            return probe_path;
         }
         if Instant::now() >= deadline {
             panic!(
@@ -612,40 +612,24 @@ fn external_unmount_with_timeout(mount_point: &Path, timeout: Duration) {
 }
 
 fn try_external_unmount_with_timeout(mount_point: &Path, timeout: Duration) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut command = Command::new("umount");
-        command.arg(mount_point);
-        return match run_command_with_timeout(&mut command, timeout) {
-            Ok(status) if status.success() => Ok(()),
-            Ok(status) => Err(io::Error::other(format!(
-                "external macOS unmount exited with {status}"
-            ))),
-            Err(error) => Err(error),
-        };
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let mut last_status = None;
-        for program in ["fusermount3", "fusermount", "umount"] {
-            let mut command = Command::new(program);
-            if program.starts_with("fuse") {
-                command.arg("-u");
-            }
-            command.arg(mount_point);
-            match run_command_with_timeout(&mut command, timeout) {
-                Ok(status) if status.success() => return Ok(()),
-                Ok(status) => last_status = Some(format!("{program} exited with {status}")),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            }
+    let mut last_status = None;
+    for program in ["fusermount3", "fusermount", "umount"] {
+        let mut command = Command::new(program);
+        if program.starts_with("fuse") {
+            command.arg("-u");
         }
-        Err(io::Error::other(format!(
-            "external Linux unmount failed: {}",
-            last_status.unwrap_or_else(|| "no unmount helper was available".to_owned())
-        )))
+        command.arg(mount_point);
+        match run_command_with_timeout(&mut command, timeout) {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => last_status = Some(format!("{program} exited with {status}")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
     }
+    Err(io::Error::other(format!(
+        "external unmount failed: {}",
+        last_status.unwrap_or_else(|| "no unmount helper was available".to_owned())
+    )))
 }
 
 fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<ExitStatus> {

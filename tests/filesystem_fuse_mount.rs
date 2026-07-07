@@ -43,8 +43,8 @@ fn mounted_filesystem_statistics_report_backing_blocks_and_logical_inode_capacit
     assert_backing_statfs_matches(&before, &backing);
     assert_ne!(before.f_bsize, 0);
     assert_eq!(before.f_namemax, 255);
-    assert_eq!(before.f_files as u64, expected_inode_capacity());
-    assert_eq!(before.f_ffree as u64 + 1, before.f_files as u64);
+    assert_eq!(before.f_files, expected_inode_capacity());
+    assert_eq!(before.f_ffree + 1, before.f_files);
     assert_eq!(event_count(&filesystem), events_before_statistics);
 
     write_mounted_file(&file_path, b"contents").expect("file is written");
@@ -54,7 +54,7 @@ fn mounted_filesystem_statistics_report_backing_blocks_and_logical_inode_capacit
         &statvfs(directories.database_directory_path()),
     );
     assert_eq!(after_create.f_files, before.f_files);
-    assert_eq!(after_create.f_ffree as u64 + 1, before.f_ffree as u64);
+    assert_eq!(after_create.f_ffree + 1, before.f_ffree);
 
     fs::hard_link(&file_path, &hard_link_path).expect("hard link is created");
     let after_hard_link = statvfs(root);
@@ -188,12 +188,6 @@ fn mount_failures_map_to_filesystem_operation_errors() {
     assert_eq!(error, FilesystemError::FilesystemOperation);
 }
 
-#[cfg(target_os = "macos")]
-fn expected_inode_capacity() -> u64 {
-    u64::from(u32::MAX - 1)
-}
-
-#[cfg(not(target_os = "macos"))]
 fn expected_inode_capacity() -> u64 {
     u64::MAX - 1
 }

@@ -71,9 +71,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - [ ] `fallocate`
 - [ ] `lseek`
 - [ ] `copy_file_range`
-- [x] `setvolname`
-- [x] `exchange`
-- [x] `getxtimes`
 
 # Benchmarks
 

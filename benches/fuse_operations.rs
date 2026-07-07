@@ -8,7 +8,7 @@ mod linux {
     use std::hint::black_box;
     use std::io::{self, ErrorKind};
     use std::mem::MaybeUninit;
-    use std::os::fd::{IntoRawFd, RawFd};
+    use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileExt, PermissionsExt, symlink};
     use std::path::{Path, PathBuf};

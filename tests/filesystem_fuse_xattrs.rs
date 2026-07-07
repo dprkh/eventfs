@@ -116,7 +116,13 @@ fn mounted_extended_attribute_small_buffers_return_range_errors_without_events()
         libc::XATTR_CREATE,
     )
     .expect_err("oversized xattr values are rejected");
-    assert_eq!(oversized_error.raw_os_error(), Some(libc::ERANGE));
+    assert!(
+        matches!(
+            oversized_error.raw_os_error(),
+            Some(errno) if errno == libc::ERANGE || errno == libc::E2BIG
+        ),
+        "oversized xattr returned unexpected error: {oversized_error}"
+    );
     expect_no_events(
         &mut events,
         &filesystem,

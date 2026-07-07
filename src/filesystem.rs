@@ -686,10 +686,6 @@ pub enum EventKind {
     ExtendedAttributeSet,
     /// Extended attribute removal event.
     ExtendedAttributeRemoved,
-    /// Regular file contents exchange event.
-    FileContentsExchanged,
-    /// Volume rename event.
-    VolumeRenamed,
 }
 
 /// Committed filesystem event exposed by event listing.
@@ -700,12 +696,10 @@ pub struct EventRecord {
     kind: EventKind,
     created_at: UtcDateTime,
     file_identifier: Option<FileIdentifier>,
-    secondary_file_identifier: Option<FileIdentifier>,
     branch_identifier: Option<BranchIdentifier>,
     branch_position: Option<BranchPosition>,
     first_parent_sequence: Option<EventSequence>,
     path: Option<String>,
-    secondary_path: Option<String>,
     offset: Option<u64>,
     byte_length: Option<u64>,
     payload: EventPayload,
@@ -732,11 +726,6 @@ impl EventRecord {
         self.file_identifier
     }
 
-    /// Returns the secondary affected regular file identifier, when applicable.
-    pub fn secondary_file_identifier(&self) -> Option<FileIdentifier> {
-        self.secondary_file_identifier
-    }
-
     /// Returns the branch identifier, when the event belongs to a branch.
     pub fn branch_identifier(&self) -> Option<BranchIdentifier> {
         self.branch_identifier
@@ -757,11 +746,6 @@ impl EventRecord {
         self.path.as_deref()
     }
 
-    /// Returns the secondary affected path, when applicable.
-    pub fn secondary_path(&self) -> Option<&str> {
-        self.secondary_path.as_deref()
-    }
-
     /// Returns the affected byte offset, when applicable.
     pub fn offset(&self) -> Option<u64> {
         self.offset
@@ -776,7 +760,7 @@ impl EventRecord {
     pub fn old_file_size(&self) -> Option<u64> {
         match &self.payload {
             EventPayload::FileWrite { old_file_size, .. } => Some(*old_file_size),
-            EventPayload::None | EventPayload::FileExchange { .. } => None,
+            EventPayload::None => None,
         }
     }
 
@@ -784,7 +768,7 @@ impl EventRecord {
     pub fn new_file_size(&self) -> Option<u64> {
         match &self.payload {
             EventPayload::FileWrite { new_file_size, .. } => Some(*new_file_size),
-            EventPayload::None | EventPayload::FileExchange { .. } => None,
+            EventPayload::None => None,
         }
     }
 
@@ -795,7 +779,7 @@ impl EventRecord {
                 overwritten_byte_length,
                 ..
             } => Some(*overwritten_byte_length),
-            EventPayload::None | EventPayload::FileExchange { .. } => None,
+            EventPayload::None => None,
         }
     }
 
@@ -806,7 +790,7 @@ impl EventRecord {
                 written_byte_length,
                 ..
             } => Some(*written_byte_length),
-            EventPayload::None | EventPayload::FileExchange { .. } => None,
+            EventPayload::None => None,
         }
     }
 }
@@ -820,12 +804,10 @@ impl fmt::Debug for EventRecord {
             .field("kind", &self.kind)
             .field("created_at", &self.created_at)
             .field("file_identifier", &self.file_identifier)
-            .field("secondary_file_identifier", &self.secondary_file_identifier)
             .field("branch_identifier", &self.branch_identifier)
             .field("branch_position", &self.branch_position)
             .field("first_parent_sequence", &self.first_parent_sequence)
             .field("path", &self.path)
-            .field("secondary_path", &self.secondary_path)
             .field("offset", &self.offset)
             .field("byte_length", &self.byte_length)
             .finish()
@@ -839,12 +821,10 @@ impl PartialEq for EventRecord {
             && self.kind == other.kind
             && self.created_at == other.created_at
             && self.file_identifier == other.file_identifier
-            && self.secondary_file_identifier == other.secondary_file_identifier
             && self.branch_identifier == other.branch_identifier
             && self.branch_position == other.branch_position
             && self.first_parent_sequence == other.first_parent_sequence
             && self.path == other.path
-            && self.secondary_path == other.secondary_path
             && self.offset == other.offset
             && self.byte_length == other.byte_length
             && self.payload == other.payload
@@ -1175,31 +1155,19 @@ impl EventRecord {
         byte_length: Option<u64>,
     ) -> Self {
         Self {
-            schema_version: 10,
+            schema_version: 11,
             sequence,
             kind,
             created_at,
             file_identifier,
-            secondary_file_identifier: None,
             branch_identifier: None,
             branch_position: None,
             first_parent_sequence: None,
             path,
-            secondary_path: None,
             offset,
             byte_length,
             payload: EventPayload::None,
         }
-    }
-
-    pub(crate) fn with_secondary_file(
-        mut self,
-        file_identifier: FileIdentifier,
-        path: Option<String>,
-    ) -> Self {
-        self.secondary_file_identifier = Some(file_identifier);
-        self.secondary_path = path;
-        self
     }
 
     pub(crate) fn with_payload(mut self, payload: EventPayload) -> Self {
@@ -1285,10 +1253,6 @@ pub(crate) enum EventPayload {
         overwritten_byte_length: u64,
         written_byte_length: u64,
     },
-    FileExchange {
-        primary_file_size: u64,
-        secondary_file_size: u64,
-    },
 }
 
 impl EventPage {
@@ -1337,12 +1301,6 @@ impl fuser::Filesystem for Filesystem {
     ) -> std::io::Result<()> {
         trace_fuse_operation("init");
         let capabilities = fuser::InitFlags::FUSE_DO_READDIRPLUS;
-        #[cfg(target_os = "macos")]
-        let capabilities = capabilities
-            | fuser::InitFlags::FUSE_ALLOCATE
-            | fuser::InitFlags::FUSE_EXCHANGE_DATA
-            | fuser::InitFlags::FUSE_VOL_RENAME
-            | fuser::InitFlags::FUSE_XTIMES;
         let _ = config.add_capabilities(capabilities);
         Ok(())
     }
@@ -1395,14 +1353,15 @@ impl fuser::Filesystem for Filesystem {
         mtime: Option<fuser::TimeOrNow>,
         ctime: Option<SystemTime>,
         _fh: Option<fuser::FileHandle>,
-        crtime: Option<SystemTime>,
-        chgtime: Option<SystemTime>,
-        bkuptime: Option<SystemTime>,
+        creation_time: Option<SystemTime>,
+        change_time: Option<SystemTime>,
+        backup_time: Option<SystemTime>,
         flags: Option<fuser::BsdFileFlags>,
         reply: fuser::ReplyAttr,
     ) {
         trace_fuse_operation("setattr");
-        if unsupported_setattr_fields_present(ctime, crtime, chgtime, bkuptime, flags) {
+        if unsupported_setattr_fields_present(ctime, creation_time, change_time, backup_time, flags)
+        {
             reply.error(self.unsupported_fuse_error("setattr"));
             return;
         }
@@ -2070,73 +2029,19 @@ impl fuser::Filesystem for Filesystem {
         reply: fuser::ReplyWrite,
     ) {
         trace_fuse_operation("copy_file_range");
-        reply.error(self.unsupported_fuse_error("copy_file_range"));
-    }
-
-    #[cfg(target_os = "macos")]
-    fn setvolname(&self, _req: &fuser::Request, name: &OsStr, reply: fuser::ReplyEmpty) {
-        trace_fuse_operation("setvolname");
-        let result = self
-            .storage
-            .set_volume_name(name)
-            .and_then(|()| self.synchronize_if_needed(self.mount_synchronization_required()));
-        match result {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(self.fuse_error("setvolname", error)),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn exchange(
-        &self,
-        _req: &fuser::Request,
-        parent: fuser::INodeNo,
-        name: &OsStr,
-        newparent: fuser::INodeNo,
-        newname: &OsStr,
-        options: u64,
-        reply: fuser::ReplyEmpty,
-    ) {
-        trace_fuse_operation("exchange");
-        let result = if options == 0 {
-            self.storage
-                .exchange(parent.into(), name, newparent.into(), newname)
-                .and_then(|()| self.synchronize_if_needed(self.mount_synchronization_required()))
-        } else {
-            Err(storage::FuseError::Errno(fuser::Errno::EINVAL))
-        };
-        match result {
-            Ok(()) => reply.ok(),
-            Err(error) => reply.error(self.fuse_error("exchange", error)),
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn getxtimes(&self, _req: &fuser::Request, ino: fuser::INodeNo, reply: fuser::ReplyXTimes) {
-        trace_fuse_operation("getxtimes");
-        match self.storage.getxtimes(ino.into()) {
-            Ok(times) => reply.xtimes(times.bkuptime, times.crtime),
-            Err(error) => reply.error(self.fuse_error("getxtimes", error)),
-        }
+        // ENOSYS and ENOTSUP let Linux fall back to read/write, which would
+        // mutate the destination after this unsupported optimized copy.
+        reply
+            .error(self.unsupported_fuse_error_with_errno("copy_file_range", fuser::Errno::EINVAL));
     }
 }
 
 fn rename_mode(flags: fuser::RenameFlags) -> Result<bool, storage::FuseError> {
-    #[cfg(target_os = "linux")]
-    {
-        let supported = fuser::RenameFlags::RENAME_NOREPLACE;
-        if !(flags - supported).is_empty() {
-            return Err(storage::FuseError::Errno(fuser::Errno::EINVAL));
-        }
-        Ok(flags.contains(fuser::RenameFlags::RENAME_NOREPLACE))
+    let supported = fuser::RenameFlags::RENAME_NOREPLACE;
+    if !(flags - supported).is_empty() {
+        return Err(storage::FuseError::Errno(fuser::Errno::EINVAL));
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        if !flags.is_empty() {
-            return Err(storage::FuseError::Errno(fuser::Errno::EINVAL));
-        }
-        Ok(false)
-    }
+    Ok(flags.contains(fuser::RenameFlags::RENAME_NOREPLACE))
 }
 
 fn create_node_metadata(
@@ -2154,15 +2059,15 @@ fn create_node_metadata(
 
 fn unsupported_setattr_fields_present(
     ctime: Option<SystemTime>,
-    crtime: Option<SystemTime>,
-    chgtime: Option<SystemTime>,
-    bkuptime: Option<SystemTime>,
+    creation_time: Option<SystemTime>,
+    change_time: Option<SystemTime>,
+    backup_time: Option<SystemTime>,
     flags: Option<fuser::BsdFileFlags>,
 ) -> bool {
     ctime.is_some()
-        || crtime.is_some()
-        || chgtime.is_some()
-        || bkuptime.is_some()
+        || creation_time.is_some()
+        || change_time.is_some()
+        || backup_time.is_some()
         || flags.is_some()
 }
 
@@ -2247,7 +2152,14 @@ impl Filesystem {
     }
 
     fn unsupported_fuse_error(&self, operation: &'static str) -> fuser::Errno {
-        let errno = fuser::Errno::ENOSYS;
+        self.unsupported_fuse_error_with_errno(operation, fuser::Errno::ENOSYS)
+    }
+
+    fn unsupported_fuse_error_with_errno(
+        &self,
+        operation: &'static str,
+        errno: fuser::Errno,
+    ) -> fuser::Errno {
         self.notify_fuse_error(operation, errno, true);
         errno
     }
@@ -2351,10 +2263,10 @@ impl Filesystem {
             .mount_state
             .lock()
             .map_err(|_| FilesystemError::FilesystemOperation)?;
-        state.mounted_sessions = state
-            .mounted_sessions
-            .checked_add(1)
-            .ok_or(FilesystemError::FilesystemOperation)?;
+        if state.mounted_sessions != 0 {
+            return Err(FilesystemError::FilesystemOperation);
+        }
+        state.mounted_sessions = 1;
         Ok(())
     }
 
@@ -2610,22 +2522,16 @@ mod tests {
             Some(3),
             Some(4),
         )
-        .with_secondary_file(FileIdentifier::new(11), Some("/secondary".to_owned()))
         .with_branch(branch_identifier, branch_position, first_parent);
 
         assert_eq!(base.sequence(), EventSequence::new(41));
         assert_eq!(base.kind(), EventKind::FileWritten);
         assert_eq!(base.created_at(), created_at);
         assert_eq!(base.file_identifier(), Some(FileIdentifier::new(10)));
-        assert_eq!(
-            base.secondary_file_identifier(),
-            Some(FileIdentifier::new(11))
-        );
         assert_eq!(base.branch_identifier(), Some(branch_identifier));
         assert_eq!(base.branch_position(), Some(branch_position));
         assert_eq!(base.first_parent_sequence(), Some(first_parent));
         assert_eq!(base.path(), Some("/primary"));
-        assert_eq!(base.secondary_path(), Some("/secondary"));
         assert_eq!(base.offset(), Some(3));
         assert_eq!(base.byte_length(), Some(4));
         assert_eq!(base.old_file_size(), None);
@@ -2643,15 +2549,6 @@ mod tests {
         assert_eq!(write.new_file_size(), Some(14));
         assert_eq!(write.overwritten_byte_length(), Some(2));
         assert_eq!(write.written_byte_length(), Some(4));
-
-        let exchanged = base.clone().with_payload(EventPayload::FileExchange {
-            primary_file_size: 20,
-            secondary_file_size: 30,
-        });
-        assert_eq!(exchanged.old_file_size(), None);
-        assert_eq!(exchanged.new_file_size(), None);
-        assert_eq!(exchanged.overwritten_byte_length(), None);
-        assert_eq!(exchanged.written_byte_length(), None);
 
         let debug = format!("{write:?}");
         assert!(debug.contains("EventRecord"));
@@ -2785,16 +2682,14 @@ mod tests {
 
     #[test]
     fn rename_adapter_accepts_supported_values_and_rejects_unknown_values() {
-        assert_eq!(
-            rename_mode(fuser::RenameFlags::empty()).expect("empty rename flags are supported"),
-            false
+        assert!(
+            !rename_mode(fuser::RenameFlags::empty()).expect("empty rename flags are supported")
         );
         #[cfg(target_os = "linux")]
         {
-            assert_eq!(
+            assert!(
                 rename_mode(fuser::RenameFlags::RENAME_NOREPLACE)
-                    .expect("noreplace rename flag is supported"),
-                true
+                    .expect("noreplace rename flag is supported")
             );
             assert_eq!(
                 rename_mode(fuser::RenameFlags::from_bits_retain(0x4000))
@@ -3030,13 +2925,35 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
     #[test]
-    fn rename_mode_rejects_non_empty_flags_on_non_linux_targets() {
-        let error = rename_mode(fuser::RenameFlags::from_bits_retain(1))
-            .expect_err("non-linux rename flags are rejected");
+    fn duplicate_mount_mark_is_rejected_and_original_mount_state_survives() {
+        let fixture = TestFilesystem::new("duplicate-mount-mark");
+        let branch = fixture
+            .filesystem
+            .current_branch()
+            .expect("current branch is returned");
 
-        assert_eq!(error.errno().code(), fuser::Errno::EINVAL.code());
+        fixture
+            .filesystem
+            .mark_mounted()
+            .expect("initial mount state is marked");
+        assert_eq!(
+            fixture.filesystem.mark_mounted(),
+            Err(FilesystemError::FilesystemOperation)
+        );
+        assert_eq!(
+            fixture.filesystem.switch_branch(branch.name()),
+            Err(FilesystemError::FilesystemOperation)
+        );
+
+        fixture
+            .filesystem
+            .mark_unmounted()
+            .expect("original mount state is released");
+        fixture
+            .filesystem
+            .switch_branch(branch.name())
+            .expect("branch switch is allowed after unmount");
     }
 
     struct TestFilesystem {

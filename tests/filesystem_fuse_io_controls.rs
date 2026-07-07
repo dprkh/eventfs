@@ -1,18 +1,12 @@
 mod support;
 
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
-
-use eventfs::EventKind;
 
 use support::{
-    TestDirectories, event_count, events_after, expect_event_kinds, expect_no_events,
-    filesystem_with_fuse_error_callback, mount, open_test_filesystem, recorded_callback_errors,
-    write_mounted_file,
+    TestDirectories, event_count, expect_no_events, filesystem_with_fuse_error_callback, mount,
+    recorded_callback_errors, write_mounted_file,
 };
 
 #[test]
@@ -102,114 +96,33 @@ fn mounted_linux_removed_data_operations_do_not_append_events() {
     let mut events = event_count(&filesystem);
 
     let fallocate_result = fallocate(sparse.as_raw_fd(), 0, 0, 4096);
+    let errors = recorded_callback_errors(&callback_errors);
+    assert_removed_operation_result("fallocate", fallocate_result, &errors);
+    expect_no_events(&mut events, &filesystem, "fallocate does not append events");
+
     let lseek_data_result = seek(sparse.as_raw_fd(), 0, libc::SEEK_DATA);
+    let errors = recorded_callback_errors(&callback_errors);
+    assert_removed_operation_result("lseek", lseek_data_result, &errors);
+    expect_no_events(&mut events, &filesystem, "SEEK_DATA does not append events");
+
     let lseek_hole_result = seek(sparse.as_raw_fd(), 0, libc::SEEK_HOLE);
+    let errors = recorded_callback_errors(&callback_errors);
+    assert_removed_operation_result("lseek", lseek_hole_result, &errors);
+    expect_no_events(&mut events, &filesystem, "SEEK_HOLE does not append events");
+
     let copy_result = copy_file_range(source.as_raw_fd(), destination.as_raw_fd(), 0, 0, 4, 0);
     let errors = recorded_callback_errors(&callback_errors);
-
-    assert_removed_operation_result("fallocate", fallocate_result, &errors);
-    assert_removed_operation_result("lseek", lseek_data_result, &errors);
-    assert_removed_operation_result("lseek", lseek_hole_result, &errors);
     assert_removed_operation_result("copy_file_range", copy_result, &errors);
     expect_no_events(
         &mut events,
         &filesystem,
-        "removed Linux data operations do not append events",
+        "copy_file_range does not append events",
     );
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn mounted_macos_volume_name_exchange_and_extended_times_are_event_aware_when_supported() {
-    let directories = TestDirectories::new();
-    let filesystem = open_test_filesystem(&directories);
-    let _mounted = mount(&filesystem);
-    let root = directories.mount_point_path();
-    let left_path = root.join("left");
-    let right_path = root.join("right");
-    let times_path = root.join("times");
-    let mut events = event_count(&filesystem);
-
-    match set_volume_name(root, "eventfs-mounted-test") {
-        Ok(()) => {
-            if events_after(&filesystem, events).is_empty() {
-                eprintln!(
-                    "skipping setvolname assertion because this mount accepted setattrlist without routing setvolname"
-                );
-            } else {
-                let renamed = expect_event_kinds(
-                    &mut events,
-                    &filesystem,
-                    &[EventKind::VolumeRenamed],
-                    "setvolname appends one volume-renamed event",
-                );
-                assert_eq!(renamed[0].path(), Some("/"));
-                assert_eq!(
-                    get_volume_name(root).expect("volume name is readable"),
-                    "eventfs-mounted-test"
-                );
-            }
-        }
-        Err(error) if macos_optional_operation_may_be_unrouted(error.raw_os_error()) => {
-            eprintln!("skipping setvolname assertion because this macFUSE mount returned {error}");
-        }
-        Err(error) => panic!("setvolname failed: {error}"),
-    }
-
-    write_mounted_file(&left_path, b"left").expect("left file is written");
-    write_mounted_file(&right_path, b"right").expect("right file is written");
-    events = event_count(&filesystem);
-    if let Err(error) = exchange_data(&left_path, &right_path) {
-        if macos_optional_operation_may_be_unrouted(error.raw_os_error()) {
-            eprintln!(
-                "skipping exchangedata assertion because this macFUSE mount returned {error}"
-            );
-            return;
-        }
-        panic!("exchangedata failed: {error}");
-    }
-
-    let exchanged = expect_event_kinds(
-        &mut events,
-        &filesystem,
-        &[EventKind::FileContentsExchanged],
-        "exchangedata appends one file-contents-exchanged event",
-    );
-    assert_eq!(exchanged[0].path(), Some("/left"));
-    assert_eq!(exchanged[0].secondary_path(), Some("/right"));
-    assert!(exchanged[0].file_identifier().is_some());
-    assert!(exchanged[0].secondary_file_identifier().is_some());
-    assert_eq!(
-        fs::read(&left_path).expect("left file is readable"),
-        b"right"
-    );
-    assert_eq!(
-        fs::read(&right_path).expect("right file is readable"),
-        b"left"
-    );
-
-    write_mounted_file(&times_path, b"times").expect("times file is written");
-    let crtime = UNIX_EPOCH + Duration::from_secs(1_800_000_001);
-    let bkuptime = UNIX_EPOCH + Duration::from_secs(1_800_000_101);
-    events = event_count(&filesystem);
-    set_file_crtime_and_bkuptime(&times_path, crtime, bkuptime)
-        .expect_err("creation and backup time updates are unsupported");
-    expect_no_events(
-        &mut events,
-        &filesystem,
-        "unsupported extended time update does not append events",
-    );
-
-    let (actual_crtime, actual_bkuptime) =
-        get_file_xtimes(&times_path).expect("extended times are read");
-    assert_ne!(actual_crtime, crtime);
-    assert_ne!(actual_bkuptime, bkuptime);
-    expect_no_events(&mut events, &filesystem, "getxtimes does not append events");
 }
 
 fn set_lock(
     fd: libc::c_int,
-    typ: libc::c_short,
+    typ: libc::c_int,
     start: libc::off_t,
     len: libc::off_t,
 ) -> std::io::Result<()> {
@@ -219,7 +132,7 @@ fn set_lock(
 
 fn get_lock(
     fd: libc::c_int,
-    typ: libc::c_short,
+    typ: libc::c_int,
     start: libc::off_t,
     len: libc::off_t,
 ) -> std::io::Result<libc::flock> {
@@ -228,9 +141,9 @@ fn get_lock(
     Ok(lock)
 }
 
-fn file_lock(typ: libc::c_short, start: libc::off_t, len: libc::off_t) -> libc::flock {
+fn file_lock(typ: libc::c_int, start: libc::off_t, len: libc::off_t) -> libc::flock {
     libc::flock {
-        l_type: typ,
+        l_type: typ as libc::c_short,
         l_whence: libc::SEEK_SET as libc::c_short,
         l_start: start,
         l_len: len,
@@ -299,7 +212,8 @@ fn copy_file_range(
     let mut source_offset = source_offset;
     let mut destination_offset = destination_offset;
     let result = unsafe {
-        libc::copy_file_range(
+        libc::syscall(
+            libc::SYS_copy_file_range,
             source,
             &mut source_offset,
             destination,
@@ -312,183 +226,6 @@ fn copy_file_range(
         Ok(result as usize)
     } else {
         Err(last_os_error())
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn set_volume_name(path: &Path, name: &str) -> std::io::Result<()> {
-    let path = c_path(path);
-    let mut attributes = empty_attrlist();
-    attributes.volattr = libc::ATTR_VOL_NAME;
-    let name = std::ffi::CString::new(name).expect("volume name has no interior NUL bytes");
-    let reference_size = std::mem::size_of::<libc::attrreference_t>();
-    let mut buffer = vec![0; reference_size + name.as_bytes_with_nul().len()];
-    let reference = libc::attrreference_t {
-        attr_dataoffset: reference_size as i32,
-        attr_length: name.as_bytes_with_nul().len() as u32,
-    };
-    unsafe {
-        std::ptr::write_unaligned(
-            buffer.as_mut_ptr().cast::<libc::attrreference_t>(),
-            reference,
-        );
-        std::ptr::copy_nonoverlapping(
-            name.as_ptr().cast::<u8>(),
-            buffer.as_mut_ptr().add(reference_size),
-            name.as_bytes_with_nul().len(),
-        );
-    }
-
-    syscall_zero(unsafe {
-        libc::setattrlist(
-            path.as_ptr(),
-            (&mut attributes as *mut libc::attrlist).cast(),
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            0,
-        )
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn get_volume_name(path: &Path) -> std::io::Result<String> {
-    let path = c_path(path);
-    let mut attributes = empty_attrlist();
-    attributes.volattr = libc::ATTR_VOL_NAME;
-    let mut buffer = vec![0u8; 512];
-    syscall_zero(unsafe {
-        libc::getattrlist(
-            path.as_ptr(),
-            (&mut attributes as *mut libc::attrlist).cast(),
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            0,
-        )
-    })?;
-
-    let reference_offset = std::mem::size_of::<u32>();
-    let reference = unsafe {
-        std::ptr::read_unaligned(
-            buffer
-                .as_ptr()
-                .add(reference_offset)
-                .cast::<libc::attrreference_t>(),
-        )
-    };
-    let start = reference_offset + reference.attr_dataoffset as usize;
-    let end = start + reference.attr_length as usize;
-    let bytes = &buffer[start..end.saturating_sub(1)];
-    String::from_utf8(bytes.to_vec())
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-}
-
-#[cfg(target_os = "macos")]
-fn exchange_data(left: &Path, right: &Path) -> std::io::Result<()> {
-    let left = c_path(left);
-    let right = c_path(right);
-    syscall_zero(unsafe { libc::exchangedata(left.as_ptr(), right.as_ptr(), 0) })
-}
-
-#[cfg(target_os = "macos")]
-fn set_file_crtime_and_bkuptime(
-    path: &Path,
-    crtime: std::time::SystemTime,
-    bkuptime: std::time::SystemTime,
-) -> std::io::Result<()> {
-    let path = c_path(path);
-    let mut attributes = empty_attrlist();
-    attributes.commonattr = libc::ATTR_CMN_CRTIME | libc::ATTR_CMN_BKUPTIME;
-    let mut times = PackedTimes {
-        crtime: timespec_from_system_time(crtime),
-        bkuptime: timespec_from_system_time(bkuptime),
-    };
-    syscall_zero(unsafe {
-        libc::setattrlist(
-            path.as_ptr(),
-            (&mut attributes as *mut libc::attrlist).cast(),
-            (&mut times as *mut PackedTimes).cast(),
-            std::mem::size_of::<PackedTimes>(),
-            0,
-        )
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn get_file_xtimes(path: &Path) -> std::io::Result<(std::time::SystemTime, std::time::SystemTime)> {
-    let path = c_path(path);
-    let mut attributes = empty_attrlist();
-    attributes.commonattr = libc::ATTR_CMN_CRTIME | libc::ATTR_CMN_BKUPTIME;
-    let mut times = PackedReturnedTimes {
-        length: 0,
-        crtime: zero_timespec(),
-        bkuptime: zero_timespec(),
-    };
-    syscall_zero(unsafe {
-        libc::getattrlist(
-            path.as_ptr(),
-            (&mut attributes as *mut libc::attrlist).cast(),
-            (&mut times as *mut PackedReturnedTimes).cast(),
-            std::mem::size_of::<PackedReturnedTimes>(),
-            0,
-        )
-    })?;
-    let crtime = times.crtime;
-    let bkuptime = times.bkuptime;
-    Ok((
-        system_time_from_timespec(crtime),
-        system_time_from_timespec(bkuptime),
-    ))
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C, packed(4))]
-struct PackedTimes {
-    crtime: libc::timespec,
-    bkuptime: libc::timespec,
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C, packed(4))]
-struct PackedReturnedTimes {
-    length: u32,
-    crtime: libc::timespec,
-    bkuptime: libc::timespec,
-}
-
-#[cfg(target_os = "macos")]
-fn empty_attrlist() -> libc::attrlist {
-    libc::attrlist {
-        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
-        reserved: 0,
-        commonattr: 0,
-        volattr: 0,
-        dirattr: 0,
-        fileattr: 0,
-        forkattr: 0,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn timespec_from_system_time(time: std::time::SystemTime) -> libc::timespec {
-    let duration = time
-        .duration_since(UNIX_EPOCH)
-        .expect("timestamp is after the unix epoch");
-    libc::timespec {
-        tv_sec: duration.as_secs() as _,
-        tv_nsec: duration.subsec_nanos() as _,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn system_time_from_timespec(time: libc::timespec) -> std::time::SystemTime {
-    UNIX_EPOCH + Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
-}
-
-#[cfg(target_os = "macos")]
-fn zero_timespec() -> libc::timespec {
-    libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
     }
 }
 
@@ -548,20 +285,6 @@ fn syscall_zero(result: libc::c_int) -> std::io::Result<()> {
 #[cfg(target_os = "linux")]
 fn unsupported_ioctl_command() -> libc::Ioctl {
     0
-}
-
-#[cfg(target_os = "macos")]
-fn unsupported_ioctl_command() -> libc::c_ulong {
-    0
-}
-
-#[cfg(target_os = "macos")]
-fn macos_optional_operation_may_be_unrouted(errno: Option<i32>) -> bool {
-    matches!(errno, Some(libc::ENOSYS | libc::ENOTSUP | libc::EINVAL))
-}
-
-fn c_path(path: &Path) -> std::ffi::CString {
-    std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path has no interior NUL bytes")
 }
 
 fn last_os_error() -> std::io::Error {
