@@ -2685,20 +2685,17 @@ mod tests {
         assert!(
             !rename_mode(fuser::RenameFlags::empty()).expect("empty rename flags are supported")
         );
-        #[cfg(target_os = "linux")]
-        {
-            assert!(
-                rename_mode(fuser::RenameFlags::RENAME_NOREPLACE)
-                    .expect("noreplace rename flag is supported")
-            );
-            assert_eq!(
-                rename_mode(fuser::RenameFlags::from_bits_retain(0x4000))
-                    .expect_err("unknown rename flags are rejected")
-                    .errno()
-                    .code(),
-                fuser::Errno::EINVAL.code()
-            );
-        }
+        assert!(
+            rename_mode(fuser::RenameFlags::RENAME_NOREPLACE)
+                .expect("noreplace rename flag is supported")
+        );
+        assert_eq!(
+            rename_mode(fuser::RenameFlags::from_bits_retain(0x4000))
+                .expect_err("unknown rename flags are rejected")
+                .errno()
+                .code(),
+            fuser::Errno::EINVAL.code()
+        );
     }
 
     #[test]

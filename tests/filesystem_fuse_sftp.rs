@@ -1,25 +1,17 @@
-#[cfg(target_os = "linux")]
+#![cfg(target_os = "linux")]
+
 mod support;
 
-#[cfg(target_os = "linux")]
 use std::env;
-#[cfg(target_os = "linux")]
 use std::fs;
-#[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
 use std::process::{Command, Output};
-#[cfg(target_os = "linux")]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[cfg(target_os = "linux")]
 use support::{TestDirectories, mount, open_test_filesystem};
 
-#[cfg(target_os = "linux")]
 #[test]
 fn openssh_sftp_workflows_use_mounted_filesystem_successfully() {
     let directories = TestDirectories::new();
@@ -116,7 +108,6 @@ fn openssh_sftp_workflows_use_mounted_filesystem_successfully() {
     );
 }
 
-#[cfg(target_os = "linux")]
 fn run_sftp_batch(mount: &Path, batch: PathBuf, commands: &[String]) {
     fs::write(&batch, commands.join("\n") + "\n").expect("SFTP batch file is written");
     let output = Command::new(sftp_client())
@@ -135,7 +126,6 @@ fn run_sftp_batch(mount: &Path, batch: PathBuf, commands: &[String]) {
     assert_success(output);
 }
 
-#[cfg(target_os = "linux")]
 fn sftp_client() -> PathBuf {
     executable(
         "sftp",
@@ -143,7 +133,6 @@ fn sftp_client() -> PathBuf {
     )
 }
 
-#[cfg(target_os = "linux")]
 fn sftp_server() -> PathBuf {
     executable(
         "sftp-server",
@@ -156,7 +145,6 @@ fn sftp_server() -> PathBuf {
     )
 }
 
-#[cfg(target_os = "linux")]
 fn executable(name: &str, candidates: &[PathBuf]) -> PathBuf {
     candidates
         .iter()
@@ -166,7 +154,6 @@ fn executable(name: &str, candidates: &[PathBuf]) -> PathBuf {
         .unwrap_or_else(|| panic!("required executable `{name}` was not found"))
 }
 
-#[cfg(target_os = "linux")]
 fn executable_from_path(name: &str) -> Option<PathBuf> {
     env::var_os("PATH").and_then(|paths| {
         env::split_paths(&paths)
@@ -175,7 +162,6 @@ fn executable_from_path(name: &str) -> Option<PathBuf> {
     })
 }
 
-#[cfg(target_os = "linux")]
 fn assert_success(output: Output) {
     assert!(
         output.status.success(),
@@ -185,12 +171,10 @@ fn assert_success(output: Output) {
     );
 }
 
-#[cfg(target_os = "linux")]
 fn output_text(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-#[cfg(target_os = "linux")]
 fn set_file_times(path: &Path, atime: SystemTime, mtime: SystemTime) -> std::io::Result<()> {
     let path = c_path(path);
     let times = [
@@ -205,7 +189,6 @@ fn set_file_times(path: &Path, atime: SystemTime, mtime: SystemTime) -> std::io:
     }
 }
 
-#[cfg(target_os = "linux")]
 fn timespec_from_system_time(time: SystemTime) -> libc::timespec {
     let duration = time
         .duration_since(UNIX_EPOCH)
@@ -216,19 +199,16 @@ fn timespec_from_system_time(time: SystemTime) -> libc::timespec {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn system_time_seconds(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .expect("timestamp is after the unix epoch")
         .as_secs()
 }
 
-#[cfg(target_os = "linux")]
 fn c_path(path: &Path) -> std::ffi::CString {
     std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path has no interior NUL bytes")
 }
 
-#[cfg(target_os = "linux")]
 fn last_os_error() -> std::io::Error {
     std::io::Error::last_os_error()
 }

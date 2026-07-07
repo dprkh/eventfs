@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 mod support;
 
 use std::fs::{self, OpenOptions};
@@ -183,7 +185,6 @@ fn mounted_namespace_edge_case_failures_do_not_append_events() {
     );
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn mounted_linux_rename_noreplace_succeeds_or_fails_without_extra_events() {
     let directories = TestDirectories::new();
@@ -235,7 +236,6 @@ fn mounted_linux_rename_noreplace_succeeds_or_fails_without_extra_events() {
     );
 }
 
-#[cfg(target_os = "linux")]
 fn rename_noreplace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
     let from = c_path(from);
     let to = c_path(to);
@@ -255,14 +255,12 @@ fn rename_noreplace(from: &std::path::Path, to: &std::path::Path) -> std::io::Re
     }
 }
 
-#[cfg(target_os = "linux")]
 fn c_path(path: &std::path::Path) -> std::ffi::CString {
     use std::os::unix::ffi::OsStrExt;
 
     std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path has no interior NUL bytes")
 }
 
-#[cfg(target_os = "linux")]
 fn last_os_error() -> std::io::Error {
     std::io::Error::last_os_error()
 }

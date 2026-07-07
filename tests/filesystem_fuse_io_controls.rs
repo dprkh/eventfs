@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 mod support;
 
 use std::fs::OpenOptions;
@@ -65,7 +67,6 @@ fn mounted_ioctl_and_poll_do_not_append_events_and_are_unsupported_when_routed()
     );
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn mounted_linux_removed_data_operations_do_not_append_events() {
     let directories = TestDirectories::new();
@@ -180,7 +181,6 @@ fn poll_file(fd: libc::c_int) -> std::io::Result<libc::c_short> {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn seek(fd: libc::c_int, offset: libc::off_t, whence: libc::c_int) -> std::io::Result<libc::off_t> {
     let result = unsafe { libc::lseek(fd, offset, whence) };
     if result >= 0 {
@@ -190,7 +190,6 @@ fn seek(fd: libc::c_int, offset: libc::off_t, whence: libc::c_int) -> std::io::R
     }
 }
 
-#[cfg(target_os = "linux")]
 fn fallocate(
     fd: libc::c_int,
     mode: libc::c_int,
@@ -200,7 +199,6 @@ fn fallocate(
     syscall_zero(unsafe { libc::fallocate(fd, mode, offset, length) })
 }
 
-#[cfg(target_os = "linux")]
 fn copy_file_range(
     source: libc::c_int,
     destination: libc::c_int,
@@ -282,7 +280,6 @@ fn syscall_zero(result: libc::c_int) -> std::io::Result<()> {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn unsupported_ioctl_command() -> libc::Ioctl {
     0
 }
