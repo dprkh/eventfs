@@ -162,24 +162,39 @@ pub(crate) fn open_database_path(path: &Path) -> Result<Storage, FilesystemError
         database
     };
     let write_state = load_write_state(&database)?;
-    let active_branch =
-        stored_branch_in_database(&database, BranchIdentifier::new(write_state.active_branch_identifier))?;
+    let active_branch = stored_branch_in_database(
+        &database,
+        BranchIdentifier::new(write_state.active_branch_identifier),
+    )?;
+    let active_namespace_root =
+        namespace_root_in_database(&database, &active_branch.namespace_identifier)?;
     let active_namespace =
         namespace_state_for_identifier_in_database(&database, &active_branch.namespace_identifier)?;
-    Ok(storage(database, write_state, active_branch, active_namespace))
+    Ok(storage(
+        database,
+        write_state,
+        active_branch,
+        active_namespace_root,
+        active_namespace,
+    ))
 }
 
 fn storage(
     database: DB,
     write_state: WriteState,
     active_branch: StoredBranch,
+    active_namespace_root: StoredNamespaceRoot,
     active_namespace: MaterializedBranchState,
 ) -> Storage {
     let active_branch_identifier = write_state.active_branch_identifier;
     Storage {
         database,
         write_state: Mutex::new(write_state),
-        active_branch_state: Mutex::new(ActiveBranchState::new(active_branch, active_namespace)),
+        active_branch_state: Mutex::new(ActiveBranchState::new(
+            active_branch,
+            active_namespace_root,
+            active_namespace,
+        )),
         active_branch_identifier: AtomicU64::new(active_branch_identifier),
     }
 }
@@ -270,6 +285,10 @@ const EVENT_PAYLOAD_PART_WRITTEN: u8 = b'w';
 const CONTENT_CHUNK_HASH_BLAKE3: u8 = 1;
 const CONTENT_MANIFEST_HASH_BLAKE3: u8 = 2;
 const NAMESPACE_HASH_BLAKE3: u8 = 3;
+const NAMESPACE_MAP_LEAF_MAX_ENTRIES: usize = 32;
+const NAMESPACE_MAP_TAG_INODES: u8 = b'i';
+const NAMESPACE_MAP_TAG_DIRECTORY_ENTRIES: u8 = b'd';
+const NAMESPACE_MAP_TAG_EXTENDED_ATTRIBUTES: u8 = b'x';
 
 #[derive(Clone, Debug)]
 struct BackingFileSystemStatistics {
@@ -298,6 +317,7 @@ enum WriteDurability {
 #[derive(Clone, Debug)]
 struct ActiveBranchState {
     branch: StoredBranch,
+    namespace_root: StoredNamespaceRoot,
     namespace: MaterializedBranchState,
     file_extents: BTreeMap<u64, Vec<StoredExtent>>,
 }
@@ -305,7 +325,8 @@ struct ActiveBranchState {
 #[derive(Clone, Debug)]
 struct ActiveBranchCommit {
     branch: StoredBranch,
-    namespace: MaterializedBranchState,
+    namespace_root: StoredNamespaceRoot,
+    mutation: StoredMutation,
     file_extents: Option<(FileIdentifier, Vec<StoredExtent>)>,
 }
 
@@ -465,8 +486,9 @@ struct FileSnapshotWriteContext<'a> {
     event: &'a EventRecord,
     file_identifier: FileIdentifier,
     branch_position: BranchPosition,
-    namespace: &'a MaterializedBranchState,
+    final_inode: Option<&'a StoredInode>,
     snapshot_extents: Option<&'a [StoredExtent]>,
+    snapshot_content_manifest_identifier: Option<&'a [u8]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -536,6 +558,45 @@ struct MaterializedBranchState {
     inodes: BTreeMap<u64, StoredInode>,
     directory_entries: BTreeMap<(u64, Vec<u8>), StoredDirectoryEntry>,
     extended_attributes: BTreeMap<(u64, Vec<u8>), Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+enum StoredNamespaceNode {
+    Root(StoredNamespaceRoot),
+    Branch(Vec<StoredNamespaceChild>),
+    Leaf(Vec<StoredNamespaceEntry>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+struct StoredNamespaceRoot {
+    inodes: Vec<u8>,
+    directory_entries: Vec<u8>,
+    extended_attributes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+struct StoredNamespaceChild {
+    nibble: u8,
+    identifier: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+struct StoredNamespaceEntry {
+    key: Vec<u8>,
+    value: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NamespaceMapKind {
+    Inodes,
+    DirectoryEntries,
+    ExtendedAttributes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NamespaceMapMutation {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -630,6 +691,52 @@ impl MaterializedBranchState {
     }
 }
 
+fn namespace_inode_after_mutation<'a>(
+    namespace: &'a MaterializedBranchState,
+    mutation: &'a StoredMutation,
+    inode_number: u64,
+) -> Option<&'a StoredInode> {
+    if mutation
+        .inode_deletes
+        .iter()
+        .any(|deleted| *deleted == inode_number)
+    {
+        return None;
+    }
+    mutation
+        .inode_puts
+        .iter()
+        .rev()
+        .find(|put| put.inode_number == inode_number)
+        .map(|put| &put.inode)
+        .or_else(|| namespace.inodes.get(&inode_number))
+}
+
+impl ActiveBranchState {
+    fn new(
+        branch: StoredBranch,
+        namespace_root: StoredNamespaceRoot,
+        namespace: MaterializedBranchState,
+    ) -> Self {
+        Self {
+            branch,
+            namespace_root,
+            namespace,
+            file_extents: BTreeMap::new(),
+        }
+    }
+
+    fn apply_commit(&mut self, commit: ActiveBranchCommit) {
+        self.branch = commit.branch;
+        self.namespace_root = commit.namespace_root;
+        self.namespace.apply(&commit.mutation);
+        self.file_extents.clear();
+        if let Some((file_identifier, extents)) = commit.file_extents {
+            self.file_extents.insert(file_identifier.get(), extents);
+        }
+    }
+}
+
 fn update_parent_after_entry_removal(
     removed_inode: &StoredInode,
     parent_inode: &mut StoredInode,
@@ -713,8 +820,11 @@ impl Storage {
     }
 
     pub(crate) fn current_branch(&self) -> Result<BranchRecord, FilesystemError> {
-        let branch_identifier = self.active_branch_identifier();
-        self.branch_record(branch_identifier)
+        let active = self
+            .active_branch_state
+            .lock()
+            .map_err(|_| FilesystemError::Database)?;
+        branch_record_from_stored(active.branch.clone())
     }
 
     pub(crate) fn list_branches(
@@ -835,10 +945,13 @@ impl Storage {
             .lock()
             .map_err(|_| FilesystemError::Database)?;
         let branch_identifier = self.branch_identifier_by_name(name)?;
-        let record = self.branch_record(branch_identifier)?;
-        if record.status() != BranchStatus::Open {
+        let stored = self.stored_branch(branch_identifier)?;
+        if stored.status != BranchStatus::Open {
             return Err(FilesystemError::Integrity);
         }
+        let namespace_root = namespace_root_in_database(&self.database, &stored.namespace_identifier)?;
+        let namespace = self.namespace_state(&stored.namespace_identifier)?;
+        let record = branch_record_from_stored(stored.clone())?;
         let mut batch = WriteBatch::default();
         self.put_metadata_u64(
             &mut batch,
@@ -850,6 +963,11 @@ impl Storage {
         write_state.active_branch_identifier = branch_identifier.get();
         write_state.active_branch_head_sequence = record.head_sequence().get();
         write_state.active_branch_head_ordinal = record.head_position().ordinal();
+        *self
+            .active_branch_state
+            .lock()
+            .map_err(|_| FilesystemError::Database)? =
+            ActiveBranchState::new(stored, namespace_root, namespace);
         self.active_branch_identifier
             .store(branch_identifier.get(), Ordering::SeqCst);
         Ok(record)
@@ -1188,18 +1306,21 @@ impl Storage {
             EventKind::MetadataChanged,
             UtcDateTime::now(),
             file_identifier_for_kind(inode_number, inode.kind),
-            inode_event_path(
-                self.active_branch_identifier(),
-                inode_number,
-                &inode,
-                &self.database,
-            )
-            .ok(),
+            self.active_inode_event_path(inode_number, &inode).ok(),
             None,
             None,
         );
-        self.commit_event(&mut batch, event_sequence, &event, mutation)?;
-        self.commit_mutation(&mut write_state, batch, event_sequence, None)?;
+        let mut active_state = self.lock_active_branch_state()?;
+        let active_commit =
+            self.commit_event(&mut batch, &active_state, event_sequence, &event, mutation)?;
+        self.commit_mutation(
+            &mut write_state,
+            &mut active_state,
+            batch,
+            event_sequence,
+            None,
+            active_commit,
+        )?;
 
         Ok(EntrySnapshot {
             ttl: FUSE_ATTRIBUTE_TTL,
@@ -1262,12 +1383,7 @@ impl Storage {
         let event_sequence = write_state.next_event_sequence()?;
         let next_inode_number = next_inode_number_after(inode_number)?;
         let now = StoredTime::now();
-        let path = child_event_path(
-            self.active_branch_identifier(),
-            parent,
-            &name_bytes,
-            &self.database,
-        )?;
+        let path = self.active_child_event_path(parent, &name_bytes)?;
         let (stored_kind, rdev, size, symlink_target, event_kind) = match kind {
             CreateNodeKind::Directory => (
                 StoredNodeKind::Directory,
@@ -1338,7 +1454,9 @@ impl Storage {
         }
         touch_loaded_directory(&mut parent_inode, now);
         mutation.put_inode(parent, &parent_inode);
-        self.commit_event(&mut batch, event_sequence, &event, mutation)?;
+        let mut active_state = self.lock_active_branch_state()?;
+        let active_commit =
+            self.commit_event(&mut batch, &active_state, event_sequence, &event, mutation)?;
         self.put_metadata_u64(
             &mut batch,
             METADATA_KEY_NEXT_INODE_NUMBER,
@@ -1346,9 +1464,11 @@ impl Storage {
         )?;
         self.commit_mutation(
             &mut write_state,
+            &mut active_state,
             batch,
             event_sequence,
             Some(next_inode_number),
+            active_commit,
         )?;
 
         Ok(EntrySnapshot {
@@ -1406,12 +1526,7 @@ impl Storage {
         let event_sequence = write_state.next_event_sequence()?;
         let next_inode_number = next_inode_number_after(inode_number)?;
         let now = StoredTime::now();
-        let path = child_event_path(
-            self.active_branch_identifier(),
-            parent,
-            &name_bytes,
-            &self.database,
-        )?;
+        let path = self.active_child_event_path(parent, &name_bytes)?;
         let target_bytes = target.as_os_str().as_bytes().to_vec();
         let (uid, gid, mode) =
             created_inode_metadata(&parent_inode, StoredNodeKind::Symlink, metadata);
@@ -1451,7 +1566,9 @@ impl Storage {
         mutation.put_directory_entry(parent, &name_bytes, &entry);
         touch_loaded_directory(&mut parent_inode, now);
         mutation.put_inode(parent, &parent_inode);
-        self.commit_event(&mut batch, event_sequence, &event, mutation)?;
+        let mut active_state = self.lock_active_branch_state()?;
+        let active_commit =
+            self.commit_event(&mut batch, &active_state, event_sequence, &event, mutation)?;
         self.put_metadata_u64(
             &mut batch,
             METADATA_KEY_NEXT_INODE_NUMBER,
@@ -1459,9 +1576,11 @@ impl Storage {
         )?;
         self.commit_mutation(
             &mut write_state,
+            &mut active_state,
             batch,
             event_sequence,
             Some(next_inode_number),
+            active_commit,
         )?;
 
         Ok(EntrySnapshot {
@@ -1517,12 +1636,7 @@ impl Storage {
 
         let event_sequence = write_state.next_event_sequence()?;
         let now = StoredTime::now();
-        let new_path = child_event_path(
-            self.active_branch_identifier(),
-            new_parent,
-            &new_name_bytes,
-            &self.database,
-        )?;
+        let new_path = self.active_child_event_path(new_parent, &new_name_bytes)?;
         let mut batch = WriteBatch::default();
         let mut removed_destination = None;
 
@@ -1593,8 +1707,17 @@ impl Storage {
         if let Some(new_parent_inode) = &new_parent_inode {
             mutation.put_inode(new_parent, new_parent_inode);
         }
-        self.commit_event(&mut batch, event_sequence, &event, mutation)?;
-        self.commit_mutation(&mut write_state, batch, event_sequence, None)
+        let mut active_state = self.lock_active_branch_state()?;
+        let active_commit =
+            self.commit_event(&mut batch, &active_state, event_sequence, &event, mutation)?;
+        self.commit_mutation(
+            &mut write_state,
+            &mut active_state,
+            batch,
+            event_sequence,
+            None,
+            active_commit,
+        )
     }
 
     pub(crate) fn hard_link(
@@ -1625,12 +1748,7 @@ impl Storage {
         let now = StoredTime::now();
         inode.nlink = inode.nlink.saturating_add(1);
         inode.ctime = now;
-        let path = child_event_path(
-            self.active_branch_identifier(),
-            new_parent,
-            &name_bytes,
-            &self.database,
-        )?;
+        let path = self.active_child_event_path(new_parent, &name_bytes)?;
         let mut batch = WriteBatch::default();
         let mut mutation = StoredMutation::default();
         mutation.put_inode(inode_number, &inode);
@@ -1650,8 +1768,17 @@ impl Storage {
             None,
             None,
         );
-        self.commit_event(&mut batch, event_sequence, &event, mutation)?;
-        self.commit_mutation(&mut write_state, batch, event_sequence, None)?;
+        let mut active_state = self.lock_active_branch_state()?;
+        let active_commit =
+            self.commit_event(&mut batch, &active_state, event_sequence, &event, mutation)?;
+        self.commit_mutation(
+            &mut write_state,
+            &mut active_state,
+            batch,
+            event_sequence,
+            None,
+            active_commit,
+        )?;
 
         Ok(EntrySnapshot {
             ttl: FUSE_ATTRIBUTE_TTL,
@@ -1683,9 +1810,8 @@ impl Storage {
         offset: u64,
         size: u32,
     ) -> FuseResult<Vec<u8>> {
-        let snapshot = self.database.snapshot();
         let inode = self
-            .inode_from_snapshot(&snapshot, inode_number)
+            .inode(inode_number)
             .map_err(to_fuse_integrity)?
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))?;
         if inode.kind != StoredNodeKind::RegularFile {
@@ -1695,7 +1821,6 @@ impl Storage {
             return Ok(Vec::new());
         }
         let readable = u64::from(size).min(inode.size - offset) as usize;
-        drop(snapshot);
         self.read_extent_range(
             ExtentSet::Current {
                 branch: self.active_branch_identifier(),
@@ -1778,7 +1903,7 @@ impl Storage {
         )?;
         let content_manifest_identifier = self.put_content_manifest(&mut batch, &final_extents)?;
         inode.size = new_size;
-        inode.content_manifest_identifier = Some(content_manifest_identifier);
+        inode.content_manifest_identifier = Some(content_manifest_identifier.clone());
         inode.mtime = now;
         inode.ctime = now;
         if clear_suid_sgid {
@@ -1792,13 +1917,7 @@ impl Storage {
             EventKind::FileWritten,
             UtcDateTime::now(),
             Some(FileIdentifier::new(inode_number)),
-            inode_event_path(
-                self.active_branch_identifier(),
-                inode_number,
-                &inode,
-                &self.database,
-            )
-            .ok(),
+            self.active_inode_event_path(inode_number, &inode).ok(),
             Some(offset),
             Some(data.len() as u64),
         )
@@ -1808,8 +1927,10 @@ impl Storage {
             overwritten_byte_length: overwritten_end.saturating_sub(offset),
             written_byte_length: data.len() as u64,
         });
-        self.commit_event_with_payloads(
+        let mut active_state = self.lock_active_branch_state()?;
+        let active_commit = self.commit_event_with_payloads(
             &mut batch,
+            &active_state,
             event_sequence,
             &event,
             EventPayloadExtents::FileWrite {
@@ -1817,9 +1938,17 @@ impl Storage {
                 written_extents: written_payload_extents,
             },
             Some(&final_extents),
+            Some(&content_manifest_identifier),
             mutation,
         )?;
-        self.commit_mutation(&mut write_state, batch, event_sequence, None)?;
+        self.commit_mutation(
+            &mut write_state,
+            &mut active_state,
+            batch,
+            event_sequence,
+            None,
+            active_commit,
+        )?;
 
         Ok(FuseWrite {
             written: data.len() as u32,
@@ -1841,11 +1970,9 @@ impl Storage {
     where
         F: FnMut(DirectoryEntrySnapshot) -> bool,
     {
-        let snapshot = self.database.snapshot();
-        let state = self
-            .namespace_state_from_snapshot(&snapshot, self.active_branch_identifier())
-            .map_err(to_fuse_integrity)?;
-        let inode = state
+        let active = self.lock_active_branch_state()?;
+        let inode = active
+            .namespace
             .inodes
             .get(&inode_number)
             .cloned()
@@ -1880,7 +2007,7 @@ impl Storage {
         }
 
         for (entry_offset, ((parent, name), entry)) in (FUSE_DIRECTORY_ENTRY_FIRST_OFFSET..)
-            .zip(state.directory_entries.range((inode_number, Vec::new())..))
+            .zip(active.namespace.directory_entries.range((inode_number, Vec::new())..))
         {
             if *parent != inode_number {
                 break;
@@ -1908,11 +2035,9 @@ impl Storage {
     where
         F: FnMut(DirectoryEntryPlusSnapshot) -> bool,
     {
-        let snapshot = self.database.snapshot();
-        let state = self
-            .namespace_state_from_snapshot(&snapshot, self.active_branch_identifier())
-            .map_err(to_fuse_integrity)?;
-        let inode = state
+        let active = self.lock_active_branch_state()?;
+        let inode = active
+            .namespace
             .inodes
             .get(&inode_number)
             .cloned()
@@ -1940,7 +2065,8 @@ impl Storage {
             } else {
                 inode.parent
             };
-            let parent_inode = state
+            let parent_inode = active
+                .namespace
                 .inodes
                 .get(&parent_number)
                 .cloned()
@@ -1959,13 +2085,14 @@ impl Storage {
         }
 
         for (entry_offset, ((parent, name), entry)) in (FUSE_DIRECTORY_ENTRY_FIRST_OFFSET..)
-            .zip(state.directory_entries.range((inode_number, Vec::new())..))
+            .zip(active.namespace.directory_entries.range((inode_number, Vec::new())..))
         {
             if *parent != inode_number {
                 break;
             }
             if entry_offset > offset {
-                let entry_inode = state
+                let entry_inode = active
+                    .namespace
                     .inodes
                     .get(&entry.inode)
                     .cloned()
@@ -2062,18 +2189,21 @@ impl Storage {
             EventKind::ExtendedAttributeSet,
             UtcDateTime::now(),
             file_identifier_for_kind(inode_number, inode.kind),
-            inode_event_path(
-                self.active_branch_identifier(),
-                inode_number,
-                &inode,
-                &self.database,
-            )
-            .ok(),
+            self.active_inode_event_path(inode_number, &inode).ok(),
             None,
             Some(value.len() as u64),
         );
-        self.commit_event(&mut batch, event_sequence, &event, mutation)?;
-        self.commit_mutation(&mut write_state, batch, event_sequence, None)
+        let mut active_state = self.lock_active_branch_state()?;
+        let active_commit =
+            self.commit_event(&mut batch, &active_state, event_sequence, &event, mutation)?;
+        self.commit_mutation(
+            &mut write_state,
+            &mut active_state,
+            batch,
+            event_sequence,
+            None,
+            active_commit,
+        )
     }
 
     pub(crate) fn getxattr(&self, inode_number: u64, name: &OsStr) -> FuseResult<Vec<u8>> {
@@ -2088,8 +2218,9 @@ impl Storage {
     }
 
     pub(crate) fn listxattr(&self, inode_number: u64) -> FuseResult<ExtendedAttributeList> {
-        let state = self.active_namespace_state().map_err(to_fuse_integrity)?;
-        state
+        let active = self.lock_active_branch_state()?;
+        active
+            .namespace
             .inodes
             .get(&inode_number)
             .ok_or(FuseError::Errno(fuser::Errno::ENOENT))
@@ -2098,7 +2229,8 @@ impl Storage {
                 Ok(inode)
             })?;
         let mut bytes = Vec::new();
-        for ((attribute_inode, name), _value) in state
+        for ((attribute_inode, name), _value) in active
+            .namespace
             .extended_attributes
             .range((inode_number, Vec::new())..)
         {
@@ -2141,18 +2273,21 @@ impl Storage {
             EventKind::ExtendedAttributeRemoved,
             UtcDateTime::now(),
             file_identifier_for_kind(inode_number, inode.kind),
-            inode_event_path(
-                self.active_branch_identifier(),
-                inode_number,
-                &inode,
-                &self.database,
-            )
-            .ok(),
+            self.active_inode_event_path(inode_number, &inode).ok(),
             None,
             None,
         );
-        self.commit_event(&mut batch, event_sequence, &event, mutation)?;
-        self.commit_mutation(&mut write_state, batch, event_sequence, None)
+        let mut active_state = self.lock_active_branch_state()?;
+        let active_commit =
+            self.commit_event(&mut batch, &active_state, event_sequence, &event, mutation)?;
+        self.commit_mutation(
+            &mut write_state,
+            &mut active_state,
+            batch,
+            event_sequence,
+            None,
+            active_commit,
+        )
     }
 
     pub(crate) fn volume_name(&self) -> Result<String, FilesystemError> {
@@ -2163,12 +2298,34 @@ impl Storage {
         self.write_state.lock().map_err(|_| FuseError::Database)
     }
 
+    fn lock_active_branch_state(&self) -> FuseResult<MutexGuard<'_, ActiveBranchState>> {
+        self.active_branch_state
+            .lock()
+            .map_err(|_| FuseError::Database)
+    }
+
+    fn active_child_event_path(&self, parent: u64, name: &[u8]) -> FuseResult<String> {
+        let active = self.lock_active_branch_state()?;
+        child_event_path(parent, name, &active.namespace)
+    }
+
+    fn active_inode_event_path(
+        &self,
+        inode_number: u64,
+        inode: &StoredInode,
+    ) -> FuseResult<String> {
+        let active = self.lock_active_branch_state()?;
+        inode_event_path(inode_number, inode, &active.namespace)
+    }
+
     fn commit_mutation(
         &self,
         write_state: &mut WriteState,
+        active_state: &mut ActiveBranchState,
         batch: WriteBatch,
         event_sequence: EventSequence,
         next_inode_number: Option<u64>,
+        active_commit: ActiveBranchCommit,
     ) -> FuseResult<()> {
         write_batch_with_durability(&self.database, batch, WriteDurability::Buffered)
             .map_err(|_| FuseError::Database)?;
@@ -2176,6 +2333,7 @@ impl Storage {
         if let Some(next_inode_number) = next_inode_number {
             write_state.record_committed_inode_number(next_inode_number);
         }
+        active_state.apply_commit(active_commit);
         Ok(())
     }
 
@@ -2221,7 +2379,7 @@ impl Storage {
         let mut batch = WriteBatch::default();
         let content_manifest_identifier = self.put_content_manifest(&mut batch, &final_extents)?;
         inode.size = new_size;
-        inode.content_manifest_identifier = Some(content_manifest_identifier);
+        inode.content_manifest_identifier = Some(content_manifest_identifier.clone());
         let mut mutation = StoredMutation::default();
         mutation.put_inode(inode_number, &inode);
 
@@ -2230,13 +2388,7 @@ impl Storage {
             EventKind::FileWritten,
             UtcDateTime::now(),
             Some(FileIdentifier::new(inode_number)),
-            inode_event_path(
-                self.active_branch_identifier(),
-                inode_number,
-                &inode,
-                &self.database,
-            )
-            .ok(),
+            self.active_inode_event_path(inode_number, &inode).ok(),
             Some(offset),
             Some(0),
         )
@@ -2246,8 +2398,10 @@ impl Storage {
             overwritten_byte_length,
             written_byte_length: 0,
         });
-        self.commit_event_with_payloads(
+        let mut active_state = self.lock_active_branch_state()?;
+        let active_commit = self.commit_event_with_payloads(
             &mut batch,
+            &active_state,
             event_sequence,
             &event,
             EventPayloadExtents::FileWrite {
@@ -2255,9 +2409,17 @@ impl Storage {
                 written_extents: Vec::new(),
             },
             Some(&final_extents),
+            Some(&content_manifest_identifier),
             mutation,
         )?;
-        self.commit_mutation(&mut *write_state, batch, event_sequence, None)?;
+        self.commit_mutation(
+            &mut *write_state,
+            &mut active_state,
+            batch,
+            event_sequence,
+            None,
+            active_commit,
+        )?;
 
         Ok(EntrySnapshot {
             ttl: FUSE_ATTRIBUTE_TTL,
@@ -2292,12 +2454,7 @@ impl Storage {
         let event_sequence = write_state.next_event_sequence()?;
         let now = StoredTime::now();
         let inode_before = inode.clone();
-        let path = child_event_path(
-            self.active_branch_identifier(),
-            parent,
-            &name_bytes,
-            &self.database,
-        )?;
+        let path = self.active_child_event_path(parent, &name_bytes)?;
         let mut batch = WriteBatch::default();
         update_parent_after_entry_removal(&inode, &mut parent_inode, now);
         let event = EventRecord::new(
@@ -2324,8 +2481,17 @@ impl Storage {
             linked_inode.ctime = now;
             mutation.put_inode(entry.inode, &linked_inode);
         }
-        self.commit_event(&mut batch, event_sequence, &event, mutation)?;
-        self.commit_mutation(&mut write_state, batch, event_sequence, None)
+        let mut active_state = self.lock_active_branch_state()?;
+        let active_commit =
+            self.commit_event(&mut batch, &active_state, event_sequence, &event, mutation)?;
+        self.commit_mutation(
+            &mut write_state,
+            &mut active_state,
+            batch,
+            event_sequence,
+            None,
+            active_commit,
+        )
     }
 
     fn entry_snapshot(&self, inode_number: u64) -> FuseResult<EntrySnapshot> {
@@ -2352,8 +2518,9 @@ impl Storage {
     }
 
     fn directory_is_empty(&self, inode_number: u64) -> FuseResult<bool> {
-        let state = self.active_namespace_state().map_err(to_fuse_integrity)?;
-        Ok(!state
+        let active = self.lock_active_branch_state()?;
+        Ok(!active
+            .namespace
             .directory_entries
             .keys()
             .any(|(parent, _name)| *parent == inode_number))
@@ -2382,7 +2549,10 @@ impl Storage {
 
     fn inode(&self, inode_number: u64) -> Result<Option<StoredInode>, FilesystemError> {
         Ok(self
-            .active_namespace_state()?
+            .active_branch_state
+            .lock()
+            .map_err(|_| FilesystemError::Database)?
+            .namespace
             .inodes
             .get(&inode_number)
             .cloned())
@@ -2470,10 +2640,6 @@ impl Storage {
             .and_then(|value| decode_branch(&value))
     }
 
-    fn active_namespace_state(&self) -> Result<MaterializedBranchState, FilesystemError> {
-        self.namespace_state_for_branch(self.active_branch_identifier())
-    }
-
     fn namespace_state_for_branch(
         &self,
         branch_identifier: BranchIdentifier,
@@ -2486,43 +2652,22 @@ impl Storage {
         &self,
         namespace_identifier: &[u8],
     ) -> Result<MaterializedBranchState, FilesystemError> {
-        let namespace_identifier = NamespaceIdentifier::from_bytes(namespace_identifier)?;
-        let namespace_nodes = self.namespace_nodes()?;
-        let value = self
-            .database
-            .get_pinned_cf(namespace_nodes, namespace_identifier.as_bytes())
-            .map_err(|_| FilesystemError::Database)?
-            .ok_or(FilesystemError::Integrity)?;
-        validate_namespace(namespace_identifier.as_bytes(), &value)?;
-        decode_namespace_state(&value)
+        namespace_state_for_identifier_in_database(&self.database, namespace_identifier)
     }
 
-    fn namespace_state_from_snapshot(
-        &self,
-        snapshot: &rocksdb::Snapshot<'_>,
-        branch_identifier: BranchIdentifier,
-    ) -> Result<MaterializedBranchState, FilesystemError> {
-        let branches = self.branches()?;
-        let branch = snapshot
-            .get_pinned_cf(branches, encode_u64(branch_identifier.get()))
-            .map_err(|_| FilesystemError::Database)?
-            .ok_or(FilesystemError::Integrity)
-            .and_then(|value| decode_branch(&value))?;
-        let namespace_nodes = self.namespace_nodes()?;
-        let value = snapshot
-            .get_pinned_cf(namespace_nodes, &branch.namespace_identifier)
-            .map_err(|_| FilesystemError::Database)?
-            .ok_or(FilesystemError::Integrity)?;
-        validate_namespace(&branch.namespace_identifier, &value)?;
-        decode_namespace_state(&value)
-    }
-
-    fn put_namespace_state(
+    fn put_namespace_mutation(
         &self,
         batch: &mut WriteBatch,
-        state: &MaterializedBranchState,
-    ) -> Result<Vec<u8>, FilesystemError> {
-        put_namespace_state_in_database(&self.database, batch, state)
+        active_state: &ActiveBranchState,
+        mutation: &StoredMutation,
+    ) -> Result<(Vec<u8>, StoredNamespaceRoot), FilesystemError> {
+        put_namespace_mutation_from_active_in_database(
+            &self.database,
+            batch,
+            &active_state.namespace_root,
+            &active_state.namespace,
+            mutation,
+        )
     }
 
     fn branch_record(
@@ -2714,39 +2859,28 @@ impl Storage {
         self.branch_root_snapshot_at_or_before_sequence(branch, file_identifier, sequence)
     }
 
-    fn inode_from_snapshot(
-        &self,
-        snapshot: &rocksdb::Snapshot<'_>,
-        inode_number: u64,
-    ) -> Result<Option<StoredInode>, FilesystemError> {
-        Ok(self
-            .namespace_state_from_snapshot(snapshot, self.active_branch_identifier())?
-            .inodes
-            .get(&inode_number)
-            .cloned())
-    }
-
     fn directory_entry(
         &self,
         parent: u64,
         name: &[u8],
     ) -> Result<Option<StoredDirectoryEntry>, FilesystemError> {
         Ok(self
-            .active_namespace_state()?
+            .active_branch_state
+            .lock()
+            .map_err(|_| FilesystemError::Database)?
+            .namespace
             .directory_entries
             .get(&(parent, name.to_vec()))
             .cloned())
     }
 
     fn extended_attribute(&self, inode_number: u64, name: &[u8]) -> FuseResult<Option<Vec<u8>>> {
-        self.active_namespace_state()
-            .map_err(to_fuse_integrity)
-            .map(|state| {
-                state
-                    .extended_attributes
-                    .get(&(inode_number, name.to_vec()))
-                    .cloned()
-            })
+        Ok(self
+            .lock_active_branch_state()?
+            .namespace
+            .extended_attributes
+            .get(&(inode_number, name.to_vec()))
+            .cloned())
     }
 
     fn file_content_manifest_extents(
@@ -2754,6 +2888,10 @@ impl Storage {
         branch: BranchIdentifier,
         file_identifier: FileIdentifier,
     ) -> Result<Vec<StoredExtent>, FilesystemError> {
+        if branch == self.active_branch_identifier() {
+            return self.active_file_content_manifest_extents(file_identifier);
+        }
+
         let state = self.namespace_state_for_branch(branch)?;
         let inode = state
             .inodes
@@ -2764,6 +2902,43 @@ impl Storage {
             .as_deref()
             .ok_or(FilesystemError::Integrity)?;
         self.content_manifest_extents(identifier)
+    }
+
+    fn active_file_content_manifest_extents(
+        &self,
+        file_identifier: FileIdentifier,
+    ) -> Result<Vec<StoredExtent>, FilesystemError> {
+        let identifier = {
+            let active = self
+                .active_branch_state
+                .lock()
+                .map_err(|_| FilesystemError::Database)?;
+            if let Some(extents) = active.file_extents.get(&file_identifier.get()) {
+                return Ok(extents.clone());
+            }
+            active
+                .namespace
+                .inodes
+                .get(&file_identifier.get())
+                .and_then(|inode| inode.content_manifest_identifier.clone())
+                .ok_or(FilesystemError::Integrity)?
+        };
+        let extents = self.content_manifest_extents(&identifier)?;
+        let mut active = self
+            .active_branch_state
+            .lock()
+            .map_err(|_| FilesystemError::Database)?;
+        let current_identifier = active
+            .namespace
+            .inodes
+            .get(&file_identifier.get())
+            .and_then(|inode| inode.content_manifest_identifier.as_deref());
+        if current_identifier == Some(identifier.as_slice()) {
+            active
+                .file_extents
+                .insert(file_identifier.get(), extents.clone());
+        }
+        Ok(extents)
     }
 
     fn branch_root_at_position(
@@ -2802,15 +2977,18 @@ impl Storage {
     fn commit_event(
         &self,
         batch: &mut WriteBatch,
+        active_state: &ActiveBranchState,
         event_sequence: EventSequence,
         event: &EventRecord,
         mutation: StoredMutation,
-    ) -> FuseResult<()> {
+    ) -> FuseResult<ActiveBranchCommit> {
         self.commit_event_with_payloads(
             batch,
+            active_state,
             event_sequence,
             event,
             EventPayloadExtents::None,
+            None,
             None,
             mutation,
         )
@@ -2819,27 +2997,26 @@ impl Storage {
     fn commit_event_with_payloads(
         &self,
         batch: &mut WriteBatch,
+        active_state: &ActiveBranchState,
         event_sequence: EventSequence,
         event: &EventRecord,
         payload_extents: EventPayloadExtents,
         snapshot_extents: Option<&[StoredExtent]>,
+        snapshot_content_manifest_identifier: Option<&[u8]>,
         mutation: StoredMutation,
-    ) -> FuseResult<()> {
+    ) -> FuseResult<ActiveBranchCommit> {
         let events = self.events().map_err(|_| FuseError::Integrity)?;
         let metadata = self.metadata().map_err(|_| FuseError::Integrity)?;
         let branches = self.branches().map_err(|_| FuseError::Integrity)?;
-        let branch_identifier = self.active_branch_identifier();
-        let mut branch = self
-            .stored_branch(branch_identifier)
-            .map_err(|_| FuseError::Integrity)?;
+        let branch_identifier = BranchIdentifier::new(active_state.branch.identifier);
+        if branch_identifier != self.active_branch_identifier() {
+            return Err(FuseError::Integrity);
+        }
+        let mut branch = active_state.branch.clone();
         let first_parent = EventSequence::new(branch.head_sequence);
         let branch_position = BranchPosition::new(branch_identifier, branch.head_ordinal + 1);
-        let mut namespace = self
-            .namespace_state(&branch.namespace_identifier)
-            .map_err(|_| FuseError::Integrity)?;
-        namespace.apply(&mutation);
-        let namespace_identifier = self
-            .put_namespace_state(batch, &namespace)
+        let (namespace_identifier, namespace_root) = self
+            .put_namespace_mutation(batch, active_state, &mutation)
             .map_err(|_| FuseError::Integrity)?;
         let event = event
             .clone()
@@ -2861,7 +3038,7 @@ impl Storage {
             event_key,
             encode_stored_event(&StoredEvent {
                 record: event.clone(),
-                mutation,
+                mutation: mutation.clone(),
             })
             .map_err(|_| FuseError::Database)?,
         );
@@ -2881,19 +3058,36 @@ impl Storage {
             &namespace_identifier,
         )
         .map_err(|_| FuseError::Integrity)?;
+        let snapshot_inode = event
+            .file_identifier()
+            .and_then(|file_identifier| {
+                namespace_inode_after_mutation(
+                    &active_state.namespace,
+                    &mutation,
+                    file_identifier.get(),
+                )
+            });
         self.put_file_snapshot_for_event(
             batch,
             event_sequence,
             &event,
-            &namespace,
+            snapshot_inode,
             snapshot_extents,
+            snapshot_content_manifest_identifier,
         )?;
         batch.put_cf(
             metadata,
             METADATA_KEY_LAST_COMMITTED_EVENT_SEQUENCE,
             encode_u64(event_sequence.get()),
         );
-        Ok(())
+        let file_extents = snapshot_extents
+            .and_then(|extents| event.file_identifier().map(|file| (file, extents.to_vec())));
+        Ok(ActiveBranchCommit {
+            branch,
+            namespace_root,
+            mutation,
+            file_extents,
+        })
     }
 
     fn put_event_payloads(
@@ -2966,7 +3160,10 @@ impl Storage {
             return Err(FuseError::Integrity);
         }
         for (stored, pending) in extents.iter().zip(pending) {
-            self.put_content_chunk(
+            if stored.chunk_identifier != pending.chunk_identifier {
+                return Err(FuseError::Integrity);
+            }
+            self.put_verified_content_chunk(
                 batch,
                 &stored.chunk_identifier,
                 &bytes[pending.byte_range()],
@@ -2996,13 +3193,14 @@ impl Storage {
         Ok(())
     }
 
-    fn put_content_chunk(
+    fn put_verified_content_chunk(
         &self,
         batch: &mut WriteBatch,
         chunk_identifier: &[u8],
         bytes: &[u8],
     ) -> FuseResult<()> {
-        validate_content_chunk(chunk_identifier, bytes).map_err(to_fuse_integrity)?;
+        validate_prefixed_blake3_identifier_shape(chunk_identifier, CONTENT_CHUNK_HASH_BLAKE3)
+            .map_err(to_fuse_integrity)?;
         let content_chunks = self.content_chunks().map_err(|_| FuseError::Integrity)?;
         if let Some(existing) = self
             .database
@@ -3026,19 +3224,10 @@ impl Storage {
     ) -> FuseResult<Vec<u8>> {
         let bytes = encode_content_manifest(extents).map_err(|_| FuseError::Database)?;
         let identifier = content_manifest_identifier_for_bytes(&bytes);
-        let manifests = self
-            .content_manifest_nodes()
-            .map_err(|_| FuseError::Integrity)?;
-        if let Some(existing) = self
-            .database
-            .get_pinned_cf(manifests, &identifier)
-            .map_err(|_| FuseError::Database)?
-        {
-            validate_content_manifest(&identifier, &existing).map_err(to_fuse_integrity)?;
-            if existing.as_ref() != bytes {
-                return Err(FuseError::Integrity);
-            }
-        } else if !extents.is_empty() {
+        if !extents.is_empty() {
+            let manifests = self
+                .content_manifest_nodes()
+                .map_err(|_| FuseError::Integrity)?;
             batch.put_cf(manifests, &identifier, bytes);
         }
         Ok(identifier)
@@ -3244,8 +3433,9 @@ impl Storage {
         batch: &mut WriteBatch,
         event_sequence: EventSequence,
         event: &EventRecord,
-        namespace: &MaterializedBranchState,
+        final_inode: Option<&StoredInode>,
         snapshot_extents: Option<&[StoredExtent]>,
+        snapshot_content_manifest_identifier: Option<&[u8]>,
     ) -> FuseResult<()> {
         let Some(branch_position) = event.branch_position() else {
             return Err(FuseError::Integrity);
@@ -3264,8 +3454,9 @@ impl Storage {
                     event,
                     file_identifier,
                     branch_position,
-                    namespace,
+                    final_inode,
                     snapshot_extents,
+                    snapshot_content_manifest_identifier,
                 },
             )?;
         }
@@ -3279,13 +3470,15 @@ impl Storage {
     ) -> FuseResult<()> {
         let file_size =
             event_snapshot_file_size(context.event, context.file_identifier).unwrap_or(0);
-        let content_manifest_identifier = if let Some(extents) = context.snapshot_extents {
+        let content_manifest_identifier = if let Some(identifier) =
+            context.snapshot_content_manifest_identifier
+        {
+            identifier.to_vec()
+        } else if let Some(extents) = context.snapshot_extents {
             self.put_content_manifest(batch, extents)?
         } else {
             context
-                .namespace
-                .inodes
-                .get(&context.file_identifier.get())
+                .final_inode
                 .and_then(|inode| inode.content_manifest_identifier.clone())
                 .unwrap_or(empty_content_manifest_identifier().map_err(to_fuse_integrity)?)
         };
@@ -3361,6 +3554,7 @@ impl Storage {
             .ok_or(FilesystemError::Integrity)
     }
 
+    #[cfg(test)]
     fn namespace_nodes(&self) -> Result<&ColumnFamily, FilesystemError> {
         self.database
             .cf_handle(COLUMN_FAMILY_NAMESPACE_NODES)
@@ -3819,19 +4013,22 @@ fn validate_allocator_metadata(
 }
 
 fn max_stored_inode_number(database: &DB) -> Result<u64, FilesystemError> {
-    let namespace_nodes = database
-        .cf_handle(COLUMN_FAMILY_NAMESPACE_NODES)
+    let branch_roots = database
+        .cf_handle(COLUMN_FAMILY_BRANCH_ROOTS)
         .ok_or(FilesystemError::Integrity)?;
     let mut maximum = INODE_ROOT;
-    let mut iterator = database.raw_iterator_cf(namespace_nodes);
+    let mut seen_roots = BTreeSet::new();
+    let mut iterator = database.raw_iterator_cf(branch_roots);
     iterator.seek_to_first();
     while iterator.valid() {
-        let key = iterator.key().ok_or(FilesystemError::Database)?;
         let value = iterator.value().ok_or(FilesystemError::Database)?;
-        validate_namespace(key, value)?;
-        let state = decode_namespace_state(value)?;
-        for inode_number in state.inodes.keys() {
-            maximum = maximum.max(*inode_number);
+        let root = decode_branch_root(value)?;
+        if seen_roots.insert(root.namespace_identifier.clone()) {
+            let state =
+                namespace_state_for_identifier_in_database(database, &root.namespace_identifier)?;
+            for inode_number in state.inodes.keys() {
+                maximum = maximum.max(*inode_number);
+            }
         }
         iterator.next();
     }
@@ -4045,23 +4242,409 @@ fn put_namespace_state_in_database(
     batch: &mut WriteBatch,
     state: &MaterializedBranchState,
 ) -> Result<Vec<u8>, FilesystemError> {
-    let bytes = encode_namespace_state(state)?;
+    let root = StoredNamespaceRoot {
+        inodes: put_namespace_map_from_entries(
+            database,
+            batch,
+            NamespaceMapKind::Inodes,
+            namespace_inode_entries(&state.inodes)?,
+        )?,
+        directory_entries: put_namespace_map_from_entries(
+            database,
+            batch,
+            NamespaceMapKind::DirectoryEntries,
+            namespace_directory_entry_entries(&state.directory_entries)?,
+        )?,
+        extended_attributes: put_namespace_map_from_entries(
+            database,
+            batch,
+            NamespaceMapKind::ExtendedAttributes,
+            namespace_extended_attribute_entries(&state.extended_attributes),
+        )?,
+    };
+    put_namespace_node_in_database(database, batch, &StoredNamespaceNode::Root(root))
+}
+
+#[cfg(test)]
+fn put_namespace_mutation_in_database(
+    database: &DB,
+    batch: &mut WriteBatch,
+    namespace_identifier: &[u8],
+    mutation: &StoredMutation,
+) -> Result<Vec<u8>, FilesystemError> {
+    let mut root = namespace_root_in_database(database, namespace_identifier)?;
+    root.inodes = put_namespace_map_mutations(
+        database,
+        batch,
+        NamespaceMapKind::Inodes,
+        &root.inodes,
+        namespace_inode_mutations(mutation)?,
+    )?;
+    root.directory_entries = put_namespace_map_mutations(
+        database,
+        batch,
+        NamespaceMapKind::DirectoryEntries,
+        &root.directory_entries,
+        namespace_directory_entry_mutations(mutation)?,
+    )?;
+    root.extended_attributes = put_namespace_map_mutations(
+        database,
+        batch,
+        NamespaceMapKind::ExtendedAttributes,
+        &root.extended_attributes,
+        namespace_extended_attribute_mutations(mutation),
+    )?;
+    put_namespace_node_in_database(database, batch, &StoredNamespaceNode::Root(root))
+}
+
+fn put_namespace_mutation_from_active_in_database(
+    database: &DB,
+    batch: &mut WriteBatch,
+    active_root: &StoredNamespaceRoot,
+    active_state: &MaterializedBranchState,
+    mutation: &StoredMutation,
+) -> Result<(Vec<u8>, StoredNamespaceRoot), FilesystemError> {
+    let mut root = active_root.clone();
+    root.inodes = put_namespace_map_mutations_with_active_entries(
+        database,
+        batch,
+        NamespaceMapKind::Inodes,
+        &root.inodes,
+        namespace_inode_entries(&active_state.inodes)?,
+        namespace_inode_mutations(mutation)?,
+    )?;
+    root.directory_entries = put_namespace_map_mutations_with_active_entries(
+        database,
+        batch,
+        NamespaceMapKind::DirectoryEntries,
+        &root.directory_entries,
+        namespace_directory_entry_entries(&active_state.directory_entries)?,
+        namespace_directory_entry_mutations(mutation)?,
+    )?;
+    root.extended_attributes = put_namespace_map_mutations_with_active_entries(
+        database,
+        batch,
+        NamespaceMapKind::ExtendedAttributes,
+        &root.extended_attributes,
+        namespace_extended_attribute_entries(&active_state.extended_attributes),
+        namespace_extended_attribute_mutations(mutation),
+    )?;
+    let identifier =
+        put_namespace_node_in_database(database, batch, &StoredNamespaceNode::Root(root.clone()))?;
+    Ok((identifier, root))
+}
+
+fn namespace_root_in_database(
+    database: &DB,
+    namespace_identifier: &[u8],
+) -> Result<StoredNamespaceRoot, FilesystemError> {
+    match namespace_node_in_database(database, namespace_identifier)? {
+        StoredNamespaceNode::Root(root) => Ok(root),
+        StoredNamespaceNode::Branch(_) | StoredNamespaceNode::Leaf(_) => {
+            Err(FilesystemError::Integrity)
+        }
+    }
+}
+
+fn namespace_node_in_database(
+    database: &DB,
+    namespace_identifier: &[u8],
+) -> Result<StoredNamespaceNode, FilesystemError> {
+    let namespace_identifier = NamespaceIdentifier::from_bytes(namespace_identifier)?;
+    let namespace_nodes = database
+        .cf_handle(COLUMN_FAMILY_NAMESPACE_NODES)
+        .ok_or(FilesystemError::Integrity)?;
+    let value = database
+        .get_pinned_cf(namespace_nodes, namespace_identifier.as_bytes())
+        .map_err(|_| FilesystemError::Database)?
+        .ok_or(FilesystemError::Integrity)?;
+    validate_namespace(namespace_identifier.as_bytes(), &value)?;
+    decode_namespace_node(&value)
+}
+
+fn put_namespace_node_in_database(
+    database: &DB,
+    batch: &mut WriteBatch,
+    node: &StoredNamespaceNode,
+) -> Result<Vec<u8>, FilesystemError> {
+    let bytes = encode_namespace_node(node)?;
     let identifier = namespace_identifier_for_bytes(&bytes);
     let namespace_nodes = database
         .cf_handle(COLUMN_FAMILY_NAMESPACE_NODES)
         .ok_or(FilesystemError::Integrity)?;
-    if let Some(existing) = database
-        .get_pinned_cf(namespace_nodes, &identifier)
-        .map_err(|_| FilesystemError::Database)?
-    {
-        validate_namespace(&identifier, &existing)?;
-        if existing.as_ref() != bytes {
-            return Err(FilesystemError::Integrity);
+    batch.put_cf(namespace_nodes, &identifier, bytes);
+    Ok(identifier)
+}
+
+fn put_namespace_map_mutations(
+    database: &DB,
+    batch: &mut WriteBatch,
+    kind: NamespaceMapKind,
+    root_identifier: &[u8],
+    mutations: Vec<NamespaceMapMutation>,
+) -> Result<Vec<u8>, FilesystemError> {
+    if mutations.len() > 1 {
+        let mut entries = namespace_map_entries_in_database(database, root_identifier)?;
+        for mutation in mutations {
+            match mutation {
+                NamespaceMapMutation::Put { key, value } => {
+                    entries.insert(key, value);
+                }
+                NamespaceMapMutation::Delete { key } => {
+                    entries.remove(&key);
+                }
+            }
         }
-    } else {
-        batch.put_cf(namespace_nodes, &identifier, bytes);
+        return put_namespace_map_from_entries(
+            database,
+            batch,
+            kind,
+            entries
+                .into_iter()
+                .map(|(key, value)| StoredNamespaceEntry { key, value })
+                .collect(),
+        );
+    }
+
+    let mut identifier = root_identifier.to_vec();
+    for mutation in mutations {
+        identifier = match mutation {
+            NamespaceMapMutation::Put { key, value } => {
+                let path = namespace_map_entry_path(kind, &key);
+                put_namespace_map_entry_at(database, batch, kind, &identifier, key, value, path, 0)?
+            }
+            NamespaceMapMutation::Delete { key } => {
+                let path = namespace_map_entry_path(kind, &key);
+                delete_namespace_map_entry_at(database, batch, kind, &identifier, &key, path, 0)?.0
+            }
+        };
     }
     Ok(identifier)
+}
+
+fn put_namespace_map_mutations_with_active_entries(
+    database: &DB,
+    batch: &mut WriteBatch,
+    kind: NamespaceMapKind,
+    root_identifier: &[u8],
+    active_entries: Vec<StoredNamespaceEntry>,
+    mutations: Vec<NamespaceMapMutation>,
+) -> Result<Vec<u8>, FilesystemError> {
+    if mutations.is_empty() {
+        return Ok(root_identifier.to_vec());
+    }
+    if active_entries.len() <= NAMESPACE_MAP_LEAF_MAX_ENTRIES || mutations.len() > 1 {
+        let mut entries = BTreeMap::new();
+        for entry in active_entries {
+            if entries.insert(entry.key, entry.value).is_some() {
+                return Err(FilesystemError::Integrity);
+            }
+        }
+        for mutation in mutations {
+            match mutation {
+                NamespaceMapMutation::Put { key, value } => {
+                    entries.insert(key, value);
+                }
+                NamespaceMapMutation::Delete { key } => {
+                    entries.remove(&key);
+                }
+            }
+        }
+        return put_namespace_map_from_entries(
+            database,
+            batch,
+            kind,
+            entries
+                .into_iter()
+                .map(|(key, value)| StoredNamespaceEntry { key, value })
+                .collect(),
+        );
+    }
+    put_namespace_map_mutations(database, batch, kind, root_identifier, mutations)
+}
+
+fn namespace_map_entries_in_database(
+    database: &DB,
+    root_identifier: &[u8],
+) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, FilesystemError> {
+    let mut entries = BTreeMap::new();
+    collect_namespace_map_entries(database, root_identifier, &mut entries)?;
+    Ok(entries)
+}
+
+fn collect_namespace_map_entries(
+    database: &DB,
+    node_identifier: &[u8],
+    entries: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+) -> Result<(), FilesystemError> {
+    match namespace_node_in_database(database, node_identifier)? {
+        StoredNamespaceNode::Leaf(leaf_entries) => {
+            validate_namespace_entries(&leaf_entries)?;
+            for entry in leaf_entries {
+                if entries.insert(entry.key, entry.value).is_some() {
+                    return Err(FilesystemError::Integrity);
+                }
+            }
+            Ok(())
+        }
+        StoredNamespaceNode::Branch(children) => {
+            validate_namespace_children(&children)?;
+            for child in children {
+                collect_namespace_map_entries(database, &child.identifier, entries)?;
+            }
+            Ok(())
+        }
+        StoredNamespaceNode::Root(_) => Err(FilesystemError::Integrity),
+    }
+}
+
+fn put_namespace_map_from_entries(
+    database: &DB,
+    batch: &mut WriteBatch,
+    kind: NamespaceMapKind,
+    entries: Vec<StoredNamespaceEntry>,
+) -> Result<Vec<u8>, FilesystemError> {
+    put_namespace_map_entries_at(database, batch, kind, entries, 0)
+}
+
+fn put_namespace_map_entry_at(
+    database: &DB,
+    batch: &mut WriteBatch,
+    kind: NamespaceMapKind,
+    node_identifier: &[u8],
+    key: Vec<u8>,
+    value: Vec<u8>,
+    path: [u8; 32],
+    depth: usize,
+) -> Result<Vec<u8>, FilesystemError> {
+    match namespace_node_in_database(database, node_identifier)? {
+        StoredNamespaceNode::Leaf(mut entries) => {
+            validate_namespace_entries(&entries)?;
+            match entries.binary_search_by(|entry| entry.key.as_slice().cmp(key.as_slice())) {
+                Ok(index) => entries[index].value = value,
+                Err(index) => entries.insert(index, StoredNamespaceEntry { key, value }),
+            }
+            put_namespace_map_entries_at(database, batch, kind, entries, depth)
+        }
+        StoredNamespaceNode::Branch(mut children) => {
+            validate_namespace_children(&children)?;
+            let nibble = namespace_path_nibble(path, depth)?;
+            match children.binary_search_by_key(&nibble, |child| child.nibble) {
+                Ok(index) => {
+                    let child_identifier = put_namespace_map_entry_at(
+                        database,
+                        batch,
+                        kind,
+                        &children[index].identifier,
+                        key,
+                        value,
+                        path,
+                        depth + 1,
+                    )?;
+                    children[index].identifier = child_identifier;
+                }
+                Err(index) => {
+                    let child_identifier = put_namespace_map_entries_at(
+                        database,
+                        batch,
+                        kind,
+                        vec![StoredNamespaceEntry { key, value }],
+                        depth + 1,
+                    )?;
+                    children.insert(
+                        index,
+                        StoredNamespaceChild {
+                            nibble,
+                            identifier: child_identifier,
+                        },
+                    );
+                }
+            }
+            put_namespace_node_in_database(database, batch, &StoredNamespaceNode::Branch(children))
+        }
+        StoredNamespaceNode::Root(_) => Err(FilesystemError::Integrity),
+    }
+}
+
+fn delete_namespace_map_entry_at(
+    database: &DB,
+    batch: &mut WriteBatch,
+    kind: NamespaceMapKind,
+    node_identifier: &[u8],
+    key: &[u8],
+    path: [u8; 32],
+    depth: usize,
+) -> Result<(Vec<u8>, bool), FilesystemError> {
+    match namespace_node_in_database(database, node_identifier)? {
+        StoredNamespaceNode::Leaf(mut entries) => {
+            validate_namespace_entries(&entries)?;
+            if let Ok(index) = entries.binary_search_by(|entry| entry.key.as_slice().cmp(key)) {
+                entries.remove(index);
+            }
+            let is_empty = entries.is_empty();
+            let identifier = put_namespace_map_entries_at(database, batch, kind, entries, depth)?;
+            Ok((identifier, is_empty))
+        }
+        StoredNamespaceNode::Branch(mut children) => {
+            validate_namespace_children(&children)?;
+            let nibble = namespace_path_nibble(path, depth)?;
+            if let Ok(index) = children.binary_search_by_key(&nibble, |child| child.nibble) {
+                let (child_identifier, child_is_empty) = delete_namespace_map_entry_at(
+                    database,
+                    batch,
+                    kind,
+                    &children[index].identifier,
+                    key,
+                    path,
+                    depth + 1,
+                )?;
+                if child_is_empty {
+                    children.remove(index);
+                } else {
+                    children[index].identifier = child_identifier;
+                }
+            }
+            if children.is_empty() {
+                let identifier = put_namespace_map_entries_at(database, batch, kind, Vec::new(), depth)?;
+                return Ok((identifier, true));
+            }
+            let identifier =
+                put_namespace_node_in_database(database, batch, &StoredNamespaceNode::Branch(children))?;
+            Ok((identifier, false))
+        }
+        StoredNamespaceNode::Root(_) => Err(FilesystemError::Integrity),
+    }
+}
+
+fn put_namespace_map_entries_at(
+    database: &DB,
+    batch: &mut WriteBatch,
+    kind: NamespaceMapKind,
+    entries: Vec<StoredNamespaceEntry>,
+    depth: usize,
+) -> Result<Vec<u8>, FilesystemError> {
+    validate_namespace_entries(&entries)?;
+    if entries.len() <= NAMESPACE_MAP_LEAF_MAX_ENTRIES || depth >= 64 {
+        return put_namespace_node_in_database(database, batch, &StoredNamespaceNode::Leaf(entries));
+    }
+
+    let mut grouped: BTreeMap<u8, Vec<StoredNamespaceEntry>> = BTreeMap::new();
+    for entry in entries {
+        let path = namespace_map_entry_path(kind, &entry.key);
+        grouped
+            .entry(namespace_path_nibble(path, depth)?)
+            .or_default()
+            .push(entry);
+    }
+
+    let mut children = Vec::with_capacity(grouped.len());
+    for (nibble, entries) in grouped {
+        children.push(StoredNamespaceChild {
+            nibble,
+            identifier: put_namespace_map_entries_at(database, batch, kind, entries, depth + 1)?,
+        });
+    }
+    put_namespace_node_in_database(database, batch, &StoredNamespaceNode::Branch(children))
 }
 
 fn stored_branch_in_database(
@@ -4099,33 +4682,270 @@ fn namespace_state_for_identifier_in_database(
     database: &DB,
     namespace_identifier: &[u8],
 ) -> Result<MaterializedBranchState, FilesystemError> {
-    let namespace_identifier = NamespaceIdentifier::from_bytes(namespace_identifier)?;
-    let namespace_nodes = database
-        .cf_handle(COLUMN_FAMILY_NAMESPACE_NODES)
-        .ok_or(FilesystemError::Integrity)?;
-    let value = database
-        .get_pinned_cf(namespace_nodes, namespace_identifier.as_bytes())
-        .map_err(|_| FilesystemError::Database)?
-        .ok_or(FilesystemError::Integrity)?;
-    validate_namespace(namespace_identifier.as_bytes(), &value)?;
-    decode_namespace_state(&value)
+    let root = namespace_root_in_database(database, namespace_identifier)?;
+    let mut state = MaterializedBranchState::default();
+    load_namespace_map_into_state(database, NamespaceMapKind::Inodes, &root.inodes, &mut state)?;
+    load_namespace_map_into_state(
+        database,
+        NamespaceMapKind::DirectoryEntries,
+        &root.directory_entries,
+        &mut state,
+    )?;
+    load_namespace_map_into_state(
+        database,
+        NamespaceMapKind::ExtendedAttributes,
+        &root.extended_attributes,
+        &mut state,
+    )?;
+    Ok(state)
 }
 
-fn namespace_state_for_branch_in_database(
+fn load_namespace_map_into_state(
     database: &DB,
-    branch: BranchIdentifier,
-) -> Result<MaterializedBranchState, FilesystemError> {
-    let stored = stored_branch_in_database(database, branch)?;
-    namespace_state_for_identifier_in_database(database, &stored.namespace_identifier)
+    kind: NamespaceMapKind,
+    root_identifier: &[u8],
+    state: &mut MaterializedBranchState,
+) -> Result<(), FilesystemError> {
+    match namespace_node_in_database(database, root_identifier)? {
+        StoredNamespaceNode::Leaf(entries) => {
+            validate_namespace_entries(&entries)?;
+            for entry in entries {
+                insert_namespace_entry_into_state(kind, entry, state)?;
+            }
+            Ok(())
+        }
+        StoredNamespaceNode::Branch(children) => {
+            validate_namespace_children(&children)?;
+            for child in children {
+                load_namespace_map_into_state(database, kind, &child.identifier, state)?;
+            }
+            Ok(())
+        }
+        StoredNamespaceNode::Root(_) => Err(FilesystemError::Integrity),
+    }
+}
+
+fn insert_namespace_entry_into_state(
+    kind: NamespaceMapKind,
+    entry: StoredNamespaceEntry,
+    state: &mut MaterializedBranchState,
+) -> Result<(), FilesystemError> {
+    match kind {
+        NamespaceMapKind::Inodes => {
+            let inode_number = decode_namespace_inode_key(&entry.key)?;
+            let inode = decode_namespace_inode_value(&entry.value)?;
+            state.inodes.insert(inode_number, inode);
+        }
+        NamespaceMapKind::DirectoryEntries => {
+            let key = decode_namespace_pair_key(&entry.key)?;
+            let entry = decode_namespace_directory_entry_value(&entry.value)?;
+            state.directory_entries.insert(key, entry);
+        }
+        NamespaceMapKind::ExtendedAttributes => {
+            let key = decode_namespace_pair_key(&entry.key)?;
+            state.extended_attributes.insert(key, entry.value);
+        }
+    }
+    Ok(())
+}
+
+fn namespace_inode_entries(
+    inodes: &BTreeMap<u64, StoredInode>,
+) -> Result<Vec<StoredNamespaceEntry>, FilesystemError> {
+    inodes
+        .iter()
+        .map(|(inode_number, inode)| {
+            Ok(StoredNamespaceEntry {
+                key: encode_namespace_inode_key(*inode_number),
+                value: encode_namespace_inode_value(inode)?,
+            })
+        })
+        .collect()
+}
+
+fn namespace_directory_entry_entries(
+    entries: &BTreeMap<(u64, Vec<u8>), StoredDirectoryEntry>,
+) -> Result<Vec<StoredNamespaceEntry>, FilesystemError> {
+    entries
+        .iter()
+        .map(|((parent, name), entry)| {
+            Ok(StoredNamespaceEntry {
+                key: encode_namespace_pair_key(*parent, name),
+                value: encode_namespace_directory_entry_value(entry)?,
+            })
+        })
+        .collect()
+}
+
+fn namespace_extended_attribute_entries(
+    attributes: &BTreeMap<(u64, Vec<u8>), Vec<u8>>,
+) -> Vec<StoredNamespaceEntry> {
+    attributes
+        .iter()
+        .map(|((inode_number, name), value)| StoredNamespaceEntry {
+            key: encode_namespace_pair_key(*inode_number, name),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+fn namespace_inode_mutations(
+    mutation: &StoredMutation,
+) -> Result<Vec<NamespaceMapMutation>, FilesystemError> {
+    let mut mutations =
+        Vec::with_capacity(mutation.inode_deletes.len() + mutation.inode_puts.len());
+    for inode_number in &mutation.inode_deletes {
+        mutations.push(NamespaceMapMutation::Delete {
+            key: encode_namespace_inode_key(*inode_number),
+        });
+    }
+    for put in &mutation.inode_puts {
+        mutations.push(NamespaceMapMutation::Put {
+            key: encode_namespace_inode_key(put.inode_number),
+            value: encode_namespace_inode_value(&put.inode)?,
+        });
+    }
+    Ok(mutations)
+}
+
+fn namespace_directory_entry_mutations(
+    mutation: &StoredMutation,
+) -> Result<Vec<NamespaceMapMutation>, FilesystemError> {
+    let mut mutations = Vec::with_capacity(
+        mutation.directory_entry_deletes.len() + mutation.directory_entry_puts.len(),
+    );
+    for delete in &mutation.directory_entry_deletes {
+        mutations.push(NamespaceMapMutation::Delete {
+            key: encode_namespace_pair_key(delete.parent, &delete.name),
+        });
+    }
+    for put in &mutation.directory_entry_puts {
+        mutations.push(NamespaceMapMutation::Put {
+            key: encode_namespace_pair_key(put.parent, &put.name),
+            value: encode_namespace_directory_entry_value(&put.entry)?,
+        });
+    }
+    Ok(mutations)
+}
+
+fn namespace_extended_attribute_mutations(
+    mutation: &StoredMutation,
+) -> Vec<NamespaceMapMutation> {
+    let mut mutations = Vec::with_capacity(
+        mutation.extended_attribute_deletes.len() + mutation.extended_attribute_puts.len(),
+    );
+    for delete in &mutation.extended_attribute_deletes {
+        mutations.push(NamespaceMapMutation::Delete {
+            key: encode_namespace_pair_key(delete.inode_number, &delete.name),
+        });
+    }
+    for put in &mutation.extended_attribute_puts {
+        mutations.push(NamespaceMapMutation::Put {
+            key: encode_namespace_pair_key(put.inode_number, &put.name),
+            value: put.value.clone(),
+        });
+    }
+    mutations
+}
+
+fn encode_namespace_inode_key(inode_number: u64) -> Vec<u8> {
+    encode_u64(inode_number).to_vec()
+}
+
+fn decode_namespace_inode_key(key: &[u8]) -> Result<u64, FilesystemError> {
+    decode_u64(key)
+}
+
+fn encode_namespace_pair_key(inode_number: u64, name: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + name.len());
+    key.extend_from_slice(&encode_u64(inode_number));
+    key.extend_from_slice(name);
+    key
+}
+
+fn decode_namespace_pair_key(key: &[u8]) -> Result<(u64, Vec<u8>), FilesystemError> {
+    if key.len() < 8 {
+        return Err(FilesystemError::Integrity);
+    }
+    Ok((decode_u64(&key[..8])?, key[8..].to_vec()))
+}
+
+fn encode_namespace_inode_value(inode: &StoredInode) -> Result<Vec<u8>, FilesystemError> {
+    postcard::to_allocvec(inode).map_err(|_| FilesystemError::Database)
+}
+
+fn decode_namespace_inode_value(value: &[u8]) -> Result<StoredInode, FilesystemError> {
+    postcard::from_bytes(value).map_err(|_| FilesystemError::Integrity)
+}
+
+fn encode_namespace_directory_entry_value(
+    entry: &StoredDirectoryEntry,
+) -> Result<Vec<u8>, FilesystemError> {
+    postcard::to_allocvec(entry).map_err(|_| FilesystemError::Database)
+}
+
+fn decode_namespace_directory_entry_value(
+    value: &[u8],
+) -> Result<StoredDirectoryEntry, FilesystemError> {
+    postcard::from_bytes(value).map_err(|_| FilesystemError::Integrity)
+}
+
+fn namespace_map_entry_path(kind: NamespaceMapKind, key: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&[kind.tag()]);
+    hasher.update(key);
+    *hasher.finalize().as_bytes()
+}
+
+fn namespace_path_nibble(path: [u8; 32], depth: usize) -> Result<u8, FilesystemError> {
+    let byte = path.get(depth / 2).ok_or(FilesystemError::Integrity)?;
+    if depth.is_multiple_of(2) {
+        Ok(byte >> 4)
+    } else {
+        Ok(byte & 0x0f)
+    }
+}
+
+fn validate_namespace_entries(entries: &[StoredNamespaceEntry]) -> Result<(), FilesystemError> {
+    for pair in entries.windows(2) {
+        if pair[0].key >= pair[1].key {
+            return Err(FilesystemError::Integrity);
+        }
+    }
+    Ok(())
+}
+
+fn validate_namespace_children(children: &[StoredNamespaceChild]) -> Result<(), FilesystemError> {
+    for child in children {
+        if child.nibble > 0x0f {
+            return Err(FilesystemError::Integrity);
+        }
+        NamespaceIdentifier::from_bytes(&child.identifier)?;
+    }
+    for pair in children.windows(2) {
+        if pair[0].nibble >= pair[1].nibble {
+            return Err(FilesystemError::Integrity);
+        }
+    }
+    Ok(())
+}
+
+impl NamespaceMapKind {
+    fn tag(self) -> u8 {
+        match self {
+            Self::Inodes => NAMESPACE_MAP_TAG_INODES,
+            Self::DirectoryEntries => NAMESPACE_MAP_TAG_DIRECTORY_ENTRIES,
+            Self::ExtendedAttributes => NAMESPACE_MAP_TAG_EXTENDED_ATTRIBUTES,
+        }
+    }
 }
 
 fn child_event_path(
-    branch: BranchIdentifier,
     parent: u64,
     name: &[u8],
-    database: &DB,
+    state: &MaterializedBranchState,
 ) -> FuseResult<String> {
-    let mut bytes = inode_path_bytes(branch, parent, database)?;
+    let mut bytes = inode_path_bytes(parent, state)?;
     if bytes.len() > 1 {
         bytes.push(b'/');
     }
@@ -4134,27 +4954,20 @@ fn child_event_path(
 }
 
 fn inode_event_path(
-    branch: BranchIdentifier,
     inode_number: u64,
     inode: &StoredInode,
-    database: &DB,
+    state: &MaterializedBranchState,
 ) -> FuseResult<String> {
     if inode_number == INODE_ROOT {
         return Ok("/".to_owned());
     }
-    child_event_path(branch, inode.parent, &inode.name, database)
+    child_event_path(inode.parent, &inode.name, state)
 }
 
-fn inode_path_bytes(
-    branch: BranchIdentifier,
-    inode_number: u64,
-    database: &DB,
-) -> FuseResult<Vec<u8>> {
+fn inode_path_bytes(inode_number: u64, state: &MaterializedBranchState) -> FuseResult<Vec<u8>> {
     if inode_number == INODE_ROOT {
         return Ok(vec![b'/']);
     }
-    let state =
-        namespace_state_for_branch_in_database(database, branch).map_err(to_fuse_integrity)?;
     let mut current = inode_number;
     let mut visited = BTreeSet::new();
     let mut components: Vec<Vec<u8>> = Vec::new();
@@ -4597,11 +5410,11 @@ fn validate_content_manifest(identifier: &[u8], bytes: &[u8]) -> Result<(), File
     validate_prefixed_blake3_identifier(identifier, CONTENT_MANIFEST_HASH_BLAKE3, bytes)
 }
 
-fn encode_namespace_state(state: &MaterializedBranchState) -> Result<Vec<u8>, FilesystemError> {
-    postcard::to_allocvec(state).map_err(|_| FilesystemError::Database)
+fn encode_namespace_node(node: &StoredNamespaceNode) -> Result<Vec<u8>, FilesystemError> {
+    postcard::to_allocvec(node).map_err(|_| FilesystemError::Database)
 }
 
-fn decode_namespace_state(value: &[u8]) -> Result<MaterializedBranchState, FilesystemError> {
+fn decode_namespace_node(value: &[u8]) -> Result<StoredNamespaceNode, FilesystemError> {
     postcard::from_bytes(value).map_err(|_| FilesystemError::Integrity)
 }
 
@@ -5010,6 +5823,7 @@ mod tests {
         let database = temporary.path().join("database");
         let storage = open_database_path(&database).expect("storage opens");
         let initial = write_state_snapshot(&storage);
+        let initial_active = active_branch_state_snapshot(&storage);
 
         set_write_batch_fault(WriteBatchFault::BeforeWrite);
         assert!(matches!(
@@ -5022,6 +5836,7 @@ mod tests {
         ));
 
         assert_eq!(write_state_snapshot(&storage), initial);
+        assert_eq!(active_branch_state_snapshot(&storage), initial_active);
         assert_eq!(
             storage
                 .last_event_sequence()
@@ -5073,6 +5888,7 @@ mod tests {
         let database = temporary.path().join("database");
         let storage = open_database_path(&database).expect("storage opens");
         let initial = write_state_snapshot(&storage);
+        let initial_active = active_branch_state_snapshot(&storage);
 
         set_write_batch_fault(WriteBatchFault::AfterWrite);
         assert!(matches!(
@@ -5085,6 +5901,7 @@ mod tests {
         ));
 
         assert_eq!(write_state_snapshot(&storage), initial);
+        assert_eq!(active_branch_state_snapshot(&storage), initial_active);
         assert_eq!(
             storage
                 .last_event_sequence()
@@ -5113,6 +5930,7 @@ mod tests {
             .write_file(inode_number, 0, b"abcdef")
             .expect("initial bytes are written");
         let before_fault = write_state_snapshot(&storage);
+        let before_fault_active = active_branch_state_snapshot(&storage);
 
         set_write_batch_fault(WriteBatchFault::BeforeWrite);
         assert!(matches!(
@@ -5121,6 +5939,10 @@ mod tests {
         ));
 
         assert_eq!(write_state_snapshot(&storage), before_fault);
+        assert_eq!(
+            active_branch_state_snapshot(&storage),
+            before_fault_active
+        );
         assert_eq!(
             storage
                 .last_event_sequence()
@@ -5158,6 +5980,7 @@ mod tests {
             .write_file(inode_number, 0, b"abcdef")
             .expect("initial bytes are written");
         let before_fault = write_state_snapshot(&storage);
+        let before_fault_active = active_branch_state_snapshot(&storage);
 
         set_write_batch_fault(WriteBatchFault::AfterWrite);
         assert!(matches!(
@@ -5166,6 +5989,10 @@ mod tests {
         ));
 
         assert_eq!(write_state_snapshot(&storage), before_fault);
+        assert_eq!(
+            active_branch_state_snapshot(&storage),
+            before_fault_active
+        );
         let committed = EventSequence::new(before_fault.last_event_sequence + 1);
         assert_eq!(
             storage
@@ -5237,10 +6064,14 @@ mod tests {
             None,
         );
         let mut batch = WriteBatch::default();
+        let active_state = storage
+            .lock_active_branch_state()
+            .expect("active branch state lock is available");
 
         assert!(matches!(
             storage.commit_event(
                 &mut batch,
+                &active_state,
                 duplicate_sequence,
                 &duplicate_event,
                 StoredMutation::default(),
@@ -7168,7 +7999,7 @@ mod tests {
             Err(FilesystemError::Integrity)
         ));
         assert!(matches!(
-            decode_namespace_state(&[0xff; 8]),
+            decode_namespace_node(&[0xff; 8]),
             Err(FilesystemError::Integrity)
         ));
 
@@ -7195,8 +8026,8 @@ mod tests {
             Err(FilesystemError::Integrity)
         );
 
-        let namespace_bytes =
-            encode_namespace_state(&MaterializedBranchState::default()).expect("namespace encodes");
+        let namespace_bytes = encode_namespace_node(&StoredNamespaceNode::Leaf(Vec::new()))
+            .expect("namespace node encodes");
         let namespace_identifier = namespace_identifier_for_bytes(&namespace_bytes);
         assert_eq!(
             NamespaceIdentifier::from_bytes(&namespace_identifier)
@@ -7277,6 +8108,114 @@ mod tests {
             open_database_path(&database),
             Err(FilesystemError::Integrity)
         ));
+    }
+
+    #[test]
+    fn namespace_trie_round_trips_and_splits_leaf_nodes() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let mut state = MaterializedBranchState::default();
+        for inode_number in 1..=40 {
+            state
+                .inodes
+                .insert(inode_number, test_inode(inode_number, StoredNodeKind::RegularFile));
+        }
+        state.directory_entries.insert(
+            (INODE_ROOT, b"entry".to_vec()),
+            StoredDirectoryEntry {
+                inode: 2,
+                kind: StoredNodeKind::RegularFile,
+            },
+        );
+        state
+            .extended_attributes
+            .insert((2, b"user.eventfs.test".to_vec()), b"value".to_vec());
+
+        let mut batch = WriteBatch::default();
+        let identifier = put_namespace_state_in_database(storage.database(), &mut batch, &state)
+            .expect("namespace trie is written");
+        write_batch(storage.database(), batch).expect("namespace trie batch is committed");
+
+        assert_eq!(
+            namespace_state_for_identifier_in_database(storage.database(), &identifier)
+                .expect("namespace trie is readable"),
+            state
+        );
+        assert!(RootStorageCounts::capture(&storage).namespace_nodes > 4);
+    }
+
+    #[test]
+    fn namespace_mutation_updates_multiple_entries_in_one_map() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let branch = storage.current_branch().expect("current branch is readable");
+        let root = storage
+            .branch_root_at_position(branch.head_position())
+            .expect("branch root is readable");
+        let mut mutation = StoredMutation::default();
+        mutation.put_inode(INODE_ROOT, &test_inode(INODE_ROOT, StoredNodeKind::Directory));
+        mutation.put_inode(2, &test_inode(2, StoredNodeKind::RegularFile));
+
+        let mut batch = WriteBatch::default();
+        let identifier = put_namespace_mutation_in_database(
+            storage.database(),
+            &mut batch,
+            &root.namespace_identifier,
+            &mutation,
+        )
+        .expect("namespace mutation is written");
+        write_batch(storage.database(), batch).expect("namespace mutation batch is committed");
+
+        let old_state =
+            namespace_state_for_identifier_in_database(storage.database(), &root.namespace_identifier)
+                .expect("old namespace remains readable");
+        let new_state = namespace_state_for_identifier_in_database(storage.database(), &identifier)
+            .expect("new namespace is readable");
+        assert!(!old_state.inodes.contains_key(&2));
+        assert_eq!(
+            new_state
+                .inodes
+                .get(&2)
+                .expect("new inode exists")
+                .kind,
+            StoredNodeKind::RegularFile
+        );
+    }
+
+    #[test]
+    fn namespace_trie_rejects_unsorted_entries_and_children() {
+        let empty_leaf_bytes = encode_namespace_node(&StoredNamespaceNode::Leaf(Vec::new()))
+            .expect("empty leaf encodes");
+        let empty_leaf_identifier = namespace_identifier_for_bytes(&empty_leaf_bytes);
+
+        assert_eq!(
+            validate_namespace_entries(&[
+                StoredNamespaceEntry {
+                    key: b"b".to_vec(),
+                    value: Vec::new(),
+                },
+                StoredNamespaceEntry {
+                    key: b"a".to_vec(),
+                    value: Vec::new(),
+                },
+            ]),
+            Err(FilesystemError::Integrity)
+        );
+        assert_eq!(
+            validate_namespace_children(&[
+                StoredNamespaceChild {
+                    nibble: 2,
+                    identifier: empty_leaf_identifier.clone(),
+                },
+                StoredNamespaceChild {
+                    nibble: 2,
+                    identifier: empty_leaf_identifier,
+                },
+            ]),
+            Err(FilesystemError::Integrity)
+        );
     }
 
     #[test]
@@ -8078,6 +9017,62 @@ mod tests {
             .write_state
             .lock()
             .expect("write state lock is available")
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ActiveBranchStateSnapshot {
+        branch: StoredBranch,
+        namespace_root: StoredNamespaceRoot,
+        namespace: MaterializedBranchState,
+        file_extents: BTreeMap<u64, Vec<StoredExtent>>,
+    }
+
+    fn active_branch_state_snapshot(storage: &Storage) -> ActiveBranchStateSnapshot {
+        let active = storage
+            .active_branch_state
+            .lock()
+            .expect("active branch state lock is available");
+        ActiveBranchStateSnapshot {
+            branch: active.branch.clone(),
+            namespace_root: active.namespace_root.clone(),
+            namespace: active.namespace.clone(),
+            file_extents: active.file_extents.clone(),
+        }
+    }
+
+    fn test_inode(inode_number: u64, kind: StoredNodeKind) -> StoredInode {
+        let time = StoredTime {
+            seconds: 0,
+            nanoseconds: 0,
+        };
+        StoredInode {
+            kind,
+            size: 0,
+            nlink: if kind == StoredNodeKind::Directory {
+                2
+            } else {
+                1
+            },
+            uid: 0,
+            gid: 0,
+            mode: if kind == StoredNodeKind::Directory {
+                INODE_MODE_ROOT
+            } else {
+                INODE_MODE_DEFAULT_FILE
+            },
+            rdev: 0,
+            atime: time,
+            mtime: time,
+            ctime: time,
+            parent: INODE_ROOT,
+            name: if inode_number == INODE_ROOT {
+                Vec::new()
+            } else {
+                format!("inode-{inode_number}").into_bytes()
+            },
+            symlink_target: None,
+            content_manifest_identifier: None,
+        }
     }
 
     fn create_regular_file(storage: &Storage, name: &str) -> u64 {

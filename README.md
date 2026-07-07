@@ -74,40 +74,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 # Benchmarks
 
-- DigitalOcean `c-2` CPU-Optimized droplet in `sfo2`
-- 2 Intel vCPUs, 3.8 GiB RAM, no swap, 25 GB disk
-- Intel(R) Xeon(R) Platinum 8358 CPU @ 2.60GHz
-- Ubuntu 24.04 x64, Linux 6.8.0-124-generic
-- FUSE 3.14.0
+- Measured with `./dev.sh bench` on July 7, 2026.
+- Apple M4 Pro host, macOS 26.2 25C56.
+- Apple container Linux VM, Linux 6.18.15 aarch64.
+- 14 CPUs and 49.3 GB RAM exposed to the container.
+- FUSE 3.14.0.
 
 | Operation | eventfs mean | host mean | eventfs / host |
 | --- | ---: | ---: | ---: |
-| `lookup` | 968.22 ns | 901.04 ns | 1.1x |
-| `getattr` | 740.21 ns | 737.59 ns | 1.0x |
-| `access` | 32.717 us | 734.32 ns | 44.6x |
-| `statfs` | 31.113 us | 909.04 ns | 34.2x |
-| `mknod` | 89.561 us | 5.2850 us | 16.9x |
-| `mkdir` | 91.145 us | 14.585 us | 6.2x |
-| `create` | 92.955 us | 6.5674 us | 14.2x |
-| `unlink` | 71.810 us | 8.6320 us | 8.3x |
-| `rmdir` | 74.567 us | 10.957 us | 6.8x |
-| `rename` | 102.17 us | 6.4034 us | 16.0x |
-| `rename_noreplace` | 101.99 us | 6.5282 us | 15.6x |
-| `link` | 99.578 us | 3.5533 us | 28.0x |
-| `symlink` | 101.71 us | 5.7821 us | 17.6x |
-| `readlink` | 37.300 us | 916.93 ns | 40.7x |
-| `open` | 34.745 us | 1.3152 us | 26.4x |
-| `read` | 490.74 ns | 537.27 ns | 0.9x |
-| `write` | 154.89 us | 747.69 ns | 207.2x |
-| `flush` | 27.127 us | 334.74 ns | 81.0x |
-| `release` | 24.526 us | 585.73 ns | 41.9x |
-| `fsync` | 60.436 us | 26.270 us | 2.3x |
-| `opendir` | 53.816 us | 1.7222 us | 31.2x |
-| `readdir` | 123.48 us | 4.2413 us | 29.1x |
-| `readdirplus` | 258.98 us | 20.143 us | 12.9x |
-| `fsyncdir` | 63.865 us | 408.28 ns | 156.4x |
-| `releasedir` | 5.2092 us | 569.03 ns | 9.2x |
-| `setxattr` | 178.65 us | 2.3739 us | 75.3x |
-| `getxattr` | 83.247 us | 1.2457 us | 66.8x |
-| `listxattr` | 56.712 us | 1.1131 us | 50.9x |
-| `removexattr` | 176.73 us | 2.2281 us | 79.3x |
+| `lookup` | 218.10 ns | 215.93 ns | 1.0x |
+| `getattr` | 126.87 ns | 134.23 ns | 0.9x |
+| `setattr_metadata` | 35.335 µs | 281.02 ns | 125.7x |
+| `setattr_size` | 69.746 µs | 460.16 ns | 151.6x |
+| `access` | 207.64 ns | 195.96 ns | 1.1x |
+| `statfs` | 28.540 µs | 272.90 ns | 104.6x |
+| `mknod` | 83.455 µs | 827.73 ns | 100.8x |
+| `mkdir` | 86.459 µs | 53.654 µs | 1.6x |
+| `create` | 96.319 µs | 1.0122 µs | 95.2x |
+| `unlink` | 71.465 µs | 1.0185 µs | 70.2x |
+| `rmdir` | 73.510 µs | 1.3399 µs | 54.9x |
+| `rename` | 96.569 µs | 984.11 ns | 98.1x |
+| `rename_noreplace` | 97.273 µs | 1.0241 µs | 95.0x |
+| `link` | 96.447 µs | 665.70 ns | 144.9x |
+| `symlink` | 94.376 µs | 998.58 ns | 94.5x |
+| `readlink` | 25.142 µs | 248.45 ns | 101.2x |
+| `open` | 25.858 µs | 254.93 ns | 101.4x |
+| `read` | 28.343 µs | 201.09 ns | 140.9x |
+| `write` | 55.232 µs | 235.94 ns | 234.1x |
+| `flush` | 108.30 ns | 107.50 ns | 1.0x |
+| `release` | 2.8680 µs | 153.36 ns | 18.7x |
+| `fsync` | 54.416 µs | 26.272 µs | 2.1x |
+| `opendir` | 22.105 µs | 381.32 ns | 58.0x |
+| `readdir` | 51.691 µs | 535.39 ns | 96.5x |
+| `readdirplus` | 111.06 µs | 4.3872 µs | 25.3x |
+| `fsyncdir` | 51.064 µs | 26.538 µs | 1.9x |
+| `releasedir` | 2.6518 µs | 156.46 ns | 16.9x |
+| `setxattr` | 55.985 µs | 370.63 ns | 151.1x |
+| `getxattr` | 23.552 µs | 292.10 ns | 80.6x |
+| `listxattr` | 23.789 µs | 261.39 ns | 91.0x |
+| `removexattr` | 56.521 µs | 351.28 ns | 160.9x |

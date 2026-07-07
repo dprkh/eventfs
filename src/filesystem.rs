@@ -2129,7 +2129,7 @@ fn validate_open_flags_for_truncate(flags: fuser::OpenFlags) -> Result<(), stora
 
 fn fopen_flags_for_open_flags(flags: fuser::OpenFlags) -> fuser::FopenFlags {
     let _ = flags;
-    fuser::FopenFlags::FOPEN_DIRECT_IO
+    fuser::FopenFlags::FOPEN_DIRECT_IO | fuser::FopenFlags::FOPEN_NOFLUSH
 }
 
 impl Filesystem {

@@ -483,7 +483,7 @@ Storage requirements:
 - `content_chunks` MUST use RocksDB integrated BlobDB.
 - Content chunks MUST be immutable whole BlobDB values.
 - Content manifest nodes MUST be immutable values that reference `content_chunks`.
-- Namespace nodes MUST be immutable values that represent inode metadata, directory entries, extended attributes, and regular file content manifest roots.
+- Namespace nodes MUST be immutable typed Merkle nodes that represent namespace roots, map branches, and map leaves for inode metadata, directory entries, extended attributes, and regular file content manifest roots.
 - Current file state MUST be read from the active branch namespace root.
 - File snapshots and event payloads MUST be represented by content manifest roots.
 - Branch records MUST store the branch head namespace root.
@@ -491,7 +491,7 @@ Storage requirements:
 - Content chunks MUST be created with FastCDC v2020 using minimum 16 KiB, target 64 KiB, maximum 256 KiB, and seed 0.
 - Content chunk identifiers MUST be cryptographic digests of chunk bytes and MUST NOT use FastCDC rolling fingerprints.
 - Content manifest identifiers MUST be cryptographic digests of canonical content manifest bytes.
-- Namespace identifiers MUST be cryptographic digests of canonical namespace bytes.
+- Namespace identifiers MUST be cryptographic digests of canonical namespace node bytes.
 - eventfs MUST use RocksDB pinned reads for durable byte content whenever the API or internal operation can borrow the value.
 - eventfs MUST NOT materialize owned byte buffers for durable byte content unless mutation, FUSE output, serialization, or caller-owned copies require it.
 - `filesystem_metadata` MUST store storage schema version, next inode number, last committed event sequence, next branch identifier, active branch identifier, and volume name.
