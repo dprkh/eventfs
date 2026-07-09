@@ -80,431 +80,255 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - 14 CPUs and 49.3 GB RAM exposed to the container.
 - FUSE 3.14.0.
 
-### Read metadata by path
-
-**Host**<br>
-215 ns
-
-**eventfs**<br>
-226 ns
-
-**Overhead**<br>
-1.1x
-
-### Read metadata from an open file
-
-**Host**<br>
-128 ns
-
-**eventfs**<br>
-128 ns
-
-**Overhead**<br>
-1.0x
-
-### Change file permissions
-
-**Host**<br>
-280 ns
-
-**eventfs**<br>
-38.91 µs
-
-**Overhead**<br>
-139.2x
-
-### Resize a file between 2 KiB and 4 KiB
-
-**Host**<br>
-523 ns
-
-**eventfs**<br>
-62.03 µs
-
-**Overhead**<br>
-118.6x
-
-### Check file read access
-
-**Host**<br>
-198 ns
-
-**eventfs**<br>
-211 ns
-
-**Overhead**<br>
-1.1x
-
-### Read filesystem statistics
-
-**Host**<br>
-282 ns
-
-**eventfs**<br>
-23.71 µs
-
-**Overhead**<br>
-83.9x
-
-### Create a named pipe
-
-**Host**<br>
-772 ns
-
-**eventfs**<br>
-81.73 µs
-
-**Overhead**<br>
-105.9x
-
-### Create a directory
-
-**Host**<br>
-51.42 µs
-
-**eventfs**<br>
-82.45 µs
-
-**Overhead**<br>
-1.6x
-
-### Create a file
-
-**Host**<br>
-886 ns
-
-**eventfs**<br>
-87.43 µs
-
-**Overhead**<br>
-98.7x
-
-### Delete a file
-
-**Host**<br>
-1.008 µs
-
-**eventfs**<br>
-67.49 µs
-
-**Overhead**<br>
-66.9x
-
-### Remove an empty directory
-
-**Host**<br>
-1.307 µs
-
-**eventfs**<br>
-66.4 µs
-
-**Overhead**<br>
-50.8x
-
-### Rename a file
-
-**Host**<br>
-874 ns
-
-**eventfs**<br>
-84.57 µs
-
-**Overhead**<br>
-96.8x
-
-### Rename a file without replacing the destination
-
-**Host**<br>
-885 ns
-
-**eventfs**<br>
-84.26 µs
-
-**Overhead**<br>
-95.3x
-
-### Create a hard link
-
-**Host**<br>
-576 ns
-
-**eventfs**<br>
-84.61 µs
-
-**Overhead**<br>
-146.8x
-
-### Create a symbolic link
-
-**Host**<br>
-830 ns
-
-**eventfs**<br>
-84.34 µs
-
-**Overhead**<br>
-101.6x
-
-### Read a symbolic link target
-
-**Host**<br>
-247 ns
-
-**eventfs**<br>
-22.44 µs
-
-**Overhead**<br>
-90.7x
-
-### Open a file
-
-**Host**<br>
-253 ns
-
-**eventfs**<br>
-24.1 µs
-
-**Overhead**<br>
-95.4x
-
-### Read 4 KiB
-
-**Host**<br>
-201 ns
-
-**eventfs**<br>
-27.67 µs
-
-**Overhead**<br>
-137.4x
-
-### Overwrite 4 KiB
-
-**Host**<br>
-241 ns
-
-**eventfs**<br>
-56.77 µs
-
-**Overhead**<br>
-235.6x
-
-### Flush a file
-
-**Host**<br>
-104 ns
-
-**eventfs**<br>
-106 ns
-
-**Overhead**<br>
-1.0x
-
-### Close a file
-
-**Host**<br>
-156 ns
-
-**eventfs**<br>
-2.699 µs
-
-**Overhead**<br>
-17.3x
-
-### Synchronize a file
-
-**Host**<br>
-27.35 µs
-
-**eventfs**<br>
-54.79 µs
-
-**Overhead**<br>
-2.0x
-
-### Open a directory containing 16 files
-
-**Host**<br>
-392 ns
-
-**eventfs**<br>
-25.57 µs
-
-**Overhead**<br>
-65.2x
-
-### Read a directory containing 16 files
-
-**Host**<br>
-538 ns
-
-**eventfs**<br>
-51.12 µs
-
-**Overhead**<br>
-95.1x
-
-### Read a directory and metadata for its 16 files
-
-**Host**<br>
-4.353 µs
-
-**eventfs**<br>
-108.4 µs
-
-**Overhead**<br>
-24.9x
-
-### Synchronize a directory
-
-**Host**<br>
-26.36 µs
-
-**eventfs**<br>
-53.42 µs
-
-**Overhead**<br>
-2.0x
-
-### Close a directory
-
-**Host**<br>
-158 ns
-
-**eventfs**<br>
-2.624 µs
-
-**Overhead**<br>
-16.7x
-
-### Set a 5-byte extended attribute
-
-**Host**<br>
-370 ns
-
-**eventfs**<br>
-56.76 µs
-
-**Overhead**<br>
-153.5x
-
-### Read a 5-byte extended attribute
-
-**Host**<br>
-292 ns
-
-**eventfs**<br>
-23.13 µs
-
-**Overhead**<br>
-79.2x
-
-### List extended attributes
-
-**Host**<br>
-261 ns
-
-**eventfs**<br>
-24.28 µs
-
-**Overhead**<br>
-93.0x
-
-### Remove an extended attribute
-
-**Host**<br>
-364 ns
-
-**eventfs**<br>
-56.21 µs
-
-**Overhead**<br>
-154.4x
-
-### Write a new 256 MiB file sequentially
-
-**Host**<br>
-32.5 ms
-
-**eventfs**<br>
-407.1 ms
-
-**Overhead**<br>
-12.5x
-
-### Write the first 64 MiB of a new file
-
-**Host**<br>
-7.471 ms
-
-**eventfs**<br>
-95.7 ms
-
-**Overhead**<br>
-12.8x
-
-### Append 64 MiB to a 192 MiB file
-
-**Host**<br>
-6.538 ms
-
-**eventfs**<br>
-97.66 ms
-
-**Overhead**<br>
-14.9x
-
-### Overwrite the middle 64 MiB of a 256 MiB file
-
-**Host**<br>
-3.694 ms
-
-**eventfs**<br>
-133.8 ms
-
-**Overhead**<br>
-36.2x
-
-### Write 64 MiB at a 512 MiB offset in a sparse file
-
-**Host**<br>
-6.929 ms
-
-**eventfs**<br>
-96.24 ms
-
-**Overhead**<br>
-13.9x
-
-### Truncate a 256 MiB file to 128 MiB, then extend it to 320 MiB
-
-**Host**<br>
-4.629 ms
-
-**eventfs**<br>
-61.8 ms
-
-**Overhead**<br>
-13.4x
-
-### Write and synchronize a new 256 MiB file
-
-**Host**<br>
-194.7 ms
-
-**eventfs**<br>
-407 ms
-
-**Overhead**<br>
-2.1x
-
-### Write, synchronize, and rename a 256 MiB file
-
-**Host**<br>
-510.1 ms
-
-**eventfs**<br>
-403.8 ms
-
-**Overhead**<br>
-0.8x
+<table style="table-layout: fixed; width: 100%;">
+  <colgroup>
+    <col style="width: 25%">
+    <col style="width: 25%">
+    <col style="width: 25%">
+    <col style="width: 25%">
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Benchmark</th>
+      <th>Host</th>
+      <th>eventfs</th>
+      <th>Overhead</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Read metadata by path</td>
+      <td>215 ns</td>
+      <td>226 ns</td>
+      <td>1.1x</td>
+    </tr>
+    <tr>
+      <td>Read metadata from an open file</td>
+      <td>128 ns</td>
+      <td>128 ns</td>
+      <td>1.0x</td>
+    </tr>
+    <tr>
+      <td>Change file permissions</td>
+      <td>280 ns</td>
+      <td>38.91 µs</td>
+      <td>139.2x</td>
+    </tr>
+    <tr>
+      <td>Resize a file between 2 KiB and 4 KiB</td>
+      <td>523 ns</td>
+      <td>62.03 µs</td>
+      <td>118.6x</td>
+    </tr>
+    <tr>
+      <td>Check file read access</td>
+      <td>198 ns</td>
+      <td>211 ns</td>
+      <td>1.1x</td>
+    </tr>
+    <tr>
+      <td>Read filesystem statistics</td>
+      <td>282 ns</td>
+      <td>23.71 µs</td>
+      <td>83.9x</td>
+    </tr>
+    <tr>
+      <td>Create a named pipe</td>
+      <td>772 ns</td>
+      <td>81.73 µs</td>
+      <td>105.9x</td>
+    </tr>
+    <tr>
+      <td>Create a directory</td>
+      <td>51.42 µs</td>
+      <td>82.45 µs</td>
+      <td>1.6x</td>
+    </tr>
+    <tr>
+      <td>Create a file</td>
+      <td>886 ns</td>
+      <td>87.43 µs</td>
+      <td>98.7x</td>
+    </tr>
+    <tr>
+      <td>Delete a file</td>
+      <td>1.008 µs</td>
+      <td>67.49 µs</td>
+      <td>66.9x</td>
+    </tr>
+    <tr>
+      <td>Remove an empty directory</td>
+      <td>1.307 µs</td>
+      <td>66.4 µs</td>
+      <td>50.8x</td>
+    </tr>
+    <tr>
+      <td>Rename a file</td>
+      <td>874 ns</td>
+      <td>84.57 µs</td>
+      <td>96.8x</td>
+    </tr>
+    <tr>
+      <td>Rename a file without replacing the destination</td>
+      <td>885 ns</td>
+      <td>84.26 µs</td>
+      <td>95.3x</td>
+    </tr>
+    <tr>
+      <td>Create a hard link</td>
+      <td>576 ns</td>
+      <td>84.61 µs</td>
+      <td>146.8x</td>
+    </tr>
+    <tr>
+      <td>Create a symbolic link</td>
+      <td>830 ns</td>
+      <td>84.34 µs</td>
+      <td>101.6x</td>
+    </tr>
+    <tr>
+      <td>Read a symbolic link target</td>
+      <td>247 ns</td>
+      <td>22.44 µs</td>
+      <td>90.7x</td>
+    </tr>
+    <tr>
+      <td>Open a file</td>
+      <td>253 ns</td>
+      <td>24.1 µs</td>
+      <td>95.4x</td>
+    </tr>
+    <tr>
+      <td>Read 4 KiB</td>
+      <td>201 ns</td>
+      <td>27.67 µs</td>
+      <td>137.4x</td>
+    </tr>
+    <tr>
+      <td>Overwrite 4 KiB</td>
+      <td>241 ns</td>
+      <td>56.77 µs</td>
+      <td>235.6x</td>
+    </tr>
+    <tr>
+      <td>Flush a file</td>
+      <td>104 ns</td>
+      <td>106 ns</td>
+      <td>1.0x</td>
+    </tr>
+    <tr>
+      <td>Close a file</td>
+      <td>156 ns</td>
+      <td>2.699 µs</td>
+      <td>17.3x</td>
+    </tr>
+    <tr>
+      <td>Synchronize a file</td>
+      <td>27.35 µs</td>
+      <td>54.79 µs</td>
+      <td>2.0x</td>
+    </tr>
+    <tr>
+      <td>Open a directory containing 16 files</td>
+      <td>392 ns</td>
+      <td>25.57 µs</td>
+      <td>65.2x</td>
+    </tr>
+    <tr>
+      <td>Read a directory containing 16 files</td>
+      <td>538 ns</td>
+      <td>51.12 µs</td>
+      <td>95.1x</td>
+    </tr>
+    <tr>
+      <td>Read a directory and metadata for its 16 files</td>
+      <td>4.353 µs</td>
+      <td>108.4 µs</td>
+      <td>24.9x</td>
+    </tr>
+    <tr>
+      <td>Synchronize a directory</td>
+      <td>26.36 µs</td>
+      <td>53.42 µs</td>
+      <td>2.0x</td>
+    </tr>
+    <tr>
+      <td>Close a directory</td>
+      <td>158 ns</td>
+      <td>2.624 µs</td>
+      <td>16.7x</td>
+    </tr>
+    <tr>
+      <td>Set a 5-byte extended attribute</td>
+      <td>370 ns</td>
+      <td>56.76 µs</td>
+      <td>153.5x</td>
+    </tr>
+    <tr>
+      <td>Read a 5-byte extended attribute</td>
+      <td>292 ns</td>
+      <td>23.13 µs</td>
+      <td>79.2x</td>
+    </tr>
+    <tr>
+      <td>List extended attributes</td>
+      <td>261 ns</td>
+      <td>24.28 µs</td>
+      <td>93.0x</td>
+    </tr>
+    <tr>
+      <td>Remove an extended attribute</td>
+      <td>364 ns</td>
+      <td>56.21 µs</td>
+      <td>154.4x</td>
+    </tr>
+    <tr>
+      <td>Write a new 256 MiB file sequentially</td>
+      <td>32.5 ms</td>
+      <td>407.1 ms</td>
+      <td>12.5x</td>
+    </tr>
+    <tr>
+      <td>Write the first 64 MiB of a new file</td>
+      <td>7.471 ms</td>
+      <td>95.7 ms</td>
+      <td>12.8x</td>
+    </tr>
+    <tr>
+      <td>Append 64 MiB to a 192 MiB file</td>
+      <td>6.538 ms</td>
+      <td>97.66 ms</td>
+      <td>14.9x</td>
+    </tr>
+    <tr>
+      <td>Overwrite the middle 64 MiB of a 256 MiB file</td>
+      <td>3.694 ms</td>
+      <td>133.8 ms</td>
+      <td>36.2x</td>
+    </tr>
+    <tr>
+      <td>Write 64 MiB at a 512 MiB offset in a sparse file</td>
+      <td>6.929 ms</td>
+      <td>96.24 ms</td>
+      <td>13.9x</td>
+    </tr>
+    <tr>
+      <td>Truncate a 256 MiB file to 128 MiB, then extend it to 320 MiB</td>
+      <td>4.629 ms</td>
+      <td>61.8 ms</td>
+      <td>13.4x</td>
+    </tr>
+    <tr>
+      <td>Write and synchronize a new 256 MiB file</td>
+      <td>194.7 ms</td>
+      <td>407 ms</td>
+      <td>2.1x</td>
+    </tr>
+    <tr>
+      <td>Write, synchronize, and rename a 256 MiB file</td>
+      <td>510.1 ms</td>
+      <td>403.8 ms</td>
+      <td>0.8x</td>
+    </tr>
+  </tbody>
+</table>
