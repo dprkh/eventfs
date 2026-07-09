@@ -80,236 +80,431 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - 14 CPUs and 49.3 GB RAM exposed to the container.
 - FUSE 3.14.0.
 
-**Read metadata by path.**
+### Read metadata by path
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 215 ns | 226 ns | 1.1x |
+*Host*
+215 ns
 
-**Read metadata from an open file.**
+*eventfs*
+226 ns
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 128 ns | 128 ns | 1.0x |
+*Difference*
+1.1x
 
-**Change file permissions.**
+### Read metadata from an open file
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 280 ns | 38.91 µs | 139.2x |
+*Host*
+128 ns
 
-**Resize a file between 2 KiB and 4 KiB.**
+*eventfs*
+128 ns
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 523 ns | 62.03 µs | 118.6x |
+*Difference*
+1.0x
 
-**Check file read access.**
+### Change file permissions
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 198 ns | 211 ns | 1.1x |
+*Host*
+280 ns
 
-**Read filesystem statistics.**
+*eventfs*
+38.91 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 282 ns | 23.71 µs | 83.9x |
+*Difference*
+139.2x
 
-**Create a named pipe.**
+### Resize a file between 2 KiB and 4 KiB
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 772 ns | 81.73 µs | 105.9x |
+*Host*
+523 ns
 
-**Create a directory.**
+*eventfs*
+62.03 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 51.42 µs | 82.45 µs | 1.6x |
+*Difference*
+118.6x
 
-**Create a file.**
+### Check file read access
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 886 ns | 87.43 µs | 98.7x |
+*Host*
+198 ns
 
-**Delete a file.**
+*eventfs*
+211 ns
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 1.008 µs | 67.49 µs | 66.9x |
+*Difference*
+1.1x
 
-**Remove an empty directory.**
+### Read filesystem statistics
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 1.307 µs | 66.4 µs | 50.8x |
+*Host*
+282 ns
 
-**Rename a file.**
+*eventfs*
+23.71 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 874 ns | 84.57 µs | 96.8x |
+*Difference*
+83.9x
 
-**Rename a file without replacing the destination.**
+### Create a named pipe
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 885 ns | 84.26 µs | 95.3x |
+*Host*
+772 ns
 
-**Create a hard link.**
+*eventfs*
+81.73 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 576 ns | 84.61 µs | 146.8x |
+*Difference*
+105.9x
 
-**Create a symbolic link.**
+### Create a directory
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 830 ns | 84.34 µs | 101.6x |
+*Host*
+51.42 µs
 
-**Read a symbolic link target.**
+*eventfs*
+82.45 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 247 ns | 22.44 µs | 90.7x |
+*Difference*
+1.6x
 
-**Open a file.**
+### Create a file
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 253 ns | 24.1 µs | 95.4x |
+*Host*
+886 ns
 
-**Read 4 KiB.**
+*eventfs*
+87.43 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 201 ns | 27.67 µs | 137.4x |
+*Difference*
+98.7x
 
-**Overwrite 4 KiB.**
+### Delete a file
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 241 ns | 56.77 µs | 235.6x |
+*Host*
+1.008 µs
 
-**Flush a file.**
+*eventfs*
+67.49 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 104 ns | 106 ns | 1.0x |
+*Difference*
+66.9x
 
-**Close a file.**
+### Remove an empty directory
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 156 ns | 2.699 µs | 17.3x |
+*Host*
+1.307 µs
 
-**Synchronize a file.**
+*eventfs*
+66.4 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 27.35 µs | 54.79 µs | 2.0x |
+*Difference*
+50.8x
 
-**Open a directory containing 16 files.**
+### Rename a file
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 392 ns | 25.57 µs | 65.2x |
+*Host*
+874 ns
 
-**Read a directory containing 16 files.**
+*eventfs*
+84.57 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 538 ns | 51.12 µs | 95.1x |
+*Difference*
+96.8x
 
-**Read a directory and metadata for its 16 files.**
+### Rename a file without replacing the destination
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 4.353 µs | 108.4 µs | 24.9x |
+*Host*
+885 ns
 
-**Synchronize a directory.**
+*eventfs*
+84.26 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 26.36 µs | 53.42 µs | 2.0x |
+*Difference*
+95.3x
 
-**Close a directory.**
+### Create a hard link
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 158 ns | 2.624 µs | 16.7x |
+*Host*
+576 ns
 
-**Set a 5-byte extended attribute.**
+*eventfs*
+84.61 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 370 ns | 56.76 µs | 153.5x |
+*Difference*
+146.8x
 
-**Read a 5-byte extended attribute.**
+### Create a symbolic link
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 292 ns | 23.13 µs | 79.2x |
+*Host*
+830 ns
 
-**List extended attributes.**
+*eventfs*
+84.34 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 261 ns | 24.28 µs | 93.0x |
+*Difference*
+101.6x
 
-**Remove an extended attribute.**
+### Read a symbolic link target
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 364 ns | 56.21 µs | 154.4x |
+*Host*
+247 ns
 
-**Write a new 256 MiB file sequentially.**
+*eventfs*
+22.44 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 32.5 ms | 407.1 ms | 12.5x |
+*Difference*
+90.7x
 
-**Write the first 64 MiB of a new file.**
+### Open a file
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 7.471 ms | 95.7 ms | 12.8x |
+*Host*
+253 ns
 
-**Append 64 MiB to a 192 MiB file.**
+*eventfs*
+24.1 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 6.538 ms | 97.66 ms | 14.9x |
+*Difference*
+95.4x
 
-**Overwrite the middle 64 MiB of a 256 MiB file.**
+### Read 4 KiB
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 3.694 ms | 133.8 ms | 36.2x |
+*Host*
+201 ns
 
-**Write 64 MiB at a 512 MiB offset in a sparse file.**
+*eventfs*
+27.67 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 6.929 ms | 96.24 ms | 13.9x |
+*Difference*
+137.4x
 
-**Truncate a 256 MiB file to 128 MiB, then extend it to 320 MiB.**
+### Overwrite 4 KiB
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 4.629 ms | 61.8 ms | 13.4x |
+*Host*
+241 ns
 
-**Write and synchronize a new 256 MiB file.**
+*eventfs*
+56.77 µs
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 194.7 ms | 407 ms | 2.1x |
+*Difference*
+235.6x
 
-**Write, synchronize, and rename a 256 MiB file.**
+### Flush a file
 
-| Host | eventfs | Difference |
-| ---: | ---: | ---: |
-| 510.1 ms | 403.8 ms | 0.8x |
+*Host*
+104 ns
+
+*eventfs*
+106 ns
+
+*Difference*
+1.0x
+
+### Close a file
+
+*Host*
+156 ns
+
+*eventfs*
+2.699 µs
+
+*Difference*
+17.3x
+
+### Synchronize a file
+
+*Host*
+27.35 µs
+
+*eventfs*
+54.79 µs
+
+*Difference*
+2.0x
+
+### Open a directory containing 16 files
+
+*Host*
+392 ns
+
+*eventfs*
+25.57 µs
+
+*Difference*
+65.2x
+
+### Read a directory containing 16 files
+
+*Host*
+538 ns
+
+*eventfs*
+51.12 µs
+
+*Difference*
+95.1x
+
+### Read a directory and metadata for its 16 files
+
+*Host*
+4.353 µs
+
+*eventfs*
+108.4 µs
+
+*Difference*
+24.9x
+
+### Synchronize a directory
+
+*Host*
+26.36 µs
+
+*eventfs*
+53.42 µs
+
+*Difference*
+2.0x
+
+### Close a directory
+
+*Host*
+158 ns
+
+*eventfs*
+2.624 µs
+
+*Difference*
+16.7x
+
+### Set a 5-byte extended attribute
+
+*Host*
+370 ns
+
+*eventfs*
+56.76 µs
+
+*Difference*
+153.5x
+
+### Read a 5-byte extended attribute
+
+*Host*
+292 ns
+
+*eventfs*
+23.13 µs
+
+*Difference*
+79.2x
+
+### List extended attributes
+
+*Host*
+261 ns
+
+*eventfs*
+24.28 µs
+
+*Difference*
+93.0x
+
+### Remove an extended attribute
+
+*Host*
+364 ns
+
+*eventfs*
+56.21 µs
+
+*Difference*
+154.4x
+
+### Write a new 256 MiB file sequentially
+
+*Host*
+32.5 ms
+
+*eventfs*
+407.1 ms
+
+*Difference*
+12.5x
+
+### Write the first 64 MiB of a new file
+
+*Host*
+7.471 ms
+
+*eventfs*
+95.7 ms
+
+*Difference*
+12.8x
+
+### Append 64 MiB to a 192 MiB file
+
+*Host*
+6.538 ms
+
+*eventfs*
+97.66 ms
+
+*Difference*
+14.9x
+
+### Overwrite the middle 64 MiB of a 256 MiB file
+
+*Host*
+3.694 ms
+
+*eventfs*
+133.8 ms
+
+*Difference*
+36.2x
+
+### Write 64 MiB at a 512 MiB offset in a sparse file
+
+*Host*
+6.929 ms
+
+*eventfs*
+96.24 ms
+
+*Difference*
+13.9x
+
+### Truncate a 256 MiB file to 128 MiB, then extend it to 320 MiB
+
+*Host*
+4.629 ms
+
+*eventfs*
+61.8 ms
+
+*Difference*
+13.4x
+
+### Write and synchronize a new 256 MiB file
+
+*Host*
+194.7 ms
+
+*eventfs*
+407 ms
+
+*Difference*
+2.1x
+
+### Write, synchronize, and rename a 256 MiB file
+
+*Host*
+510.1 ms
+
+*eventfs*
+403.8 ms
+
+*Difference*
+0.8x
