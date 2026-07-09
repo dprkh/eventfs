@@ -1,5 +1,3 @@
-Never use your own knowledge. When planning, read `SPEC.md` fully.
-
 ## Development Under macOS
 
 - When developing on macOS, do not run Linux-sensitive Cargo or Rust verification commands directly on the host.
