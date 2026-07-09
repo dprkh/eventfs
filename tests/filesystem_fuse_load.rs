@@ -10,8 +10,8 @@ use std::thread;
 
 use support::{
     TestDirectories, access_path, assert_event_sequences_increase, event_page_limit,
-    file_identifier_for_path, fsync_directory, list_all_events, mkfifo, mount,
-    open_test_filesystem, statvfs, write_mounted_file,
+    file_identifier_for_path, fsync_directory, get_xattr, list_all_events, list_xattr, mkfifo,
+    mount, open_test_filesystem, remove_xattr, set_xattr, statvfs, write_mounted_file,
 };
 
 #[test]
@@ -105,6 +105,121 @@ fn concurrent_mounted_writes_and_event_listing_preserve_final_contents() {
 }
 
 #[test]
+fn mounted_file_matrix_covers_sizes_patterns_and_operations() {
+    let directories = TestDirectories::new();
+    let filesystem = open_test_filesystem(&directories);
+    let mounted = mount(&filesystem);
+    let root = directories.mount_point_path();
+    let matrix = root.join("matrix");
+    let sizes = [
+        0,
+        1,
+        4095,
+        4096,
+        4097,
+        16 * 1024,
+        64 * 1024,
+        256 * 1024,
+        1024 * 1024,
+        4 * 1024 * 1024,
+    ];
+
+    fs::create_dir(&matrix).expect("matrix directory is created");
+    for (index, size) in sizes.into_iter().enumerate() {
+        let path = matrix.join(format!("case-{index}"));
+        let renamed = matrix.join(format!("case-{index}-renamed"));
+        let hard_link = matrix.join(format!("case-{index}-hard"));
+        let symbolic_link = matrix.join(format!("case-{index}-symlink"));
+        let mut expected = patterned_workflow_bytes(size, index as u8);
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("matrix file is created");
+
+        for chunk in expected.chunks(matrix_write_chunk_size(index)) {
+            file.write_all(chunk).expect("matrix file chunk is written");
+        }
+        file.flush().expect("matrix file is flushed");
+        file.sync_data().expect("matrix file data is synchronized");
+
+        let patch = patterned_workflow_bytes(8193.min(expected.len().max(1)), 100 + index as u8);
+        let overwrite_offset = expected.len().saturating_sub(patch.len()) / 2;
+        file.seek(SeekFrom::Start(overwrite_offset as u64))
+            .expect("matrix file seeks for overwrite");
+        file.write_all(&patch).expect("matrix overwrite is written");
+        if expected.len() < overwrite_offset + patch.len() {
+            expected.resize(overwrite_offset + patch.len(), 0);
+        }
+        expected[overwrite_offset..overwrite_offset + patch.len()].copy_from_slice(&patch);
+
+        let sparse_offset = expected.len() + 4096 + index;
+        let sparse = patterned_workflow_bytes(4097, 150 + index as u8);
+        file.seek(SeekFrom::Start(sparse_offset as u64))
+            .expect("matrix file seeks for sparse write");
+        file.write_all(&sparse)
+            .expect("matrix sparse write succeeds");
+        expected.resize(sparse_offset, 0);
+        expected.extend_from_slice(&sparse);
+
+        let truncated_len = expected.len() / 2;
+        file.set_len(truncated_len as u64)
+            .expect("matrix file truncates");
+        expected.truncate(truncated_len);
+        let extended_len = expected.len() + 2048 + index;
+        file.set_len(extended_len as u64)
+            .expect("matrix file extends");
+        expected.resize(extended_len, 0);
+        drop(file);
+
+        fs::rename(&path, &renamed).expect("matrix file is renamed");
+        fs::hard_link(&renamed, &hard_link).expect("matrix hard link is created");
+        symlink(&renamed, &symbolic_link).expect("matrix symbolic link is created");
+        assert_eq!(
+            fs::read_link(&symbolic_link).expect("matrix symbolic link target is read"),
+            renamed
+        );
+        set_xattr(&renamed, "user.matrix", b"value", 0).expect("matrix xattr is set");
+        assert_eq!(
+            get_xattr(&renamed, "user.matrix").expect("matrix xattr is read"),
+            b"value"
+        );
+        assert!(
+            list_xattr(&renamed)
+                .expect("matrix xattrs are listed")
+                .windows(b"user.matrix\0".len())
+                .any(|window| window == b"user.matrix\0")
+        );
+        remove_xattr(&renamed, "user.matrix").expect("matrix xattr is removed");
+        assert_eq!(
+            fs::read(&renamed).expect("matrix renamed file is read"),
+            expected
+        );
+        assert_eq!(
+            fs::read(&hard_link).expect("matrix hard link is read"),
+            expected
+        );
+
+        fs::remove_file(&symbolic_link).expect("matrix symbolic link is removed");
+        fs::remove_file(&hard_link).expect("matrix hard link is removed");
+        fs::remove_file(&renamed).expect("matrix renamed file is removed");
+    }
+
+    assert!(
+        fs::read_dir(&matrix)
+            .expect("matrix directory is read")
+            .next()
+            .is_none(),
+        "matrix workflow cleans up all cases"
+    );
+    assert_eq!(statvfs(root).f_namemax, 255);
+    fs::remove_dir(&matrix).expect("matrix directory is removed");
+    mounted.unmount().expect("filesystem unmounts");
+    assert_event_sequences_increase(&list_all_events(&filesystem));
+}
+
+#[test]
 fn mounted_fuse_stress_repeats_supported_operation_combinations() {
     let directories = TestDirectories::new();
     let filesystem = open_test_filesystem(&directories);
@@ -180,6 +295,21 @@ fn mounted_fuse_stress_repeats_supported_operation_combinations() {
     }
     assert_event_sequences_increase(&list_all_events(&filesystem));
     mounted.unmount().expect("filesystem unmounts");
+}
+
+fn patterned_workflow_bytes(size: usize, seed: u8) -> Vec<u8> {
+    (0..size)
+        .map(|index| seed.wrapping_add((index % 251) as u8))
+        .collect()
+}
+
+fn matrix_write_chunk_size(index: usize) -> usize {
+    match index % 4 {
+        0 => 257,
+        1 => 4096,
+        2 => 16 * 1024,
+        _ => 64 * 1024,
+    }
 }
 
 fn initial_bytes(thread_index: usize, file_index: usize) -> Vec<u8> {

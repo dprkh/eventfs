@@ -284,6 +284,9 @@ const EVENT_PAYLOAD_PART_OVERWRITTEN: u8 = b'o';
 const EVENT_PAYLOAD_PART_WRITTEN: u8 = b'w';
 const CONTENT_CHUNK_HASH_BLAKE3: u8 = 1;
 const CONTENT_MANIFEST_HASH_BLAKE3: u8 = 2;
+const CONTENT_MANIFEST_NODE_MAGIC: &[u8] = b"eventfs.content-manifest.node.v1\0";
+const CONTENT_MANIFEST_CONCAT_MAX_CHILDREN: usize = 256;
+const CONTENT_MANIFEST_MAX_DEPTH: usize = 4096;
 const NAMESPACE_HASH_BLAKE3: u8 = 3;
 const NAMESPACE_MAP_LEAF_MAX_ENTRIES: usize = 32;
 const NAMESPACE_MAP_TAG_INODES: u8 = b'i';
@@ -319,7 +322,6 @@ struct ActiveBranchState {
     branch: StoredBranch,
     namespace_root: StoredNamespaceRoot,
     namespace: MaterializedBranchState,
-    file_extents: BTreeMap<u64, Vec<StoredExtent>>,
 }
 
 #[derive(Clone, Debug)]
@@ -327,7 +329,6 @@ struct ActiveBranchCommit {
     branch: StoredBranch,
     namespace_root: StoredNamespaceRoot,
     mutation: StoredMutation,
-    file_extents: Option<(FileIdentifier, Vec<StoredExtent>)>,
 }
 
 impl WriteState {
@@ -475,6 +476,26 @@ struct StoredExtent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+enum StoredContentManifestNode {
+    Concat {
+        children: Vec<StoredContentManifestChild>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+struct StoredContentManifestChild {
+    logical_offset: u64,
+    length: u64,
+    identifier: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DecodedContentManifest {
+    Extents(Vec<StoredExtent>),
+    Node(StoredContentManifestNode),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 struct StoredSnapshotMetadata {
     file_size: u64,
     sequence: u64,
@@ -556,7 +577,6 @@ enum EventPayloadExtents {
 #[derive(Clone, Debug)]
 struct CommitEventPayloads<'a> {
     event_payload_extents: EventPayloadExtents,
-    snapshot_extents: Option<&'a [StoredExtent]>,
     snapshot_content_manifest_identifier: Option<&'a [u8]>,
 }
 
@@ -673,15 +693,13 @@ impl<'a> CommitEventPayloads<'a> {
     fn none() -> Self {
         Self {
             event_payload_extents: EventPayloadExtents::None,
-            snapshot_extents: None,
             snapshot_content_manifest_identifier: None,
         }
     }
 
-    fn file_write(
+    fn file_write_append(
         overwritten_extents: Vec<StoredExtent>,
         written_extents: Vec<StoredExtent>,
-        snapshot_extents: &'a [StoredExtent],
         snapshot_content_manifest_identifier: &'a [u8],
     ) -> Self {
         Self {
@@ -689,7 +707,20 @@ impl<'a> CommitEventPayloads<'a> {
                 overwritten_extents,
                 written_extents,
             },
-            snapshot_extents: Some(snapshot_extents),
+            snapshot_content_manifest_identifier: Some(snapshot_content_manifest_identifier),
+        }
+    }
+
+    fn file_write_without_extent_update(
+        overwritten_extents: Vec<StoredExtent>,
+        written_extents: Vec<StoredExtent>,
+        snapshot_content_manifest_identifier: &'a [u8],
+    ) -> Self {
+        Self {
+            event_payload_extents: EventPayloadExtents::FileWrite {
+                overwritten_extents,
+                written_extents,
+            },
             snapshot_content_manifest_identifier: Some(snapshot_content_manifest_identifier),
         }
     }
@@ -751,7 +782,6 @@ impl ActiveBranchState {
             branch,
             namespace_root,
             namespace,
-            file_extents: BTreeMap::new(),
         }
     }
 
@@ -759,10 +789,6 @@ impl ActiveBranchState {
         self.branch = commit.branch;
         self.namespace_root = commit.namespace_root;
         self.namespace.apply(&commit.mutation);
-        self.file_extents.clear();
-        if let Some((file_identifier, extents)) = commit.file_extents {
-            self.file_extents.insert(file_identifier.get(), extents);
-        }
     }
 }
 
@@ -1879,6 +1905,9 @@ impl Storage {
         append: bool,
         clear_suid_sgid: bool,
     ) -> FuseResult<FuseWrite> {
+        // Keep writes proportional to the changed byte range: appends never
+        // materialize the old manifest, and overwrites read only old extents
+        // needed for the overwritten payload.
         let mut write_state = self.lock_write_state()?;
         let mut inode = self
             .inode(inode_number)
@@ -1895,30 +1924,32 @@ impl Storage {
         let event_sequence = write_state.next_event_sequence()?;
         let now = StoredTime::now();
         let old_size = inode.size;
-        let existing_extents = self
-            .file_content_manifest_extents(
-                self.active_branch_identifier(),
-                FileIdentifier::new(inode_number),
-            )
-            .map_err(to_fuse_integrity)?;
-        self.validate_stored_extents(&existing_extents)?;
+        let previous_content_manifest_identifier = inode
+            .content_manifest_identifier
+            .clone()
+            .ok_or(FuseError::Integrity)?;
         let overwritten_end = end.min(old_size);
-        let overwritten_extents = if offset < overwritten_end && !data.is_empty() {
-            slice_extents(&existing_extents, offset, overwritten_end, 0)
-                .map_err(to_fuse_integrity)?
-        } else {
-            Vec::new()
-        };
+        let is_append_write = offset >= old_size;
         let written_chunks = chunk_bytes(data)?;
         let written_current_extents = stored_extents_from_pending(offset, &written_chunks)?;
         let written_payload_extents = stored_extents_from_pending(0, &written_chunks)?;
-        let final_extents = current_extents_after_write(
-            &existing_extents,
-            old_size,
-            offset,
-            new_size,
-            &written_current_extents,
-        )?;
+        let overwritten_extents = if is_append_write {
+            Vec::new()
+        } else {
+            let extents =
+                self.content_manifest_extents_in_range(
+                    &previous_content_manifest_identifier,
+                    offset,
+                    overwritten_end,
+                )
+                .map_err(to_fuse_integrity)?;
+            if offset < overwritten_end && !data.is_empty() {
+                slice_extents(&extents, offset, overwritten_end, 0).map_err(to_fuse_integrity)?
+            } else {
+                Vec::new()
+            }
+        };
+        self.validate_stored_extents(&overwritten_extents)?;
         let mut batch = WriteBatch::default();
         self.put_pending_extents(
             &mut batch,
@@ -1930,7 +1961,23 @@ impl Storage {
             &written_current_extents,
             &written_chunks,
         )?;
-        let content_manifest_identifier = self.put_content_manifest(&mut batch, &final_extents)?;
+        let content_manifest_identifier = if is_append_write {
+            self.put_appended_content_manifest(
+                &mut batch,
+                &previous_content_manifest_identifier,
+                old_size,
+                &written_current_extents,
+            )?
+        } else {
+            self.put_replaced_content_manifest(
+                &mut batch,
+                &previous_content_manifest_identifier,
+                old_size,
+                offset,
+                end,
+                &written_current_extents,
+            )?
+        };
         inode.size = new_size;
         inode.content_manifest_identifier = Some(content_manifest_identifier.clone());
         inode.mtime = now;
@@ -1962,12 +2009,19 @@ impl Storage {
             &active_state,
             event_sequence,
             &event,
-            CommitEventPayloads::file_write(
-                overwritten_extents,
-                written_payload_extents,
-                &final_extents,
-                &content_manifest_identifier,
-            ),
+            if is_append_write {
+                CommitEventPayloads::file_write_append(
+                    overwritten_extents,
+                    written_payload_extents,
+                    &content_manifest_identifier,
+                )
+            } else {
+                CommitEventPayloads::file_write_without_extent_update(
+                    overwritten_extents,
+                    written_payload_extents,
+                    &content_manifest_identifier,
+                )
+            },
             mutation,
         )?;
         self.commit_mutation(
@@ -2373,6 +2427,8 @@ impl Storage {
         mut inode: StoredInode,
         new_size: u64,
     ) -> FuseResult<EntrySnapshot> {
+        // File growth is metadata-only for content; shrinking touches only the
+        // discarded range needed for the overwritten payload.
         if inode.kind != StoredNodeKind::RegularFile {
             return Err(FuseError::Errno(fuser::Errno::EINVAL));
         }
@@ -2384,29 +2440,40 @@ impl Storage {
             });
         }
 
-        let existing_extents = self
-            .file_content_manifest_extents(
-                self.active_branch_identifier(),
-                FileIdentifier::new(inode_number),
-            )
-            .map_err(to_fuse_integrity)?;
-        self.validate_stored_extents(&existing_extents)?;
-        let (offset, overwritten_byte_length, overwritten_extents, final_extents) =
-            if new_size < old_size {
-                (
+        let previous_content_manifest_identifier = inode
+            .content_manifest_identifier
+            .clone()
+            .ok_or(FuseError::Integrity)?;
+        let (offset, overwritten_byte_length, overwritten_extents) = if new_size < old_size {
+            let extents = self
+                .content_manifest_extents_in_range(
+                    &previous_content_manifest_identifier,
                     new_size,
-                    old_size - new_size,
-                    slice_extents(&existing_extents, new_size, old_size, 0)
-                        .map_err(to_fuse_integrity)?,
-                    slice_extents(&existing_extents, 0, new_size, 0).map_err(to_fuse_integrity)?,
+                    old_size,
                 )
-            } else {
-                (old_size, 0, Vec::new(), existing_extents.clone())
-            };
+                .map_err(to_fuse_integrity)?;
+            (
+                new_size,
+                old_size - new_size,
+                slice_extents(&extents, new_size, old_size, 0).map_err(to_fuse_integrity)?,
+            )
+        } else {
+            (old_size, 0, Vec::new())
+        };
+        self.validate_stored_extents(&overwritten_extents)?;
 
         let event_sequence = write_state.next_event_sequence()?;
         let mut batch = WriteBatch::default();
-        let content_manifest_identifier = self.put_content_manifest(&mut batch, &final_extents)?;
+        let content_manifest_identifier = if new_size > old_size {
+            previous_content_manifest_identifier
+        } else {
+            self.put_content_manifest_range(
+                &mut batch,
+                &previous_content_manifest_identifier,
+                0,
+                new_size,
+            )?
+        };
         inode.size = new_size;
         inode.content_manifest_identifier = Some(content_manifest_identifier.clone());
         let mut mutation = StoredMutation::default();
@@ -2433,12 +2500,19 @@ impl Storage {
             &active_state,
             event_sequence,
             &event,
-            CommitEventPayloads::file_write(
-                overwritten_extents,
-                Vec::new(),
-                &final_extents,
-                &content_manifest_identifier,
-            ),
+            if new_size > old_size {
+                CommitEventPayloads::file_write_without_extent_update(
+                    overwritten_extents,
+                    Vec::new(),
+                    &content_manifest_identifier,
+                )
+            } else {
+                CommitEventPayloads::file_write_without_extent_update(
+                    overwritten_extents,
+                    Vec::new(),
+                    &content_manifest_identifier,
+                )
+            },
             mutation,
         )?;
         self.commit_mutation(
@@ -2912,62 +2986,35 @@ impl Storage {
             .cloned())
     }
 
-    fn file_content_manifest_extents(
+    fn file_content_manifest_identifier(
         &self,
         branch: BranchIdentifier,
         file_identifier: FileIdentifier,
-    ) -> Result<Vec<StoredExtent>, FilesystemError> {
+    ) -> Result<Vec<u8>, FilesystemError> {
         if branch == self.active_branch_identifier() {
-            return self.active_file_content_manifest_extents(file_identifier);
+            return self.active_file_content_manifest_identifier(file_identifier);
         }
 
         let state = self.namespace_state_for_branch(branch)?;
-        let inode = state
+        state
             .inodes
             .get(&file_identifier.get())
-            .ok_or(FilesystemError::Integrity)?;
-        let identifier = inode
-            .content_manifest_identifier
-            .as_deref()
-            .ok_or(FilesystemError::Integrity)?;
-        self.content_manifest_extents(identifier)
+            .and_then(|inode| inode.content_manifest_identifier.clone())
+            .ok_or(FilesystemError::Integrity)
     }
 
-    fn active_file_content_manifest_extents(
+    fn active_file_content_manifest_identifier(
         &self,
         file_identifier: FileIdentifier,
-    ) -> Result<Vec<StoredExtent>, FilesystemError> {
-        let identifier = {
-            let active = self
-                .active_branch_state
-                .lock()
-                .map_err(|_| FilesystemError::Database)?;
-            if let Some(extents) = active.file_extents.get(&file_identifier.get()) {
-                return Ok(extents.clone());
-            }
-            active
-                .namespace
-                .inodes
-                .get(&file_identifier.get())
-                .and_then(|inode| inode.content_manifest_identifier.clone())
-                .ok_or(FilesystemError::Integrity)?
-        };
-        let extents = self.content_manifest_extents(&identifier)?;
-        let mut active = self
-            .active_branch_state
+    ) -> Result<Vec<u8>, FilesystemError> {
+        self.active_branch_state
             .lock()
-            .map_err(|_| FilesystemError::Database)?;
-        let current_identifier = active
+            .map_err(|_| FilesystemError::Database)?
             .namespace
             .inodes
             .get(&file_identifier.get())
-            .and_then(|inode| inode.content_manifest_identifier.as_deref());
-        if current_identifier == Some(identifier.as_slice()) {
-            active
-                .file_extents
-                .insert(file_identifier.get(), extents.clone());
-        }
-        Ok(extents)
+            .and_then(|inode| inode.content_manifest_identifier.clone())
+            .ok_or(FilesystemError::Integrity)
     }
 
     fn branch_root_at_position(
@@ -3032,7 +3079,6 @@ impl Storage {
     ) -> FuseResult<ActiveBranchCommit> {
         let CommitEventPayloads {
             event_payload_extents,
-            snapshot_extents,
             snapshot_content_manifest_identifier,
         } = payloads;
         let events = self.events().map_err(|_| FuseError::Integrity)?;
@@ -3102,7 +3148,7 @@ impl Storage {
             event_sequence,
             &event,
             snapshot_inode,
-            snapshot_extents,
+            None,
             snapshot_content_manifest_identifier,
         )?;
         batch.put_cf(
@@ -3110,13 +3156,10 @@ impl Storage {
             METADATA_KEY_LAST_COMMITTED_EVENT_SEQUENCE,
             encode_u64(event_sequence.get()),
         );
-        let file_extents = snapshot_extents
-            .and_then(|extents| event.file_identifier().map(|file| (file, extents.to_vec())));
         Ok(ActiveBranchCommit {
             branch,
             namespace_root,
             mutation,
-            file_extents,
         })
     }
 
@@ -3263,17 +3306,215 @@ impl Storage {
         Ok(identifier)
     }
 
-    fn content_manifest_extents(
+    fn put_appended_content_manifest(
+        &self,
+        batch: &mut WriteBatch,
+        previous_identifier: &[u8],
+        previous_length: u64,
+        appended_extents: &[StoredExtent],
+    ) -> FuseResult<Vec<u8>> {
+        ContentManifestIdentifier::from_bytes(previous_identifier).map_err(to_fuse_integrity)?;
+        if appended_extents.is_empty() {
+            return Ok(previous_identifier.to_vec());
+        }
+
+        let appended_identifier = self.put_content_manifest(batch, appended_extents)?;
+        let empty_identifier = empty_content_manifest_identifier().map_err(to_fuse_integrity)?;
+        if previous_identifier == empty_identifier.as_slice() {
+            return Ok(appended_identifier);
+        }
+
+        let appended_child =
+            content_manifest_child_for_extents(appended_extents, appended_identifier)?;
+        self.put_content_manifest_with_appended_child(
+            batch,
+            previous_identifier,
+            0,
+            previous_length,
+            appended_child,
+        )
+    }
+
+    fn put_content_manifest_with_appended_child(
+        &self,
+        batch: &mut WriteBatch,
+        current_identifier: &[u8],
+        current_start: u64,
+        current_end: u64,
+        appended_child: StoredContentManifestChild,
+    ) -> FuseResult<Vec<u8>> {
+        ContentManifestIdentifier::from_bytes(current_identifier).map_err(to_fuse_integrity)?;
+        let empty_identifier = empty_content_manifest_identifier().map_err(to_fuse_integrity)?;
+        if current_identifier == empty_identifier.as_slice() {
+            return Ok(appended_child.identifier);
+        }
+
+        let Some(mut children) = self
+            .content_manifest_concat_children(current_identifier)
+            .map_err(to_fuse_integrity)?
+        else {
+            return self.put_wrapped_content_manifest_with_appended_child(
+                batch,
+                current_identifier,
+                current_start,
+                current_end,
+                appended_child,
+            );
+        };
+
+        if children.len() < CONTENT_MANIFEST_CONCAT_MAX_CHILDREN {
+            children.push(appended_child);
+            return self.put_content_manifest_node(
+                batch,
+                &StoredContentManifestNode::Concat { children },
+            );
+        }
+
+        let Some(last_child) = children.last_mut() else {
+            return Err(FuseError::Integrity);
+        };
+        let last_child_end = content_manifest_child_end(last_child).map_err(to_fuse_integrity)?;
+        if last_child_end != current_end {
+            return self.put_wrapped_content_manifest_with_appended_child(
+                batch,
+                current_identifier,
+                current_start,
+                current_end,
+                appended_child,
+            );
+        }
+
+        let appended_child_end =
+            content_manifest_child_end(&appended_child).map_err(to_fuse_integrity)?;
+        last_child.identifier = self.put_content_manifest_with_appended_child(
+            batch,
+            &last_child.identifier,
+            last_child.logical_offset,
+            last_child_end,
+            appended_child,
+        )?;
+        last_child.length = appended_child_end
+            .checked_sub(last_child.logical_offset)
+            .ok_or(FuseError::Integrity)?;
+        self.put_content_manifest_node(batch, &StoredContentManifestNode::Concat { children })
+    }
+
+    fn put_wrapped_content_manifest_with_appended_child(
+        &self,
+        batch: &mut WriteBatch,
+        current_identifier: &[u8],
+        current_start: u64,
+        current_end: u64,
+        appended_child: StoredContentManifestChild,
+    ) -> FuseResult<Vec<u8>> {
+        let mut children = Vec::with_capacity(2);
+        if current_start < current_end {
+            children.push(StoredContentManifestChild {
+                logical_offset: current_start,
+                length: current_end
+                    .checked_sub(current_start)
+                    .ok_or(FuseError::Integrity)?,
+                identifier: current_identifier.to_vec(),
+            });
+        }
+        children.push(appended_child);
+        self.put_content_manifest_children(batch, children)
+    }
+
+    fn put_replaced_content_manifest(
+        &self,
+        batch: &mut WriteBatch,
+        previous_identifier: &[u8],
+        previous_length: u64,
+        offset: u64,
+        end: u64,
+        written_extents: &[StoredExtent],
+    ) -> FuseResult<Vec<u8>> {
+        ContentManifestIdentifier::from_bytes(previous_identifier).map_err(to_fuse_integrity)?;
+        let mut children = Vec::new();
+        if offset > 0 {
+            children.push(StoredContentManifestChild {
+                logical_offset: 0,
+                length: offset.min(previous_length),
+                identifier: previous_identifier.to_vec(),
+            });
+        }
+        if !written_extents.is_empty() {
+            let written_identifier = self.put_content_manifest(batch, written_extents)?;
+            children.push(content_manifest_child_for_extents(
+                written_extents,
+                written_identifier,
+            )?);
+        }
+        if end < previous_length {
+            children.push(StoredContentManifestChild {
+                logical_offset: end,
+                length: previous_length - end,
+                identifier: previous_identifier.to_vec(),
+            });
+        }
+        self.put_content_manifest_children(batch, children)
+    }
+
+    fn put_content_manifest_range(
+        &self,
+        batch: &mut WriteBatch,
+        identifier: &[u8],
+        offset: u64,
+        length: u64,
+    ) -> FuseResult<Vec<u8>> {
+        ContentManifestIdentifier::from_bytes(identifier).map_err(to_fuse_integrity)?;
+        if length == 0 {
+            return empty_content_manifest_identifier().map_err(to_fuse_integrity);
+        }
+        self.put_content_manifest_children(
+            batch,
+            vec![StoredContentManifestChild {
+                logical_offset: offset,
+                length,
+                identifier: identifier.to_vec(),
+            }],
+        )
+    }
+
+    fn put_content_manifest_children(
+        &self,
+        batch: &mut WriteBatch,
+        mut children: Vec<StoredContentManifestChild>,
+    ) -> FuseResult<Vec<u8>> {
+        children.retain(|child| child.length != 0);
+        if children.is_empty() {
+            return empty_content_manifest_identifier().map_err(to_fuse_integrity);
+        }
+        self.put_content_manifest_node(batch, &StoredContentManifestNode::Concat { children })
+    }
+
+    fn put_content_manifest_node(
+        &self,
+        batch: &mut WriteBatch,
+        node: &StoredContentManifestNode,
+    ) -> FuseResult<Vec<u8>> {
+        validate_stored_content_manifest_node(node).map_err(to_fuse_integrity)?;
+        let bytes = encode_content_manifest_node(node).map_err(|_| FuseError::Database)?;
+        let identifier = content_manifest_identifier_for_bytes(&bytes);
+        let manifests = self
+            .content_manifest_nodes()
+            .map_err(|_| FuseError::Integrity)?;
+        batch.put_cf(manifests, &identifier, bytes);
+        Ok(identifier)
+    }
+
+    fn content_manifest_concat_children(
         &self,
         content_manifest_identifier: &[u8],
-    ) -> Result<Vec<StoredExtent>, FilesystemError> {
+    ) -> Result<Option<Vec<StoredContentManifestChild>>, FilesystemError> {
         let content_manifest_identifier =
             ContentManifestIdentifier::from_bytes(content_manifest_identifier)?;
-        let empty_identifier =
-            empty_content_manifest_identifier().map_err(|_| FilesystemError::Integrity)?;
+        let empty_identifier = empty_content_manifest_identifier()?;
         if content_manifest_identifier.as_bytes() == empty_identifier.as_slice() {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
+
         let manifests = self.content_manifest_nodes()?;
         let value = self
             .database
@@ -3281,7 +3522,91 @@ impl Storage {
             .map_err(|_| FilesystemError::Database)?
             .ok_or(FilesystemError::Integrity)?;
         validate_content_manifest(content_manifest_identifier.as_bytes(), &value)?;
-        decode_content_manifest(&value)
+        let Some(node) = decode_versioned_content_manifest_node(&value)? else {
+            return Ok(None);
+        };
+        let StoredContentManifestNode::Concat { children } = node;
+        Ok(Some(children))
+    }
+
+    fn content_manifest_extents_in_range(
+        &self,
+        content_manifest_identifier: &[u8],
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<StoredExtent>, FilesystemError> {
+        let content_manifest_identifier =
+            ContentManifestIdentifier::from_bytes(content_manifest_identifier)?;
+        let empty_identifier =
+            empty_content_manifest_identifier().map_err(|_| FilesystemError::Integrity)?;
+        if content_manifest_identifier.as_bytes() == empty_identifier.as_slice() || start >= end {
+            return Ok(Vec::new());
+        }
+        let mut extents = Vec::new();
+        self.collect_content_manifest_extents_in_range(
+            content_manifest_identifier.as_bytes(),
+            &empty_identifier,
+            start,
+            end,
+            &mut extents,
+            0,
+        )?;
+        Ok(extents)
+    }
+
+    fn collect_content_manifest_extents_in_range(
+        &self,
+        content_manifest_identifier: &[u8],
+        empty_identifier: &[u8],
+        start: u64,
+        end: u64,
+        extents: &mut Vec<StoredExtent>,
+        depth: usize,
+    ) -> Result<(), FilesystemError> {
+        if depth > CONTENT_MANIFEST_MAX_DEPTH {
+            return Err(FilesystemError::Integrity);
+        }
+        let content_manifest_identifier =
+            ContentManifestIdentifier::from_bytes(content_manifest_identifier)?;
+        if content_manifest_identifier.as_bytes() == empty_identifier {
+            return Ok(());
+        }
+
+        let manifests = self.content_manifest_nodes()?;
+        let value = self
+            .database
+            .get_pinned_cf(manifests, content_manifest_identifier.as_bytes())
+            .map_err(|_| FilesystemError::Database)?
+            .ok_or(FilesystemError::Integrity)?;
+        validate_content_manifest(content_manifest_identifier.as_bytes(), &value)?;
+        match decode_content_manifest_entry(&value)? {
+            DecodedContentManifest::Extents(decoded) => {
+                extents.extend(slice_extents(&decoded, start, end, start)?);
+                Ok(())
+            }
+            DecodedContentManifest::Node(StoredContentManifestNode::Concat { children }) => {
+                for child in children {
+                    let child_end = child
+                        .logical_offset
+                        .checked_add(child.length)
+                        .ok_or(FilesystemError::Integrity)?;
+                    if child_end <= start || child.logical_offset >= end {
+                        continue;
+                    }
+                    let child_start = start.max(child.logical_offset);
+                    let child_stop = end.min(child_end);
+                    self.collect_content_manifest_extents_in_range(
+                        &child.identifier,
+                        empty_identifier,
+                        child_start,
+                        child_stop,
+                        extents,
+                        depth + 1,
+                    )?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn read_extent_range(
@@ -3290,6 +3615,8 @@ impl Storage {
         offset: u64,
         length: u64,
     ) -> Result<Vec<u8>, FilesystemError> {
+        // Range reads traverse only manifest children that intersect the
+        // requested range, then read only the intersecting content chunks.
         if length == 0 {
             return Ok(Vec::new());
         }
@@ -3298,7 +3625,7 @@ impl Storage {
         let end = offset
             .checked_add(length as u64)
             .ok_or(FilesystemError::Integrity)?;
-        let extents = self.extent_manifest(extent_set)?;
+        let extents = self.extent_manifest_range(extent_set, offset, end)?;
         for extent in extents {
             if extent.logical_offset >= end {
                 break;
@@ -3334,12 +3661,20 @@ impl Storage {
         Ok(bytes)
     }
 
-    fn extent_manifest(&self, extent_set: ExtentSet) -> Result<Vec<StoredExtent>, FilesystemError> {
+    fn extent_manifest_range(
+        &self,
+        extent_set: ExtentSet,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<StoredExtent>, FilesystemError> {
         match extent_set {
             ExtentSet::Current {
                 branch,
                 file_identifier,
-            } => self.file_content_manifest_extents(branch, file_identifier),
+            } => {
+                let identifier = self.file_content_manifest_identifier(branch, file_identifier)?;
+                self.content_manifest_extents_in_range(&identifier, start, end)
+            }
             ExtentSet::Snapshot {
                 branch,
                 file_identifier,
@@ -3350,7 +3685,11 @@ impl Storage {
                     file_identifier,
                     BranchPosition::new(branch, ordinal),
                 )?;
-                self.content_manifest_extents(&manifest.content_manifest_identifier)
+                self.content_manifest_extents_in_range(
+                    &manifest.content_manifest_identifier,
+                    start,
+                    end,
+                )
             }
             ExtentSet::EventPayload { sequence, part } => {
                 let manifests = self.event_payload_manifests()?;
@@ -3363,7 +3702,11 @@ impl Storage {
                     .map_err(|_| FilesystemError::Database)?
                     .ok_or(FilesystemError::Integrity)?;
                 let manifest = decode_event_payload_manifest(&value)?;
-                self.content_manifest_extents(&manifest.content_manifest_identifier)
+                self.content_manifest_extents_in_range(
+                    &manifest.content_manifest_identifier,
+                    start,
+                    end,
+                )
             }
         }
     }
@@ -4210,6 +4553,7 @@ fn slice_extents(
     Ok(sliced)
 }
 
+#[cfg(test)]
 fn current_extents_after_write(
     existing: &[StoredExtent],
     old_size: u64,
@@ -4225,6 +4569,9 @@ fn current_extents_after_write(
     let end = offset
         .checked_add(written_length)
         .ok_or(FuseError::Errno(fuser::Errno::EFBIG))?;
+    if offset >= old_size {
+        return appended_current_extents(existing.to_vec(), new_size, written_extents);
+    }
     let mut extents =
         slice_extents(existing, 0, offset.min(old_size), 0).map_err(to_fuse_integrity)?;
     extents.extend_from_slice(written_extents);
@@ -4233,6 +4580,52 @@ fn current_extents_after_write(
     }
     extents.retain(|extent| extent.logical_offset < new_size && extent.length != 0);
     Ok(extents)
+}
+
+#[cfg(test)]
+fn appended_current_extents(
+    mut existing: Vec<StoredExtent>,
+    new_size: u64,
+    written_extents: &[StoredExtent],
+) -> FuseResult<Vec<StoredExtent>> {
+    existing.extend_from_slice(written_extents);
+    existing.retain(|extent| extent.logical_offset < new_size && extent.length != 0);
+    Ok(existing)
+}
+
+fn content_manifest_child_for_extents(
+    extents: &[StoredExtent],
+    identifier: Vec<u8>,
+) -> FuseResult<StoredContentManifestChild> {
+    let first = extents.first().ok_or(FuseError::Integrity)?;
+    let mut end = first
+        .logical_offset
+        .checked_add(first.length)
+        .ok_or(FuseError::Integrity)?;
+    for extent in &extents[1..] {
+        end = end.max(
+            extent
+                .logical_offset
+                .checked_add(extent.length)
+                .ok_or(FuseError::Integrity)?,
+        );
+    }
+    Ok(StoredContentManifestChild {
+        logical_offset: first.logical_offset,
+        length: end
+            .checked_sub(first.logical_offset)
+            .ok_or(FuseError::Integrity)?,
+        identifier,
+    })
+}
+
+fn content_manifest_child_end(
+    child: &StoredContentManifestChild,
+) -> Result<u64, FilesystemError> {
+    child
+        .logical_offset
+        .checked_add(child.length)
+        .ok_or(FilesystemError::Integrity)
 }
 
 fn validate_extent_bounds(extents: &[StoredExtent], byte_length: u64) -> FuseResult<()> {
@@ -5439,6 +5832,57 @@ fn decode_content_manifest(value: &[u8]) -> Result<Vec<StoredExtent>, Filesystem
     postcard::from_bytes(value).map_err(|_| FilesystemError::Integrity)
 }
 
+fn encode_content_manifest_node(
+    node: &StoredContentManifestNode,
+) -> Result<Vec<u8>, FilesystemError> {
+    validate_stored_content_manifest_node(node)?;
+    let mut bytes = CONTENT_MANIFEST_NODE_MAGIC.to_vec();
+    bytes.extend(postcard::to_allocvec(node).map_err(|_| FilesystemError::Database)?);
+    Ok(bytes)
+}
+
+fn decode_content_manifest_entry(value: &[u8]) -> Result<DecodedContentManifest, FilesystemError> {
+    match decode_versioned_content_manifest_node(value)? {
+        Some(node) => Ok(DecodedContentManifest::Node(node)),
+        None => decode_content_manifest(value).map(DecodedContentManifest::Extents),
+    }
+}
+
+fn decode_versioned_content_manifest_node(
+    value: &[u8],
+) -> Result<Option<StoredContentManifestNode>, FilesystemError> {
+    let Some(value) = value.strip_prefix(CONTENT_MANIFEST_NODE_MAGIC) else {
+        return Ok(None);
+    };
+    let node = postcard::from_bytes(value).map_err(|_| FilesystemError::Integrity)?;
+    validate_stored_content_manifest_node(&node)?;
+    Ok(Some(node))
+}
+
+fn validate_stored_content_manifest_node(
+    node: &StoredContentManifestNode,
+) -> Result<(), FilesystemError> {
+    match node {
+        StoredContentManifestNode::Concat { children } => {
+            if children.is_empty() || children.len() > CONTENT_MANIFEST_CONCAT_MAX_CHILDREN {
+                return Err(FilesystemError::Integrity);
+            }
+            let mut previous_end = 0;
+            for child in children {
+                ContentManifestIdentifier::from_bytes(&child.identifier)?;
+                if child.length == 0 || child.logical_offset < previous_end {
+                    return Err(FilesystemError::Integrity);
+                }
+                previous_end = child
+                    .logical_offset
+                    .checked_add(child.length)
+                    .ok_or(FilesystemError::Integrity)?;
+            }
+            Ok(())
+        }
+    }
+}
+
 fn content_manifest_identifier_for_bytes(bytes: &[u8]) -> Vec<u8> {
     prefixed_blake3_identifier(CONTENT_MANIFEST_HASH_BLAKE3, bytes)
 }
@@ -6313,6 +6757,88 @@ mod tests {
                 .last_event_sequence()
                 .expect("last event sequence is readable"),
             committed_sequence
+        );
+    }
+
+    #[test]
+    fn append_and_tail_reads_do_not_validate_untouched_old_chunks() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let inode_number = create_regular_file(&storage, "append-corruption");
+        let original = patterned_bytes(96 * 1024, 17);
+        let appended = patterned_bytes(24 * 1024, 41);
+        storage
+            .write_file(inode_number, 0, &original)
+            .expect("original file is written");
+
+        let content_chunks = storage
+            .content_chunks()
+            .expect("content chunks column family exists");
+        let mut iterator = storage.database().raw_iterator_cf(content_chunks);
+        iterator.seek_to_first();
+        let chunk_identifier = iterator.key().expect("content chunk key exists").to_vec();
+        iterator.status().expect("content chunk iterator is valid");
+
+        let mut batch = WriteBatch::default();
+        batch.put_cf(content_chunks, &chunk_identifier, b"corrupt bytes");
+        write_batch(storage.database(), batch).expect("old content chunk is corrupted");
+
+        storage
+            .write_file(inode_number, original.len() as u64, &appended)
+            .expect("append does not validate untouched corrupt content");
+        assert_eq!(
+            storage
+                .read_file(inode_number, original.len() as u64, appended.len() as u32)
+                .expect("appended tail is readable without old content"),
+            appended
+        );
+        assert!(matches!(
+            storage.write_file(inode_number, 0, b"overwrite"),
+            Err(FuseError::Integrity)
+        ));
+    }
+
+    #[test]
+    fn many_small_appends_cross_manifest_child_limits_and_keep_ranges_readable() {
+        let temporary = tempfile::tempdir().expect("temporary directory is created");
+        let storage =
+            open_database_path(&temporary.path().join("database")).expect("storage opens");
+        let inode_number = create_regular_file(&storage, "many-appends");
+        let append_count = CONTENT_MANIFEST_CONCAT_MAX_CHILDREN * 2 + 3;
+        let mut expected = Vec::with_capacity(append_count * 3);
+
+        for index in 0..append_count {
+            let bytes = [
+                (index % 251) as u8,
+                ((index * 3) % 251) as u8,
+                ((index * 7) % 251) as u8,
+            ];
+            storage
+                .write_file(inode_number, expected.len() as u64, &bytes)
+                .expect("small append succeeds");
+            expected.extend_from_slice(&bytes);
+        }
+
+        assert_eq!(
+            storage
+                .read_file(inode_number, 0, expected.len() as u32)
+                .expect("full file is readable"),
+            expected
+        );
+        let middle = expected.len() / 2;
+        assert_eq!(
+            storage
+                .read_file(inode_number, middle as u64, 33)
+                .expect("middle range is readable"),
+            expected[middle..middle + 33]
+        );
+        let tail = expected.len() - 48;
+        assert_eq!(
+            storage
+                .read_file(inode_number, tail as u64, 48)
+                .expect("tail range is readable"),
+            expected[tail..]
         );
     }
 
@@ -9066,7 +9592,6 @@ mod tests {
         branch: StoredBranch,
         namespace_root: StoredNamespaceRoot,
         namespace: MaterializedBranchState,
-        file_extents: BTreeMap<u64, Vec<StoredExtent>>,
     }
 
     fn active_branch_state_snapshot(storage: &Storage) -> ActiveBranchStateSnapshot {
@@ -9078,7 +9603,6 @@ mod tests {
             branch: active.branch.clone(),
             namespace_root: active.namespace_root.clone(),
             namespace: active.namespace.clone(),
-            file_extents: active.file_extents.clone(),
         }
     }
 

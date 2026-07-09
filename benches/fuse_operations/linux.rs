@@ -1,7 +1,8 @@
+use std::env;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::os::raw::c_int;
@@ -24,6 +25,11 @@ const BENCHMARK_PROFILE_FREQUENCY: c_int = 997;
 const BENCHMARK_BLOCK_SIZE: usize = 4096;
 const BENCHMARK_DIRECTORY_ENTRY_COUNT: usize = 16;
 const BENCHMARK_XATTR_VALUE: &[u8] = b"value";
+const BENCHMARK_MIB: usize = 1024 * 1024;
+const BENCHMARK_LARGE_SAMPLE_SIZE: usize = 10;
+const BENCHMARK_LARGE_FILE_DEFAULT_MIB: usize = 256;
+const BENCHMARK_LARGE_WRITE_SIZE: usize = BENCHMARK_MIB;
+const BENCHMARK_LARGE_INTERVAL_SIZE: usize = 64 * BENCHMARK_MIB;
 
 pub(crate) fn criterion_configuration() -> Criterion {
     Criterion::default()
@@ -44,6 +50,8 @@ pub(crate) fn bench_fuse_operations(criterion: &mut Criterion) {
     benchmark_extended_operations(&mut group, &fixture);
 
     group.finish();
+
+    benchmark_large_file_workflows(criterion, &fixture);
 }
 
 struct FuseBenchmarkFixture {
@@ -470,6 +478,79 @@ fn benchmark_extended_operations(
     );
 }
 
+fn benchmark_large_file_workflows(criterion: &mut Criterion, fixture: &FuseBenchmarkFixture) {
+    let mut group = criterion.benchmark_group("large_file_workflows");
+    group.sample_size(BENCHMARK_LARGE_SAMPLE_SIZE);
+    group.warm_up_time(Duration::from_millis(BENCHMARK_WARM_UP_MS));
+    group.measurement_time(Duration::from_secs(10));
+
+    let (eventfs_root, host_root) = fixture.roots();
+    benchmark_pair(
+        &mut group,
+        "large_sequential_write",
+        repeated_large_sequential_write(eventfs_root),
+        repeated_large_sequential_write(host_root),
+    );
+
+    let (eventfs_root, host_root) = fixture.roots();
+    benchmark_pair(
+        &mut group,
+        "large_append_first_interval",
+        repeated_large_append_interval(eventfs_root, LargeFileInterval::First),
+        repeated_large_append_interval(host_root, LargeFileInterval::First),
+    );
+
+    let (eventfs_root, host_root) = fixture.roots();
+    benchmark_pair(
+        &mut group,
+        "large_append_tail_interval",
+        repeated_large_append_interval(eventfs_root, LargeFileInterval::Tail),
+        repeated_large_append_interval(host_root, LargeFileInterval::Tail),
+    );
+
+    let (eventfs_root, host_root) = fixture.roots();
+    benchmark_pair(
+        &mut group,
+        "large_overwrite_interval",
+        repeated_large_overwrite_interval(eventfs_root),
+        repeated_large_overwrite_interval(host_root),
+    );
+
+    let (eventfs_root, host_root) = fixture.roots();
+    benchmark_pair(
+        &mut group,
+        "large_sparse_write",
+        repeated_large_sparse_write(eventfs_root),
+        repeated_large_sparse_write(host_root),
+    );
+
+    let (eventfs_root, host_root) = fixture.roots();
+    benchmark_pair(
+        &mut group,
+        "large_truncate_extend",
+        repeated_large_truncate_extend(eventfs_root),
+        repeated_large_truncate_extend(host_root),
+    );
+
+    let (eventfs_root, host_root) = fixture.roots();
+    benchmark_pair(
+        &mut group,
+        "large_sync_write",
+        repeated_large_sync_write(eventfs_root),
+        repeated_large_sync_write(host_root),
+    );
+
+    let (eventfs_root, host_root) = fixture.roots();
+    benchmark_pair(
+        &mut group,
+        "large_staged_rename",
+        repeated_large_staged_rename(eventfs_root),
+        repeated_large_staged_rename(host_root),
+    );
+
+    group.finish();
+}
+
 fn benchmark_pair<Eventfs, Host>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     operation: &'static str,
@@ -493,11 +574,187 @@ fn benchmark_pair<Eventfs, Host>(
     });
 }
 
+#[derive(Clone, Copy)]
+enum LargeFileInterval {
+    First,
+    Tail,
+}
+
 fn repeated_existing_path(
     path: PathBuf,
     operation: fn(&Path) -> io::Result<()>,
 ) -> impl FnMut(u64) -> io::Result<Duration> {
     move |iterations| measure_repeated(iterations, || operation(&path))
+}
+
+fn repeated_large_sequential_write(root: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
+    let size = large_file_size();
+    let buffer = large_file_buffer();
+    move |iterations| {
+        let mut elapsed = Duration::ZERO;
+        for index in 0..iterations {
+            let path = iteration_path(&root, "large-sequential-write", index, "file");
+            elapsed += timed(|| write_new_large_file(&path, size, &buffer))?;
+            cleanup_path(&path)?;
+        }
+        Ok(elapsed)
+    }
+}
+
+fn repeated_large_append_interval(
+    root: PathBuf,
+    interval: LargeFileInterval,
+) -> impl FnMut(u64) -> io::Result<Duration> {
+    let size = large_file_size();
+    let interval_size = BENCHMARK_LARGE_INTERVAL_SIZE.min(size);
+    let interval_start = match interval {
+        LargeFileInterval::First => 0,
+        LargeFileInterval::Tail => size.saturating_sub(interval_size),
+    };
+    let buffer = large_file_buffer();
+    let mut batch_index = 0;
+    move |iterations| {
+        if interval_start > 0 {
+            let path = iteration_path(
+                &root,
+                "large-append-tail-interval",
+                batch_index,
+                "file",
+            );
+            batch_index += 1;
+
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)?;
+            write_large_file_bytes(&mut file, interval_start, &buffer)?;
+
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iterations {
+                file.seek(SeekFrom::Start(interval_start as u64))?;
+                elapsed += timed(|| write_large_file_bytes(&mut file, interval_size, &buffer))?;
+                file.set_len(interval_start as u64)?;
+            }
+            drop(file);
+            cleanup_path(&path)?;
+            return Ok(elapsed);
+        }
+
+        let mut elapsed = Duration::ZERO;
+        for index in 0..iterations {
+            let path = iteration_path(&root, "large-append-interval", index, "file");
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)?;
+            write_large_file_bytes(&mut file, interval_start, &buffer)?;
+            elapsed += timed(|| write_large_file_bytes(&mut file, interval_size, &buffer))?;
+            drop(file);
+            cleanup_path(&path)?;
+        }
+        Ok(elapsed)
+    }
+}
+
+fn repeated_large_overwrite_interval(root: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
+    let size = large_file_size();
+    let interval_size = BENCHMARK_LARGE_INTERVAL_SIZE.min(size);
+    let overwrite_offset = (size / 2).saturating_sub(interval_size / 2);
+    let buffer = large_file_buffer();
+    move |iterations| {
+        let mut elapsed = Duration::ZERO;
+        for index in 0..iterations {
+            let path = iteration_path(&root, "large-overwrite-interval", index, "file");
+            write_new_large_file(&path, size, &buffer)?;
+            let file = OpenOptions::new().write(true).open(&path)?;
+            elapsed += timed(|| write_large_file_at(&file, overwrite_offset as u64, interval_size, &buffer))?;
+            drop(file);
+            cleanup_path(&path)?;
+        }
+        Ok(elapsed)
+    }
+}
+
+fn repeated_large_sparse_write(root: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
+    let size = large_file_size();
+    let interval_size = BENCHMARK_LARGE_INTERVAL_SIZE.min(size);
+    let sparse_offset = size.saturating_mul(2);
+    let buffer = large_file_buffer();
+    move |iterations| {
+        let mut elapsed = Duration::ZERO;
+        for index in 0..iterations {
+            let path = iteration_path(&root, "large-sparse-write", index, "file");
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)?;
+            elapsed += timed(|| write_large_file_at(&file, sparse_offset as u64, interval_size, &buffer))?;
+            drop(file);
+            cleanup_path(&path)?;
+        }
+        Ok(elapsed)
+    }
+}
+
+fn repeated_large_truncate_extend(root: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
+    let size = large_file_size();
+    let extended_size = size.saturating_add(BENCHMARK_LARGE_INTERVAL_SIZE);
+    let buffer = large_file_buffer();
+    move |iterations| {
+        let mut elapsed = Duration::ZERO;
+        for index in 0..iterations {
+            let path = iteration_path(&root, "large-truncate-extend", index, "file");
+            write_new_large_file(&path, size, &buffer)?;
+            let file = OpenOptions::new().write(true).open(&path)?;
+            elapsed += timed(|| {
+                file.set_len((size / 2) as u64)?;
+                file.set_len(extended_size as u64)
+            })?;
+            drop(file);
+            cleanup_path(&path)?;
+        }
+        Ok(elapsed)
+    }
+}
+
+fn repeated_large_sync_write(root: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
+    let size = large_file_size();
+    let buffer = large_file_buffer();
+    move |iterations| {
+        let mut elapsed = Duration::ZERO;
+        for index in 0..iterations {
+            let path = iteration_path(&root, "large-sync-write", index, "file");
+            elapsed += timed(|| {
+                let mut file = OpenOptions::new().create_new(true).write(true).open(&path)?;
+                write_large_file_bytes(&mut file, size, &buffer)?;
+                file.sync_all()
+            })?;
+            cleanup_path(&path)?;
+        }
+        Ok(elapsed)
+    }
+}
+
+fn repeated_large_staged_rename(root: PathBuf) -> impl FnMut(u64) -> io::Result<Duration> {
+    let size = large_file_size();
+    let buffer = large_file_buffer();
+    move |iterations| {
+        let mut elapsed = Duration::ZERO;
+        for index in 0..iterations {
+            let temporary = iteration_path(&root, "large-staged-rename", index, "partial");
+            let final_path = iteration_path(&root, "large-staged-rename", index, "final");
+            elapsed += timed(|| {
+                write_new_large_file(&temporary, size, &buffer)?;
+                let file = OpenOptions::new().read(true).write(true).open(&temporary)?;
+                file.sync_all()?;
+                drop(file);
+                fs::rename(&temporary, &final_path)
+            })?;
+            cleanup_path(&temporary)?;
+            cleanup_path(&final_path)?;
+        }
+        Ok(elapsed)
+    }
 }
 
 fn repeated_unique_path(
@@ -836,6 +1093,50 @@ fn measure_repeated(
         elapsed += timed(&mut operation)?;
     }
     Ok(elapsed)
+}
+
+fn write_new_large_file(path: &Path, size: usize, buffer: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    write_large_file_bytes(&mut file, size, buffer)?;
+    black_box(file.metadata()?.len());
+    Ok(())
+}
+
+fn write_large_file_bytes(file: &mut File, size: usize, buffer: &[u8]) -> io::Result<()> {
+    let mut remaining = size;
+    while remaining > 0 {
+        let written = remaining.min(buffer.len());
+        file.write_all(&buffer[..written])?;
+        remaining -= written;
+    }
+    Ok(())
+}
+
+fn write_large_file_at(file: &File, offset: u64, size: usize, buffer: &[u8]) -> io::Result<()> {
+    let mut remaining = size;
+    let mut written_offset = offset;
+    while remaining > 0 {
+        let written = remaining.min(buffer.len());
+        file.write_all_at(&buffer[..written], written_offset)?;
+        remaining -= written;
+        written_offset += written as u64;
+    }
+    Ok(())
+}
+
+fn large_file_size() -> usize {
+    env::var("EVENTFS_BENCH_LARGE_FILE_MIB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(BENCHMARK_LARGE_FILE_DEFAULT_MIB)
+        * BENCHMARK_MIB
+}
+
+fn large_file_buffer() -> Vec<u8> {
+    (0..BENCHMARK_LARGE_WRITE_SIZE)
+        .map(|index| (index % 251) as u8)
+        .collect()
 }
 
 fn timed(mut operation: impl FnMut() -> io::Result<()>) -> io::Result<Duration> {
