@@ -82,429 +82,429 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Read metadata by path
 
-*Host*
+**Host**<br>
 215 ns
 
-*eventfs*
+**eventfs**<br>
 226 ns
 
-*Difference*
+**Overhead**<br>
 1.1x
 
 ### Read metadata from an open file
 
-*Host*
+**Host**<br>
 128 ns
 
-*eventfs*
+**eventfs**<br>
 128 ns
 
-*Difference*
+**Overhead**<br>
 1.0x
 
 ### Change file permissions
 
-*Host*
+**Host**<br>
 280 ns
 
-*eventfs*
+**eventfs**<br>
 38.91 µs
 
-*Difference*
+**Overhead**<br>
 139.2x
 
 ### Resize a file between 2 KiB and 4 KiB
 
-*Host*
+**Host**<br>
 523 ns
 
-*eventfs*
+**eventfs**<br>
 62.03 µs
 
-*Difference*
+**Overhead**<br>
 118.6x
 
 ### Check file read access
 
-*Host*
+**Host**<br>
 198 ns
 
-*eventfs*
+**eventfs**<br>
 211 ns
 
-*Difference*
+**Overhead**<br>
 1.1x
 
 ### Read filesystem statistics
 
-*Host*
+**Host**<br>
 282 ns
 
-*eventfs*
+**eventfs**<br>
 23.71 µs
 
-*Difference*
+**Overhead**<br>
 83.9x
 
 ### Create a named pipe
 
-*Host*
+**Host**<br>
 772 ns
 
-*eventfs*
+**eventfs**<br>
 81.73 µs
 
-*Difference*
+**Overhead**<br>
 105.9x
 
 ### Create a directory
 
-*Host*
+**Host**<br>
 51.42 µs
 
-*eventfs*
+**eventfs**<br>
 82.45 µs
 
-*Difference*
+**Overhead**<br>
 1.6x
 
 ### Create a file
 
-*Host*
+**Host**<br>
 886 ns
 
-*eventfs*
+**eventfs**<br>
 87.43 µs
 
-*Difference*
+**Overhead**<br>
 98.7x
 
 ### Delete a file
 
-*Host*
+**Host**<br>
 1.008 µs
 
-*eventfs*
+**eventfs**<br>
 67.49 µs
 
-*Difference*
+**Overhead**<br>
 66.9x
 
 ### Remove an empty directory
 
-*Host*
+**Host**<br>
 1.307 µs
 
-*eventfs*
+**eventfs**<br>
 66.4 µs
 
-*Difference*
+**Overhead**<br>
 50.8x
 
 ### Rename a file
 
-*Host*
+**Host**<br>
 874 ns
 
-*eventfs*
+**eventfs**<br>
 84.57 µs
 
-*Difference*
+**Overhead**<br>
 96.8x
 
 ### Rename a file without replacing the destination
 
-*Host*
+**Host**<br>
 885 ns
 
-*eventfs*
+**eventfs**<br>
 84.26 µs
 
-*Difference*
+**Overhead**<br>
 95.3x
 
 ### Create a hard link
 
-*Host*
+**Host**<br>
 576 ns
 
-*eventfs*
+**eventfs**<br>
 84.61 µs
 
-*Difference*
+**Overhead**<br>
 146.8x
 
 ### Create a symbolic link
 
-*Host*
+**Host**<br>
 830 ns
 
-*eventfs*
+**eventfs**<br>
 84.34 µs
 
-*Difference*
+**Overhead**<br>
 101.6x
 
 ### Read a symbolic link target
 
-*Host*
+**Host**<br>
 247 ns
 
-*eventfs*
+**eventfs**<br>
 22.44 µs
 
-*Difference*
+**Overhead**<br>
 90.7x
 
 ### Open a file
 
-*Host*
+**Host**<br>
 253 ns
 
-*eventfs*
+**eventfs**<br>
 24.1 µs
 
-*Difference*
+**Overhead**<br>
 95.4x
 
 ### Read 4 KiB
 
-*Host*
+**Host**<br>
 201 ns
 
-*eventfs*
+**eventfs**<br>
 27.67 µs
 
-*Difference*
+**Overhead**<br>
 137.4x
 
 ### Overwrite 4 KiB
 
-*Host*
+**Host**<br>
 241 ns
 
-*eventfs*
+**eventfs**<br>
 56.77 µs
 
-*Difference*
+**Overhead**<br>
 235.6x
 
 ### Flush a file
 
-*Host*
+**Host**<br>
 104 ns
 
-*eventfs*
+**eventfs**<br>
 106 ns
 
-*Difference*
+**Overhead**<br>
 1.0x
 
 ### Close a file
 
-*Host*
+**Host**<br>
 156 ns
 
-*eventfs*
+**eventfs**<br>
 2.699 µs
 
-*Difference*
+**Overhead**<br>
 17.3x
 
 ### Synchronize a file
 
-*Host*
+**Host**<br>
 27.35 µs
 
-*eventfs*
+**eventfs**<br>
 54.79 µs
 
-*Difference*
+**Overhead**<br>
 2.0x
 
 ### Open a directory containing 16 files
 
-*Host*
+**Host**<br>
 392 ns
 
-*eventfs*
+**eventfs**<br>
 25.57 µs
 
-*Difference*
+**Overhead**<br>
 65.2x
 
 ### Read a directory containing 16 files
 
-*Host*
+**Host**<br>
 538 ns
 
-*eventfs*
+**eventfs**<br>
 51.12 µs
 
-*Difference*
+**Overhead**<br>
 95.1x
 
 ### Read a directory and metadata for its 16 files
 
-*Host*
+**Host**<br>
 4.353 µs
 
-*eventfs*
+**eventfs**<br>
 108.4 µs
 
-*Difference*
+**Overhead**<br>
 24.9x
 
 ### Synchronize a directory
 
-*Host*
+**Host**<br>
 26.36 µs
 
-*eventfs*
+**eventfs**<br>
 53.42 µs
 
-*Difference*
+**Overhead**<br>
 2.0x
 
 ### Close a directory
 
-*Host*
+**Host**<br>
 158 ns
 
-*eventfs*
+**eventfs**<br>
 2.624 µs
 
-*Difference*
+**Overhead**<br>
 16.7x
 
 ### Set a 5-byte extended attribute
 
-*Host*
+**Host**<br>
 370 ns
 
-*eventfs*
+**eventfs**<br>
 56.76 µs
 
-*Difference*
+**Overhead**<br>
 153.5x
 
 ### Read a 5-byte extended attribute
 
-*Host*
+**Host**<br>
 292 ns
 
-*eventfs*
+**eventfs**<br>
 23.13 µs
 
-*Difference*
+**Overhead**<br>
 79.2x
 
 ### List extended attributes
 
-*Host*
+**Host**<br>
 261 ns
 
-*eventfs*
+**eventfs**<br>
 24.28 µs
 
-*Difference*
+**Overhead**<br>
 93.0x
 
 ### Remove an extended attribute
 
-*Host*
+**Host**<br>
 364 ns
 
-*eventfs*
+**eventfs**<br>
 56.21 µs
 
-*Difference*
+**Overhead**<br>
 154.4x
 
 ### Write a new 256 MiB file sequentially
 
-*Host*
+**Host**<br>
 32.5 ms
 
-*eventfs*
+**eventfs**<br>
 407.1 ms
 
-*Difference*
+**Overhead**<br>
 12.5x
 
 ### Write the first 64 MiB of a new file
 
-*Host*
+**Host**<br>
 7.471 ms
 
-*eventfs*
+**eventfs**<br>
 95.7 ms
 
-*Difference*
+**Overhead**<br>
 12.8x
 
 ### Append 64 MiB to a 192 MiB file
 
-*Host*
+**Host**<br>
 6.538 ms
 
-*eventfs*
+**eventfs**<br>
 97.66 ms
 
-*Difference*
+**Overhead**<br>
 14.9x
 
 ### Overwrite the middle 64 MiB of a 256 MiB file
 
-*Host*
+**Host**<br>
 3.694 ms
 
-*eventfs*
+**eventfs**<br>
 133.8 ms
 
-*Difference*
+**Overhead**<br>
 36.2x
 
 ### Write 64 MiB at a 512 MiB offset in a sparse file
 
-*Host*
+**Host**<br>
 6.929 ms
 
-*eventfs*
+**eventfs**<br>
 96.24 ms
 
-*Difference*
+**Overhead**<br>
 13.9x
 
 ### Truncate a 256 MiB file to 128 MiB, then extend it to 320 MiB
 
-*Host*
+**Host**<br>
 4.629 ms
 
-*eventfs*
+**eventfs**<br>
 61.8 ms
 
-*Difference*
+**Overhead**<br>
 13.4x
 
 ### Write and synchronize a new 256 MiB file
 
-*Host*
+**Host**<br>
 194.7 ms
 
-*eventfs*
+**eventfs**<br>
 407 ms
 
-*Difference*
+**Overhead**<br>
 2.1x
 
 ### Write, synchronize, and rename a 256 MiB file
 
-*Host*
+**Host**<br>
 510.1 ms
 
-*eventfs*
+**eventfs**<br>
 403.8 ms
 
-*Difference*
+**Overhead**<br>
 0.8x
